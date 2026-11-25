@@ -14,11 +14,63 @@ import type {
 import type { JsonValue } from "./json-value";
 import { LOCALE, UI } from "./locale";
 import { ActivityTimeline } from "./activity-timeline";
+import {
+  DSH_SUBAGENT_METADATA_KEY,
+  formatSubagentModel,
+  isSubagentToolName,
+  parseRelayedAgentMessage,
+  parseSubagentActivation,
+  parseSubagentSettlementMessage,
+  type DshSubagentMetadata,
+  type SubagentKind,
+  type SubagentLogEventLike,
+  type SubagentMode,
+  type SubagentStatus,
+  type SubagentTelemetry,
+} from "../shared/subagent-card";
 
 interface DshEvent {
   type: string;
   seq?: number;
+  time?: number;
   [key: string]: unknown;
+}
+
+interface SubagentCatalogRecord {
+  childId: string;
+  name?: string;
+  label?: string;
+  mode?: SubagentMode;
+  createdAt?: number;
+}
+
+interface SubagentSettlementRecord {
+  status?: SubagentStatus;
+  report?: string;
+}
+
+interface TrackedSubagentCall {
+  callId: string;
+  kind: SubagentKind;
+  input: Record<string, unknown>;
+  callTime?: number;
+  resultTime?: number;
+  output?: string;
+  resultMeta?: Record<string, unknown>;
+  failed: boolean;
+  canceled: boolean;
+  completed: boolean;
+  activationName?: string;
+  childId?: string;
+}
+
+/** Snapshot of per-session subagent correlation state handed from replay to live builder. */
+export interface SubagentTimelineStateSnapshot {
+  catalogByChildId: ReadonlyMap<string, SubagentCatalogRecord>;
+  catalogByName: ReadonlyMap<string, string>;
+  telemetry: ReadonlyMap<string, SubagentTelemetry>;
+  settlements: ReadonlyMap<string, SubagentSettlementRecord>;
+  agentMessages: ReadonlyMap<string, string>;
 }
 
 /**
@@ -542,11 +594,28 @@ function withPresentationMeta(
  * missing key means "no description" and the client falls back to the wire
  * target.
  */
+function finiteTime(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function metaNonNegativeInt(meta: Record<string, unknown> | undefined, key: string): number | undefined {
+  if (meta === undefined) return undefined;
+  const value = meta[key];
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function metaNonNegativeNumber(meta: Record<string, unknown> | undefined, key: string): number | undefined {
+  if (meta === undefined) return undefined;
+  const value = meta[key];
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
 function toolMetadata(
   input: Record<string, unknown>,
   presentationMeta: JsonValue | undefined,
   teamRoster?: ReadonlyMap<string, string>,
   jobTitle?: string,
+  dshSubagent?: DshSubagentMetadata,
 ): Record<string, JsonValue> {
   const description = stringField(input, "description");
   return {
@@ -555,6 +624,7 @@ function toolMetadata(
     locale: LOCALE,
     ...(teamRoster === undefined ? {} : { [TEAM_ROSTER_METADATA_KEY]: rosterRecord(teamRoster) }),
     ...(presentationMeta === undefined ? {} : { [PRESENTATION_META_KEY]: presentationMeta }),
+    ...(dshSubagent === undefined ? {} : { [DSH_SUBAGENT_METADATA_KEY]: dshSubagent as unknown as JsonValue }),
   };
 }
 
@@ -892,6 +962,24 @@ export class TimelineBuilder {
    * never re-renders it when a later roster read arrives.
    */
   #teamRoster = new Map<string, string>();
+  /** Per-session `subagent/catalog` v3 records keyed by child session id. */
+  #subagentCatalogByChildId = new Map<string, SubagentCatalogRecord>();
+  /** Per-session `subagent/catalog` v3 name -> child session id index. */
+  #subagentCatalogByName = new Map<string, string>();
+  /** Per-session tracked `subagent` / `subagent_fork` tool calls keyed by callId. */
+  #subagentCalls = new Map<string, TrackedSubagentCall>();
+  /** Child session id -> owning non-failed delegation callId. */
+  #subagentCallByChildId = new Map<string, string>();
+  /** Delegation runtime name -> callId (handles `tool/result` before `subagent/catalog`). */
+  #subagentCallByName = new Map<string, string>();
+  /** Real measured child telemetry fed from `DshChildSession` or replay prefetch. */
+  #subagentTelemetry = new Map<string, SubagentTelemetry>();
+  /** Parent-observed `subagent-settled` terminal status & closing report per child id. */
+  #subagentSettlements = new Map<string, SubagentSettlementRecord>();
+  /** Latest relayed `agent-message` text per child id (used when settlement omits closing text). */
+  #subagentAgentMessages = new Map<string, string>();
+  /** Earliest observed durable `event.time` per tool callId (for sync duration measurement). */
+  #toolCallTimes = new Map<string, number>();
   /**
    * `turn:step` -> the attempt identities this step has streamed, in order.
    *
@@ -1061,6 +1149,379 @@ export class TimelineBuilder {
   }
 
   /**
+   * Record durable `subagent/catalog` v3 identity (`childId`, `name`, `label`,
+   * `mode`, `childCreatedAt`) so `subagent` / `subagent_fork` tool calls can
+   * correlate to their child session and measured telemetry.
+   */
+  #absorbSubagentCatalog(data: Record<string, unknown>): void {
+    if (data.version !== 3) return;
+    const childId = stringField(data, "childId");
+    if (childId === undefined) return;
+    const prev = this.#subagentCatalogByChildId.get(childId);
+    const name = stringField(data, "name") ?? prev?.name;
+    const label = stringField(data, "label") ?? prev?.label;
+    const mode: SubagentMode | undefined =
+      data.mode === "continuable" || data.mode === "one-shot" ? data.mode : prev?.mode;
+    const createdAt = finiteTime(data.childCreatedAt) ?? prev?.createdAt;
+    const record: SubagentCatalogRecord = {
+      childId,
+      ...(name === undefined ? {} : { name }),
+      ...(label === undefined ? {} : { label }),
+      ...(mode === undefined ? {} : { mode }),
+      ...(createdAt === undefined ? {} : { createdAt }),
+    };
+    this.#subagentCatalogByChildId.set(childId, record);
+    if (name !== undefined) {
+      this.#subagentCatalogByName.set(name, childId);
+      const pendingCallId = this.#subagentCallByName.get(name);
+      if (pendingCallId !== undefined) {
+        const tracked = this.#subagentCalls.get(pendingCallId);
+        if (
+          tracked !== undefined &&
+          tracked.completed &&
+          !tracked.failed &&
+          tracked.childId === undefined &&
+          !this.#subagentCallByChildId.has(childId)
+        ) {
+          tracked.childId = childId;
+          this.#subagentCallByChildId.set(childId, pendingCallId);
+        }
+      }
+    }
+  }
+
+  /**
+   * Absorb a parent `user/message` that is either a child's `agent-message`
+   * relay or its `subagent-settled` completion notice. Returns the settled
+   * `childId` when a settlement notice was absorbed.
+   */
+  #absorbSubagentUserMessage(data: Record<string, unknown>): string | undefined {
+    const relayed = parseRelayedAgentMessage(data);
+    if (relayed !== null) {
+      this.#subagentAgentMessages.set(relayed.senderSessionId, relayed.text);
+      return undefined;
+    }
+    const notice = parseSubagentSettlementMessage(data);
+    if (notice === null) return undefined;
+    const prev = this.#subagentSettlements.get(notice.senderSessionId);
+    const resolvedReport =
+      notice.report ??
+      (notice.omittedForAgentMessage
+        ? this.#subagentAgentMessages.get(notice.senderSessionId)
+        : undefined);
+    const next: SubagentSettlementRecord = {
+      ...((notice.status ?? prev?.status) === undefined ? {} : { status: notice.status ?? prev?.status }),
+      ...((resolvedReport ?? prev?.report) === undefined ? {} : { report: resolvedReport ?? prev?.report }),
+    };
+    this.#subagentSettlements.set(notice.senderSessionId, next);
+    return notice.senderSessionId;
+  }
+
+  /**
+   * Pre-scan a replayed parent event log before emitting rows so `subagent` and
+   * `subagent_fork` tool calls already carry their durable catalog identity and
+   * settled outcome in their original turn (Paseo does not merge cross-turn
+   * `tool_call` updates).
+   *
+   * Returns the deduplicated list of `childId`s referenced by non-failed
+   * `subagent` / `subagent_fork` calls in `events`.
+   */
+  preScanSubagentEvents(events: ReadonlyArray<SubagentLogEventLike>): string[] {
+    const calls = new Map<string, { argsName?: string; activationName?: string; failed: boolean }>();
+    for (const event of events) {
+      const data = isRecord(event.data) ? event.data : {};
+      if (event.type === "subagent/catalog") {
+        this.#absorbSubagentCatalog(data);
+      } else if (event.type === "user/message") {
+        this.#absorbSubagentUserMessage(data);
+      } else if (event.type === "assistant/message") {
+        const message = isRecord(data.message) ? data.message : undefined;
+        const content = message?.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (!isRecord(block) || block.type !== "tool-call") continue;
+            const name = stringField(block, "name");
+            const callId = stringField(block, "id");
+            if (name === undefined || callId === undefined || !isSubagentToolName(name)) continue;
+            const args = parseArguments(block.arguments);
+            const existing = calls.get(callId);
+            calls.set(callId, {
+              argsName: stringField(args, "name") ?? existing?.argsName,
+              activationName: existing?.activationName,
+              failed: existing?.failed ?? false,
+            });
+          }
+        }
+      } else if (event.type === "tool/call") {
+        const name = stringField(data, "name");
+        const callId = stringField(data, "callId");
+        if (name === undefined || callId === undefined || !isSubagentToolName(name)) continue;
+        const args = parseArguments(data.arguments);
+        const existing = calls.get(callId);
+        calls.set(callId, {
+          argsName: stringField(args, "name") ?? existing?.argsName,
+          activationName: existing?.activationName,
+          failed: existing?.failed ?? false,
+        });
+      } else if (event.type === "tool/result") {
+        const message = isRecord(data.message) ? data.message : undefined;
+        const callId =
+          stringField(data, "toolCallId") ??
+          (message === undefined ? undefined : stringField(message, "toolCallId"));
+        if (callId === undefined) continue;
+        const existing = calls.get(callId);
+        if (existing === undefined) continue;
+        if (message?.isError === true) {
+          existing.failed = true;
+          continue;
+        }
+        const output = message === undefined ? "" : textOf(message.content);
+        const activation = parseSubagentActivation(data.meta, output);
+        if (activation !== null) existing.activationName = activation.name;
+      }
+    }
+
+    const referenced: string[] = [];
+    const seen = new Set<string>();
+    for (const call of calls.values()) {
+      if (call.failed) continue;
+      const lookupName = call.activationName ?? call.argsName;
+      if (lookupName === undefined) continue;
+      const childId = this.#subagentCatalogByName.get(lookupName);
+      if (childId === undefined || seen.has(childId)) continue;
+      seen.add(childId);
+      referenced.push(childId);
+    }
+    return referenced;
+  }
+
+  /** Snapshot subagent correlation state so the live builder inherits replay knowledge. */
+  subagentStateSnapshot(): SubagentTimelineStateSnapshot {
+    return {
+      catalogByChildId: new Map(this.#subagentCatalogByChildId),
+      catalogByName: new Map(this.#subagentCatalogByName),
+      telemetry: new Map(this.#subagentTelemetry),
+      settlements: new Map(this.#subagentSettlements),
+      agentMessages: new Map(this.#subagentAgentMessages),
+    };
+  }
+
+  /** Merge a replay builder's subagent correlation state without discarding newer live facts. */
+  mergeSubagentState(snapshot: SubagentTimelineStateSnapshot): void {
+    for (const [childId, entry] of snapshot.catalogByChildId) {
+      if (!this.#subagentCatalogByChildId.has(childId)) {
+        this.#subagentCatalogByChildId.set(childId, entry);
+      }
+    }
+    for (const [name, childId] of snapshot.catalogByName) {
+      if (!this.#subagentCatalogByName.has(name)) {
+        this.#subagentCatalogByName.set(name, childId);
+      }
+    }
+    for (const [childId, telemetry] of snapshot.telemetry) {
+      if (!this.#subagentTelemetry.has(childId)) {
+        this.#subagentTelemetry.set(childId, telemetry);
+      }
+    }
+    for (const [childId, settlement] of snapshot.settlements) {
+      if (!this.#subagentSettlements.has(childId)) {
+        this.#subagentSettlements.set(childId, settlement);
+      }
+    }
+    for (const [childId, message] of snapshot.agentMessages) {
+      if (!this.#subagentAgentMessages.has(childId)) {
+        this.#subagentAgentMessages.set(childId, message);
+      }
+    }
+  }
+
+  /**
+   * Record real measured telemetry for a child session and, if a correlated
+   * `subagent` / `subagent_fork` tool row already exists in this builder and its
+   * metadata changed, return the updated item for same-turn emission.
+   */
+  recordSubagentTelemetry(
+    childId: string,
+    telemetry: SubagentTelemetry,
+  ): { callId: string; item: ProviderTimelineItem } | undefined {
+    if (childId === "") return undefined;
+    const prev = this.#subagentTelemetry.get(childId);
+    const merged: SubagentTelemetry = {
+      ...((telemetry.status ?? prev?.status) === undefined ? {} : { status: telemetry.status ?? prev?.status }),
+      ...((telemetry.report ?? prev?.report) === undefined ? {} : { report: telemetry.report ?? prev?.report }),
+      ...((telemetry.mode ?? prev?.mode) === undefined ? {} : { mode: telemetry.mode ?? prev?.mode }),
+      ...((telemetry.preset ?? prev?.preset) === undefined ? {} : { preset: telemetry.preset ?? prev?.preset }),
+      ...((telemetry.model ?? prev?.model) === undefined ? {} : { model: telemetry.model ?? prev?.model }),
+      ...((telemetry.label ?? prev?.label) === undefined ? {} : { label: telemetry.label ?? prev?.label }),
+      ...((telemetry.steps ?? prev?.steps) === undefined ? {} : { steps: telemetry.steps ?? prev?.steps }),
+      ...((telemetry.durationMs ?? prev?.durationMs) === undefined
+        ? {}
+        : { durationMs: telemetry.durationMs ?? prev?.durationMs }),
+      ...((telemetry.outputTokens ?? prev?.outputTokens) === undefined
+        ? {}
+        : { outputTokens: telemetry.outputTokens ?? prev?.outputTokens }),
+    };
+    this.#subagentTelemetry.set(childId, merged);
+    return this.#refreshSubagentItem(childId);
+  }
+
+  /**
+   * Observe a live parent `user/message` (`subagent-settled` or `agent-message`)
+   * and return the updated tool row if a correlated subagent call changed.
+   */
+  observeSubagentUserMessage(
+    data: Record<string, unknown>,
+  ): { callId: string; item: ProviderTimelineItem } | undefined {
+    const childId = this.#absorbSubagentUserMessage(data);
+    if (childId === undefined) return undefined;
+    return this.#refreshSubagentItem(childId);
+  }
+
+  #bindSubagentChild(tracked: TrackedSubagentCall): string | undefined {
+    if (tracked.failed) return undefined;
+    if (tracked.childId !== undefined) {
+      if (!this.#subagentCallByChildId.has(tracked.childId)) {
+        this.#subagentCallByChildId.set(tracked.childId, tracked.callId);
+      }
+      return tracked.childId;
+    }
+    if (!tracked.completed) return undefined;
+    const candidateName = tracked.activationName ?? stringField(tracked.input, "name");
+    if (candidateName === undefined) return undefined;
+    if (!this.#subagentCallByName.has(candidateName)) {
+      this.#subagentCallByName.set(candidateName, tracked.callId);
+    }
+    const childId = this.#subagentCatalogByName.get(candidateName);
+    if (childId === undefined) return undefined;
+    const owner = this.#subagentCallByChildId.get(childId);
+    if (owner !== undefined && owner !== tracked.callId) return undefined;
+    tracked.childId = childId;
+    this.#subagentCallByChildId.set(childId, tracked.callId);
+    return childId;
+  }
+
+  #buildSubagentMetadata(tracked: TrackedSubagentCall): DshSubagentMetadata {
+    const input = tracked.input;
+    const argRole =
+      stringField(input, "name") ??
+      stringField(input, "role") ??
+      stringField(input, "subagent_type") ??
+      stringField(input, "subAgentType") ??
+      stringField(input, "agent_preset");
+    const argTitle = stringField(input, "description");
+    const task = stringField(input, "prompt") ?? stringField(input, "task");
+    const argPreset = stringField(input, "agent_preset");
+    const argModel = formatSubagentModel(input.provider, input.model);
+
+    // A failed delegation call never spawned a child: never attach another
+    // child's catalog id, report, or metrics to it (e.g. duplicate-name errors).
+    if (tracked.failed) {
+      return {
+        kind: tracked.kind,
+        status: "failed",
+        ...(argRole === undefined ? {} : { role: argRole }),
+        ...(argTitle === undefined ? {} : { title: argTitle }),
+        ...(task === undefined ? {} : { task }),
+        ...(argPreset === undefined ? {} : { preset: argPreset }),
+        ...(argModel === undefined ? {} : { model: argModel }),
+      };
+    }
+
+    const childId = this.#bindSubagentChild(tracked);
+    const catalog = childId === undefined ? undefined : this.#subagentCatalogByChildId.get(childId);
+    const telemetry = childId === undefined ? undefined : this.#subagentTelemetry.get(childId);
+    const settlement = childId === undefined ? undefined : this.#subagentSettlements.get(childId);
+    const isActivation = tracked.activationName !== undefined;
+
+    const status: SubagentStatus = tracked.canceled
+      ? "canceled"
+      : !tracked.completed
+        ? "running"
+        : isActivation
+          ? (settlement?.status ?? telemetry?.status ?? "running")
+          : (settlement?.status ?? telemetry?.status ?? "completed");
+
+    const role = argRole ?? telemetry?.preset ?? tracked.activationName ?? catalog?.name;
+    const title = argTitle ?? catalog?.label ?? telemetry?.label;
+    const report = isActivation
+      ? (settlement?.report ?? telemetry?.report)
+      : ((tracked.output !== undefined && tracked.output.trim() !== "" ? tracked.output : undefined) ??
+        settlement?.report ??
+        telemetry?.report);
+    const mode = catalog?.mode ?? telemetry?.mode;
+    const preset = argPreset ?? telemetry?.preset;
+    const model = argModel ?? telemetry?.model;
+    const steps = telemetry?.steps ?? metaNonNegativeInt(tracked.resultMeta, "steps");
+    const outputTokens = telemetry?.outputTokens ?? metaNonNegativeInt(tracked.resultMeta, "outputTokens");
+    const metaDuration = metaNonNegativeNumber(tracked.resultMeta, "durationMs");
+    const syncDuration =
+      !isActivation &&
+      tracked.completed &&
+      tracked.callTime !== undefined &&
+      tracked.resultTime !== undefined &&
+      tracked.resultTime >= tracked.callTime
+        ? Math.round(tracked.resultTime - tracked.callTime)
+        : undefined;
+    const durationMs =
+      telemetry?.durationMs ??
+      (metaDuration === undefined ? undefined : Math.round(metaDuration)) ??
+      syncDuration;
+
+    return {
+      kind: tracked.kind,
+      status,
+      ...(role === undefined ? {} : { role }),
+      ...(title === undefined ? {} : { title }),
+      ...(task === undefined ? {} : { task }),
+      ...(report === undefined ? {} : { report }),
+      ...(childId === undefined ? {} : { childSessionId: childId }),
+      ...(mode === undefined ? {} : { mode }),
+      ...(preset === undefined ? {} : { preset }),
+      ...(model === undefined ? {} : { model }),
+      ...(steps === undefined ? {} : { steps }),
+      ...(durationMs === undefined ? {} : { durationMs }),
+      ...(outputTokens === undefined ? {} : { outputTokens }),
+    };
+  }
+
+  #refreshSubagentItem(childId: string): { callId: string; item: ProviderTimelineItem } | undefined {
+    let callId = this.#subagentCallByChildId.get(childId);
+    if (callId === undefined) {
+      const catalog = this.#subagentCatalogByChildId.get(childId);
+      if (catalog?.name !== undefined) {
+        const candidate = this.#subagentCallByName.get(catalog.name);
+        if (candidate !== undefined) {
+          const tracked = this.#subagentCalls.get(candidate);
+          if (tracked !== undefined && tracked.completed && !tracked.failed && tracked.childId === undefined) {
+            tracked.childId = childId;
+            this.#subagentCallByChildId.set(childId, candidate);
+            callId = candidate;
+          }
+        }
+      }
+    }
+    if (callId === undefined) return undefined;
+    const tracked = this.#subagentCalls.get(callId);
+    const existing = this.#items.get(`tool:${callId}`);
+    if (tracked === undefined || existing === undefined || existing.type !== "tool_call") return undefined;
+
+    const nextMeta = this.#buildSubagentMetadata(tracked);
+    const existingMeta = isRecord(existing.metadata) ? existing.metadata : {};
+    const prevSubagent = existingMeta[DSH_SUBAGENT_METADATA_KEY];
+    if (JSON.stringify(prevSubagent) === JSON.stringify(nextMeta)) return undefined;
+
+    const updated: ProviderTimelineItem = {
+      ...existing,
+      metadata: {
+        ...existingMeta,
+        [DSH_SUBAGENT_METADATA_KEY]: nextMeta as unknown as JsonValue,
+      },
+    };
+    this.#items.set(updated.id, updated);
+    return { callId, item: updated };
+  }
+
+  /**
    * `list_agents` is DSH's roster dump, and `spawn_teammate`'s result carries
    * the member DSH actually created. Both merge into the same per-session map,
    * so a team created during a live session gets its descriptions on the rows
@@ -1154,18 +1615,21 @@ export class TimelineBuilder {
       this.#warn(message);
       return this.#put({ type: "error", id: `activity-error:${event.type}:${event.seq ?? this.#items.size}`, message });
     }
+    const eventTime = finiteTime(event.time);
     switch (event.type) {
       case "assistant/message":
-        return this.#assistantMessage(data);
+        return this.#assistantMessage(data, eventTime);
       case "tool/call":
-        return this.#toolCall(data);
+        return this.#toolCall(data, eventTime);
       case "tool/result":
-        return this.#toolResult(data);
+        return this.#toolResult(data, eventTime);
       // DSH 0.2.2-rc.3's member directory, written to the parent's own log. It
       // draws no row; it only teaches the roster the rows after it read, live
-      // and on replay (see `#absorbCatalogRoster`).
+      // and on replay (see `#absorbCatalogRoster`), and links `subagent` /
+      // `subagent_fork` calls to their durable child session id.
       case "subagent/catalog":
         this.#absorbCatalogRoster(data);
+        this.#absorbSubagentCatalog(data);
         return [];
       case "command/run":
         return this.#commandRun(data);
@@ -1249,7 +1713,7 @@ export class TimelineBuilder {
     return [item];
   }
 
-  #assistantMessage(data: Record<string, unknown>): ProviderTimelineItem[] {
+  #assistantMessage(data: Record<string, unknown>, eventTime?: number): ProviderTimelineItem[] {
     const message = isRecord(data.message) ? data.message : undefined;
     const content = message?.content;
     if (!Array.isArray(content)) return [];
@@ -1307,7 +1771,10 @@ export class TimelineBuilder {
       const input = parseArguments(block.arguments);
       this.#toolNames.set(callId, name);
       this.#toolInputs.set(callId, input);
-      out.push(...this.#emitToolCall(callId, name, input));
+      if (eventTime !== undefined && !this.#toolCallTimes.has(callId)) {
+        this.#toolCallTimes.set(callId, eventTime);
+      }
+      out.push(...this.#emitToolCall(callId, name, input, undefined, eventTime));
     }
     return out;
   }
@@ -1394,7 +1861,7 @@ export class TimelineBuilder {
     return `:${seen.length}`;
   }
 
-  #toolCall(data: Record<string, unknown>): ProviderTimelineItem[] {
+  #toolCall(data: Record<string, unknown>, eventTime?: number): ProviderTimelineItem[] {
     const callId = stringField(data, "callId");
     if (callId === undefined) return [];
     // Only a real name is remembered. Falling back to `#toolNames` first keeps a
@@ -1412,6 +1879,9 @@ export class TimelineBuilder {
     const input = parseArguments(data.arguments);
     this.#toolNames.set(callId, name);
     this.#toolInputs.set(callId, input);
+    if (eventTime !== undefined && !this.#toolCallTimes.has(callId)) {
+      this.#toolCallTimes.set(callId, eventTime);
+    }
     // The bridge resolved this from DSH's job registry (see
     // {@link JOB_TITLE_METADATA_KEY}); it only ever exists on `tool/call`.
     const jobTitle = stringField(data, "jobTitle");
@@ -1419,10 +1889,10 @@ export class TimelineBuilder {
     // The row only ever opens as running: `#emitToolCall` ignores a repeat for a
     // row that already reached a terminal state, so this cannot undo a finished
     // tool.
-    return this.#emitToolCall(callId, name, input, jobTitle);
+    return this.#emitToolCall(callId, name, input, jobTitle, eventTime);
   }
 
-  #toolResult(data: Record<string, unknown>): ProviderTimelineItem[] {
+  #toolResult(data: Record<string, unknown>, eventTime?: number): ProviderTimelineItem[] {
     const message = isRecord(data.message) ? data.message : undefined;
     const callId = stringField(data, "toolCallId") ?? (message === undefined ? undefined : stringField(message, "toolCallId"));
     if (callId === undefined) return [];
@@ -1480,6 +1950,28 @@ export class TimelineBuilder {
       this.#warn,
     );
 
+    let dshSubagent: DshSubagentMetadata | undefined;
+    if (isSubagentToolName(name)) {
+      const prev = this.#subagentCalls.get(callId);
+      const activation = failed ? null : parseSubagentActivation(data.meta, output);
+      const tracked: TrackedSubagentCall = {
+        callId,
+        kind: name,
+        input,
+        callTime: prev?.callTime ?? this.#toolCallTimes.get(callId),
+        resultTime: eventTime,
+        output,
+        resultMeta: isRecord(data.meta) ? data.meta : undefined,
+        failed,
+        canceled: false,
+        completed: true,
+        activationName: activation?.name,
+        childId: failed ? undefined : prev?.childId,
+      };
+      this.#subagentCalls.set(callId, tracked);
+      dshSubagent = this.#buildSubagentMetadata(tracked);
+    }
+
     if (name === "todo_write" && !failed) {
       const items = todoItems(input);
       if (items !== null) {
@@ -1501,6 +1993,7 @@ export class TimelineBuilder {
             // The title arrived on the `tool/call`; this snapshot is the one the
             // user reads after the tool finishes, so it must carry it too.
             this.#toolTitles.get(callId),
+            dshSubagent,
           ),
           // DSH's structured failure identity (`HarnessError.code` /
           // `.name` / `.reason`), carried beside the verbatim text so the client
@@ -1734,6 +2227,24 @@ export class TimelineBuilder {
     for (const callId of [...this.#runningTools]) {
       const previous = this.#items.get(`tool:${callId}`);
       if (previous === undefined || previous.type !== "tool_call") continue;
+      const tracked = this.#subagentCalls.get(callId);
+      if (tracked !== undefined) {
+        tracked.canceled = true;
+        const nextSubagent = this.#buildSubagentMetadata(tracked);
+        const existingMeta = isRecord(previous.metadata) ? previous.metadata : {};
+        out.push(
+          ...this.#put({
+            ...previous,
+            metadata: {
+              ...existingMeta,
+              [DSH_SUBAGENT_METADATA_KEY]: nextSubagent as unknown as JsonValue,
+            },
+            status: "canceled" as const,
+            error: null,
+          }),
+        );
+        continue;
+      }
       out.push(...this.#put({ ...previous, status: "canceled" as const, error: null }));
     }
     return out;
@@ -1752,6 +2263,7 @@ export class TimelineBuilder {
     name: string,
     input: Record<string, unknown>,
     jobTitle?: string,
+    eventTime?: number,
   ): ProviderTimelineItem[] {
     const previous = this.#items.get(`tool:${callId}`);
     if (
@@ -1767,6 +2279,21 @@ export class TimelineBuilder {
     // A spawn names its member before any result arrives; remembering it here
     // is what makes the spawn row itself and the rows after it carry the label.
     this.#absorbToolCallRoster(name, input);
+    let dshSubagent: DshSubagentMetadata | undefined;
+    if (isSubagentToolName(name)) {
+      const prev = this.#subagentCalls.get(callId);
+      const tracked: TrackedSubagentCall = {
+        callId,
+        kind: name,
+        input,
+        callTime: prev?.callTime ?? eventTime ?? this.#toolCallTimes.get(callId),
+        failed: false,
+        canceled: false,
+        completed: false,
+      };
+      this.#subagentCalls.set(callId, tracked);
+      dshSubagent = this.#buildSubagentMetadata(tracked);
+    }
     const item: ProviderTimelineItem = {
       type: "tool_call",
       id: `tool:${callId}`,
@@ -1778,6 +2305,7 @@ export class TimelineBuilder {
         undefined,
         carriesTeamRoster(name) ? this.#teamRoster : undefined,
         jobTitle,
+        dshSubagent,
       ),
       status: "running",
       error: null,

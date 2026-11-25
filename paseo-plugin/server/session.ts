@@ -52,6 +52,15 @@ import { paseoIdentityFromEnv } from "./identity-env";
 import { ASSISTANT_DELTA_EVENT, TimelineBuilder } from "./timeline";
 import { isGoalRoundSource } from "./activity-timeline";
 import { assistantStreamFirstTokenTime } from "./first-token";
+import {
+  extractSubagentTelemetryFromEvents,
+  formatSubagentModel,
+  isSubagentToolName,
+  mapSubagentStopReason,
+  type SubagentMode,
+  type SubagentStatus,
+  type SubagentTelemetry,
+} from "../shared/subagent-card";
 
 /**
  * The two option keys this provider owns: Paseo's composer reads them under
@@ -302,6 +311,14 @@ export function modes(): ProviderMode[] {
 
 /** Bounded cap on child notices held until the root is ready or their parent appears. */
 const CHILD_BUFFER_LIMIT = 2000;
+
+/**
+ * Total budget for best-effort child history telemetry reads during root
+ * `replayHistory()`, only spent when the parent log actually has correlated
+ * `subagent` / `subagent_fork` tool calls.
+ */
+const SUBAGENT_TELEMETRY_REPLAY_BUDGET_MS = 1_500;
+const SUBAGENT_TELEMETRY_REPLAY_CONCURRENCY = 4;
 
 /**
  * Held events for one label-less child before it is opened without a title.
@@ -704,6 +721,18 @@ export class DshSession {
   readonly #childParents = new Map<string, string>();
   /** The same children, keyed by the root-scoped Paseo provider id they emit. */
   #childByProviderId = new Map<string, DshChildSession>();
+  /** Measured child execution telemetry keyed by DSH child session id. */
+  #childTelemetry = new Map<string, SubagentTelemetry>();
+  /**
+   * `callId -> root turnId` for `subagent` / `subagent_fork` rows emitted in the
+   * currently active root turn.
+   *
+   * Paseo's `timeline-projection.js` merges `tool_call` updates in place ONLY
+   * when `existing.turnId === entry.turnId`; a cross-turn re-emit duplicates the
+   * row at the bottom of the timeline. Tracking the spawning turn here gates
+   * live telemetry/settlement updates to same-turn refreshes only.
+   */
+  #subagentCallTurns = new Map<string, string>();
   /** Whether Paseo negotiated `session.subsession`; gates every child emission. */
   readonly #subsession: boolean;
   /** Set once the root has emitted `session.ready`; children are gated on it. */
@@ -1879,6 +1908,11 @@ export class DshSession {
     }
     if (events.length === 0) return;
     const builder = new TimelineBuilder({ warn: (line) => this.#options.log(line) });
+    // Pre-scan durable catalog/settlement facts and best-effort child telemetry
+    // BEFORE emitting rows, so `subagent` / `subagent_fork` calls carry their
+    // observed facts in their original turn (Paseo does not merge cross-turn
+    // tool_call updates).
+    await this.#seedSubagentReplayState(builder, events);
     let lastTimestamp: string | undefined;
     // The DSH turn currently being replayed, and whether its `turn/end` is in yet.
     //
@@ -1939,7 +1973,12 @@ export class DshSession {
         // non-human source kind is still skipped by `replayRowSource` below.
         if (isGoalRoundSource(source)) {
           const itemTimestamp = timestamp ?? lastTimestamp;
-          const items = builder.consume({ type: event.type, seq, data });
+          const items = builder.consume({
+            type: event.type,
+            seq,
+            ...(typeof event.time === "number" ? { time: event.time } : {}),
+            data,
+          });
           if (items.length > 0) startReplayTurn();
           for (const item of items) {
             this.#options.emit({
@@ -1985,7 +2024,12 @@ export class DshSession {
       // Consumed before the bracket is announced: an event that produces no row
       // (`step/end`, `turn/end` of a clean turn) must not be the reason a turn
       // appears on screen.
-      const items = builder.consume({ type: event.type, seq, data });
+      const items = builder.consume({
+        type: event.type,
+        seq,
+        ...(typeof event.time === "number" ? { time: event.time } : {}),
+        data,
+      });
       if (items.length > 0) startReplayTurn();
       for (const item of items) {
         this.#options.emit({
@@ -2085,7 +2129,70 @@ export class DshSession {
     // the live builder keeps any descriptions it already learned from live
     // events (merge, not replace).
     this.#timeline.mergeTeamRoster(builder.rosterSnapshot());
+    this.#timeline.mergeSubagentState(builder.subagentStateSnapshot());
     this.#syncChildRosters();
+  }
+
+  /**
+   * Seed a replay `TimelineBuilder` with subagent catalog/settlement facts from
+   * `events`, plus best-effort measured telemetry (`steps`, `durationMs`,
+   * `outputTokens`, `status`, `report`, `preset`, `model`) from referenced child
+   * logs within a tight wall-clock budget.
+   *
+   * Sessions with zero correlated `subagent` / `subagent_fork` calls make zero
+   * extra RPCs. Read errors, unavailable logs, or budget expiry degrade cleanly
+   * without notices or throws — unmeasured fields are simply omitted.
+   */
+  async #seedSubagentReplayState(
+    builder: TimelineBuilder,
+    events: ReadonlyArray<{ type: string; seq?: number; time?: number; data?: unknown }>,
+  ): Promise<void> {
+    const referencedChildIds = builder.preScanSubagentEvents(events);
+    for (const [childId, telemetry] of this.#childTelemetry) {
+      builder.recordSubagentTelemetry(childId, telemetry);
+    }
+    if (referencedChildIds.length === 0 || this.#closed) return;
+    const missing = referencedChildIds.filter((childId) => !this.#childTelemetry.has(childId));
+    if (missing.length === 0) return;
+    const process = this.#process;
+    if (process === undefined || typeof process.history !== "function") return;
+
+    const deadline = Date.now() + SUBAGENT_TELEMETRY_REPLAY_BUDGET_MS;
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      while (!this.#closed) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return;
+        const index = cursor;
+        cursor += 1;
+        if (index >= missing.length) return;
+        const childId = missing[index];
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const history = await Promise.race([
+            process.history(childId),
+            new Promise<undefined>((resolve) => {
+              timer = setTimeout(() => resolve(undefined), remaining);
+            }),
+          ]);
+          if (history === undefined || this.#closed || history.available === false) continue;
+          const telemetry = extractSubagentTelemetryFromEvents(
+            history.events,
+            history.inheritedEventCount,
+          );
+          if (Object.keys(telemetry).length === 0) continue;
+          this.#childTelemetry.set(childId, telemetry);
+          builder.recordSubagentTelemetry(childId, telemetry);
+        } catch {
+          // Best-effort telemetry enrichment only; authoritative replay errors
+          // belong to `replaySubagents()`.
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+        }
+      }
+    };
+    const concurrency = Math.min(SUBAGENT_TELEMETRY_REPLAY_CONCURRENCY, missing.length);
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
   }
 
   /** Emit one replayed root turn boundary (started or a terminal state). */
@@ -2996,6 +3103,8 @@ export class DshSession {
     // before the close, with the same `canceled` signal a real interrupt uses.
     this.#cancelTurnLocally();
     this.#closed = true;
+    this.#subagentCallTurns.clear();
+    this.#childTelemetry.clear();
     clearTimeout(this.#usageRefreshTimer);
     this.#clearUsageReplays();
     const process = this.#process;
@@ -3091,6 +3200,7 @@ export class DshSession {
       // rewrote the first turn's already-shown stats row in place.
       if (!this.#turnStarted) {
         this.#toolStarts.clear();
+        this.#subagentCallTurns.clear();
         this.#turnTool = { count: 0, ms: 0 };
         // A later usage refresh must not rewrite the previous turn's row.
         this.#lastStats = undefined;
@@ -3308,6 +3418,7 @@ export class DshSession {
       log: (line) => this.#options.log(line),
       resolvePermission: (permissionId, response) => this.resolvePermission(permissionId, response),
       teamRoster: this.#timeline.rosterSnapshot(),
+      onTelemetry: (nativeId, telemetry) => this.#onChildTelemetry(nativeId, telemetry),
     });
     this.#children.set(payload.sessionId, child);
     this.#childByProviderId.set(child.id, child);
@@ -3626,7 +3737,21 @@ export class DshSession {
     // the timeline builder folds the same frame into the growing answer row, so
     // one arrival feeds both halves of the feature.
     if (event.type === ASSISTANT_DELTA_EVENT) this.#observeStreamSnapshot(isRecord(event.data) ? event.data : {});
-    for (const item of this.#timeline.consume(event)) this.#emitItem(item);
+    for (const item of this.#timeline.consume(event)) {
+      if (
+        item.type === "tool_call" &&
+        isSubagentToolName(item.name) &&
+        this.#turnStarted &&
+        this.#turnId !== null
+      ) {
+        this.#subagentCallTurns.set(item.callId, this.#turnId);
+      }
+      this.#emitItem(item);
+    }
+    if (event.type === "user/message") {
+      const settled = this.#timeline.observeSubagentUserMessage(isRecord(event.data) ? event.data : {});
+      if (settled !== undefined) this.#emitSameTurnSubagentUpdate(settled.callId, settled.item);
+    }
     // A live `spawn_teammate` / `list_agents` row (or rc.3's durable
     // `subagent/catalog` fact) just taught the parent's builder a description;
     // mirror it before the next child row is built. The catalog is the only
@@ -3816,6 +3941,32 @@ export class DshSession {
   /** Publish one timeline item for this session. */
   #emitItem(item: ProviderTimelineItem): void {
     this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
+  }
+
+  /**
+   * Absorb a child session's measured telemetry and, when the spawning
+   * `subagent` / `subagent_fork` row belongs to the currently active root turn,
+   * re-emit the enriched row in place.
+   */
+  #onChildTelemetry(nativeId: string, telemetry: SubagentTelemetry): void {
+    if (this.#closed) return;
+    this.#childTelemetry.set(nativeId, telemetry);
+    const updated = this.#timeline.recordSubagentTelemetry(nativeId, telemetry);
+    if (updated !== undefined) {
+      this.#emitSameTurnSubagentUpdate(updated.callId, updated.item);
+    }
+  }
+
+  /**
+   * Re-emit a `subagent` / `subagent_fork` `tool_call` ONLY while its spawning
+   * root turn is still open: Paseo's `timeline-projection.js` rejects cross-turn
+   * `tool_call` merges (`existing.turnId !== entry.turnId`) and appends a
+   * duplicate row instead.
+   */
+  #emitSameTurnSubagentUpdate(callId: string, item: ProviderTimelineItem): void {
+    if (!this.#turnStarted || this.#turnId === null) return;
+    if (this.#subagentCallTurns.get(callId) !== this.#turnId) return;
+    this.#emitItem(item);
   }
 
   /**
@@ -4072,6 +4223,8 @@ interface DshChildSessionOptions {
   resolvePermission(permissionId: string, response: ProviderPermissionResponse): void;
   /** The parent's roster at creation time; the parent updates it on later live team events. */
   teamRoster?: ReadonlyMap<string, string>;
+  /** Invoked whenever this child observes updated real execution telemetry. */
+  onTelemetry?: (nativeId: string, telemetry: SubagentTelemetry) => void;
 }
 
 /**
@@ -4125,6 +4278,20 @@ export class DshChildSession {
    * this child is demonstrably live here.
    */
   #observedLive = false;
+  /** Observed telemetry accumulated from this child's own events (past fork prefix). */
+  #telemetrySteps = new Set<string>();
+  #telemetryAnonStep = 0;
+  #telemetryOutputTokens = 0;
+  #telemetryHasOutputTokens = false;
+  #telemetryActiveTurnStart: number | undefined;
+  #telemetryDurationMs = 0;
+  #telemetryHasDuration = false;
+  #telemetryStatus: SubagentStatus | undefined;
+  #telemetryReport: string | undefined;
+  #telemetryMode: SubagentMode | undefined;
+  #telemetryPreset: string | undefined;
+  #telemetryModel: string | undefined;
+  #telemetryLabel: string | undefined;
 
   /**
    * Child sessions are a read-only projection: they have no process of their own
@@ -4172,6 +4339,94 @@ export class DshChildSession {
   get running(): boolean | undefined {
     if (!this.#observedLive) return undefined;
     return this.#turnId !== null && !this.#turnEnded;
+  }
+
+  /** Snapshot of real measured telemetry observed on this child session so far. */
+  telemetry(): SubagentTelemetry {
+    return {
+      ...(this.#telemetryStatus === undefined ? {} : { status: this.#telemetryStatus }),
+      ...(this.#telemetryReport === undefined ? {} : { report: this.#telemetryReport }),
+      ...(this.#telemetryMode === undefined ? {} : { mode: this.#telemetryMode }),
+      ...(this.#telemetryPreset === undefined ? {} : { preset: this.#telemetryPreset }),
+      ...(this.#telemetryModel === undefined ? {} : { model: this.#telemetryModel }),
+      ...(this.#telemetryLabel === undefined ? {} : { label: this.#telemetryLabel }),
+      ...(this.#telemetrySteps.size > 0 ? { steps: this.#telemetrySteps.size } : {}),
+      ...(this.#telemetryHasDuration ? { durationMs: Math.round(this.#telemetryDurationMs) } : {}),
+      ...(this.#telemetryHasOutputTokens
+        ? { outputTokens: Math.round(this.#telemetryOutputTokens) }
+        : {}),
+    };
+  }
+
+  #observeTelemetryEvent(
+    event: { type: string; time?: unknown; data?: unknown },
+    inOwnSuffix: boolean,
+  ): boolean {
+    const data = isRecord(event.data) ? event.data : {};
+    if (event.type === "subagent/descriptor") {
+      if (data.mode === "continuable" || data.mode === "one-shot") this.#telemetryMode = data.mode;
+      if (typeof data.agentPreset === "string" && data.agentPreset.trim() !== "") {
+        this.#telemetryPreset = data.agentPreset.trim();
+      }
+      const model = formatSubagentModel(data.agentProvider, data.agentModel);
+      if (model !== undefined) this.#telemetryModel = model;
+      const label = subagentLabel(data);
+      if (label !== undefined) this.#telemetryLabel = label;
+      return true;
+    }
+    if (!inOwnSuffix) return false;
+    const eventTime = typeof event.time === "number" && Number.isFinite(event.time) && event.time >= 0
+      ? event.time
+      : undefined;
+    if (event.type === "turn/start") {
+      this.#telemetryStatus = "running";
+      this.#telemetryActiveTurnStart = eventTime;
+      return true;
+    }
+    if (event.type === "turn/end") {
+      if (
+        this.#telemetryActiveTurnStart !== undefined &&
+        eventTime !== undefined &&
+        eventTime >= this.#telemetryActiveTurnStart
+      ) {
+        this.#telemetryDurationMs += eventTime - this.#telemetryActiveTurnStart;
+        this.#telemetryHasDuration = true;
+      }
+      this.#telemetryActiveTurnStart = undefined;
+      this.#telemetryStatus = mapSubagentStopReason(data.reason) ?? "failed";
+      return true;
+    }
+    if (event.type === "assistant/message") {
+      const turn = typeof data.turn === "number" ? data.turn : undefined;
+      const step = typeof data.step === "number" ? data.step : undefined;
+      if (turn !== undefined && step !== undefined) {
+        this.#telemetrySteps.add(`${turn}:${step}`);
+      } else {
+        this.#telemetryAnonStep += 1;
+        this.#telemetrySteps.add(`anon:${this.#telemetryAnonStep}`);
+      }
+      if (isRecord(data.usage)) {
+        const out = data.usage.outputTokens;
+        if (typeof out === "number" && Number.isFinite(out) && out >= 0) {
+          this.#telemetryOutputTokens += out;
+          this.#telemetryHasOutputTokens = true;
+        }
+      }
+      const message = isRecord(data.message) ? data.message : undefined;
+      if (message !== undefined) {
+        const text = textBlocks(message.content);
+        if (text !== "") this.#telemetryReport = text;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  #notifyTelemetry(): void {
+    if (this.#options.onTelemetry === undefined) return;
+    const snapshot = this.telemetry();
+    if (Object.keys(snapshot).length === 0) return;
+    this.#options.onTelemetry(this.nativeId, snapshot);
   }
 
   /** Announce the child to Paseo as a provider-owned subsession. Idempotent. */
@@ -4234,6 +4489,9 @@ export class DshChildSession {
           usage: this.#lastUsage,
         });
       }
+    }
+    if (this.#observeTelemetryEvent(event, true)) {
+      this.#notifyTelemetry();
     }
     for (const item of this.#timeline.consume(event)) {
       this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
@@ -4320,6 +4578,8 @@ export class DshChildSession {
     if (this.#turnEnded && this.#turnId === null) return;
     this.#turnId = null;
     this.#turnEnded = true;
+    this.#telemetryStatus = "failed";
+    this.#notifyTelemetry();
     this.#options.emit({
       type: "session.runtime_failed",
       sessionId: this.id,
@@ -4375,7 +4635,9 @@ export class DshChildSession {
     let lastTimestamp: string | undefined;
     for (const event of events) {
       const seq = typeof event.seq === "number" ? event.seq : fallbackSeq++;
-      if (seq < inheritedEventCount) continue;
+      const inOwnSuffix = seq >= inheritedEventCount;
+      this.#observeTelemetryEvent(event, inOwnSuffix);
+      if (!inOwnSuffix) continue;
       const data = isRecord(event.data) ? event.data : {};
       const timestamp = replayTimestamp(event);
       if (timestamp !== undefined) lastTimestamp = timestamp;
@@ -4436,7 +4698,12 @@ export class DshChildSession {
         continue;
       }
       const itemTimestamp = timestamp ?? lastTimestamp;
-      for (const item of this.#timeline.consume({ type: event.type, seq, data })) {
+      for (const item of this.#timeline.consume({
+        type: event.type,
+        seq,
+        ...(typeof event.time === "number" ? { time: event.time } : {}),
+        data,
+      })) {
         this.#options.emit({
           type: "timeline.item",
           sessionId: this.id,
@@ -4448,6 +4715,7 @@ export class DshChildSession {
     // The stored log's own terminal: only the terminal is emitted, so a failed
     // or cancelled child is never shown as completed.
     if (!turnOpen && lastTurnEnd !== undefined) {
+      this.#notifyTelemetry();
       this.#endReplayedTurn(lastTurnEnd);
       return;
     }
@@ -4465,7 +4733,10 @@ export class DshChildSession {
       // close: with no turn in the log it proves nothing about this child.
       const adoptingProvesOpenTurn = (live || processKeptRunning) && turnOpen;
       const bufferedTerminalClosesTurn = terminalBuffered && turnOpen;
-      if (adoptingProvesOpenTurn || bufferedTerminalClosesTurn || this.#observedLive) return;
+      if (adoptingProvesOpenTurn || bufferedTerminalClosesTurn || this.#observedLive) {
+        this.#notifyTelemetry();
+        return;
+      }
       this.#options.log(
         `subagent ${this.nativeId}: stored history ends with no turn terminal ` +
           `(${turnOpen ? "the last turn was never closed" : "no turn was ever recorded"}); ` +
@@ -4482,6 +4753,8 @@ export class DshChildSession {
       for (const item of this.#timeline.settleLoadingCompactions()) {
         this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
       }
+      this.#telemetryStatus = "canceled";
+      this.#notifyTelemetry();
       this.#endReplayedTurn("canceled");
     }
   }
