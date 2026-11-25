@@ -341,6 +341,62 @@ function buildContributions(client: PluginClientContext): () => void {
           hideResultCaption: z.boolean().optional(),
         })
         .nullable(),
+      // Lightweight expandable card metadata for subagent / subagent_fork;
+      // null for every other tool.
+      subagent: z
+        .object({
+          kind: z.enum(["subagent", "subagent_fork"]),
+          status: z.enum(["running", "completed", "failed", "canceled"]),
+          role: z.string().optional(),
+          title: z.string().optional(),
+          task: z.string().optional(),
+          report: z.string().optional(),
+          childSessionId: z.string().optional(),
+          mode: z.enum(["continuable", "one-shot"]).optional(),
+          preset: z.string().optional(),
+          model: z.string().optional(),
+          steps: z.number().optional(),
+          durationMs: z.number().optional(),
+          outputTokens: z.number().optional(),
+        })
+        .nullable(),
+      // Single-line status-chip summary for list_agents / archive_subagents;
+      // null for every other tool or unrecognized/failed output.
+      subagentChips: z
+        .discriminatedUnion("kind", [
+          z.object({
+            kind: z.literal("list_agents"),
+            list: z.object({
+              format: z.enum(["text", "tree-json", "roster-json", "empty"]),
+              counts: z.object({
+                total: z.number(),
+                running: z.number(),
+                inactive: z.number(),
+                completed: z.number(),
+                failed: z.number(),
+                canceled: z.number(),
+                archived: z.number(),
+                diagnostic: z.number(),
+                other: z.number(),
+              }),
+              leadOnly: z.boolean(),
+              leadStatus: z.string().optional(),
+            }),
+          }),
+          z.object({
+            kind: z.literal("archive_subagents"),
+            archive: z.object({
+              scope: z.enum(["session", "all"]),
+              dryRun: z.boolean(),
+              total: z.number(),
+              archived: z.number(),
+              alreadyArchived: z.number(),
+              running: z.number(),
+              failed: z.number(),
+            }),
+          }),
+        ])
+        .nullable(),
       // DSH's failure code, error class, and words drawn for a known code.
       errorCode: z.string(),
       errorName: z.string().optional(),

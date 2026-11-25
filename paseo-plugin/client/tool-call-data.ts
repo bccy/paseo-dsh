@@ -16,6 +16,16 @@
  */
 import type { AgentMessage } from "./agent-message";
 import { agentMessageLabel, currentLocale, localeText, teamToolErrorDisplay, type ToolCardsText } from "./locale";
+import {
+  parseSubagentStatusChips,
+  resolveSubagentCardMetadata,
+  type ArchiveSubagentsSummary,
+  type DshSubagentMetadata,
+  type ListAgentsSummary,
+  type SubagentKind,
+  type SubagentMode,
+  type SubagentStatus,
+} from "../shared/subagent-card";
 import { teamTaskSchema } from "../shared/team";
 import { labelFor, rosterFromMetadata } from "./team-roster";
 import { teamTaskFields, teamTaskMark, type TeamTaskMark } from "./team-polling";
@@ -239,6 +249,17 @@ export interface ToolCallData {
    */
   fields: ToolFieldsData | null;
   /**
+   * Lightweight expandable card metadata for `subagent` / `subagent_fork`, or
+   * null for every other tool. Populated strictly from observed facts via
+   * `resolveSubagentCardMetadata` (unmeasured metrics omitted, never fabricated).
+   */
+  subagent: SubagentCardData | null;
+  /**
+   * Single-line status-chip summary for `list_agents` / `archive_subagents`, or
+   * null for every other tool (and on failed / unrecognized output).
+   */
+  subagentChips: SubagentStatusChipsData | null;
+  /**
    * DSH's structured failure code for a failed row (`HarnessError.code`, relayed
    * on `metadata.errorCode` by `server/timeline.ts`), or "".
    */
@@ -349,6 +370,65 @@ export type ToolFieldsData = {
    */
   hideResultCaption?: boolean;
 };
+
+/**
+ * Lightweight expandable card payload for `subagent` / `subagent_fork` rows.
+ *
+ * A type alias rather than an interface so `ToolCallData` stays assignable to
+ * Paseo's `JsonValue` payload. Mirrors `DshSubagentMetadata` verbatim.
+ */
+export type SubagentCardData = {
+  kind: SubagentKind;
+  status: SubagentStatus;
+  role?: string;
+  title?: string;
+  task?: string;
+  report?: string;
+  childSessionId?: string;
+  mode?: SubagentMode;
+  preset?: string;
+  model?: string;
+  steps?: number;
+  durationMs?: number;
+  outputTokens?: number;
+};
+
+/** Lead-excluded status count breakdown for `list_agents` inline chips. */
+export type SubagentListCountsData = {
+  total: number;
+  running: number;
+  inactive: number;
+  completed: number;
+  failed: number;
+  canceled: number;
+  archived: number;
+  diagnostic: number;
+  other: number;
+};
+
+/** Structured inline status-chip summary for `list_agents`. */
+export type SubagentListChipsData = {
+  format: ListAgentsSummary["format"];
+  counts: SubagentListCountsData;
+  leadOnly: boolean;
+  leadStatus?: string;
+};
+
+/** Structured inline status-chip summary for `archive_subagents`. */
+export type SubagentArchiveChipsData = {
+  scope: ArchiveSubagentsSummary["scope"];
+  dryRun: boolean;
+  total: number;
+  archived: number;
+  alreadyArchived: number;
+  running: number;
+  failed: number;
+};
+
+/** Unified inline status-chip summary for `list_agents` and `archive_subagents`. */
+export type SubagentStatusChipsData =
+  | { kind: "list_agents"; list: SubagentListChipsData }
+  | { kind: "archive_subagents"; archive: SubagentArchiveChipsData };
 
 /* -------------------------------------------------------------------------- */
 /* Block copy                                                                 */
@@ -3337,6 +3417,43 @@ export function toolCallData(
     goal !== null ||
     team !== null ||
     fields !== null;
+  const resolvedSubagent: DshSubagentMetadata | null =
+    agentMessage === undefined ? resolveSubagentCardMetadata(item) : null;
+  const subagent: SubagentCardData | null =
+    resolvedSubagent === null ? null : { ...resolvedSubagent };
+  const hasSubagentDetail =
+    subagent !== null &&
+    ((typeof subagent.task === "string" && subagent.task.trim() !== "") ||
+      (typeof subagent.report === "string" && subagent.report.trim() !== ""));
+  const statusChipOutput =
+    type === "unknown"
+      ? detail.output
+      : type === "plain_text"
+        ? detail.text
+        : undefined;
+  const parsedChips =
+    agentMessage === undefined && !failed
+      ? parseSubagentStatusChips(item.name, statusChipOutput, failed)
+      : null;
+  const subagentChips: SubagentStatusChipsData | null =
+    parsedChips === null
+      ? null
+      : parsedChips.kind === "list_agents"
+        ? {
+            kind: "list_agents",
+            list: {
+              format: parsedChips.list.format,
+              counts: { ...parsedChips.list.counts },
+              leadOnly: parsedChips.list.leadOnly,
+              ...(parsedChips.list.leadStatus === undefined
+                ? {}
+                : { leadStatus: parsedChips.list.leadStatus }),
+            },
+          }
+        : {
+            kind: "archive_subagents",
+            archive: { ...parsedChips.archive },
+          };
   // The daemon hints an agent-message row's glyph with `icon: "bot"`; when that
   // hint is missing the row would fall to the wrench, so a message always reads
   // as an agent's row.
@@ -3410,7 +3527,7 @@ export function toolCallData(
     // plain text is empty: the card is the content. A failure reason counts
     // too: that is the only content a failed tool with an empty output has.
     titled: agentMessage !== undefined || description !== "",
-    hasDetail: headline !== "" || body !== "" || structured || failureText !== "",
+    hasDetail: headline !== "" || body !== "" || structured || hasSubagentDetail || failureText !== "",
     kind,
     search,
     read,
@@ -3419,6 +3536,8 @@ export function toolCallData(
     goal,
     team,
     fields,
+    subagent,
+    subagentChips,
     errorCode,
     ...(errorName === "" ? {} : { errorName }),
     errorShort:

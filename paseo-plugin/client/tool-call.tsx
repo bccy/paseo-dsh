@@ -58,6 +58,7 @@ import {
   useInkStreamReveal,
 } from "./row-entrance";
 import { RowStatusIcon, resolveRowIconStatus } from "./row-status-icon";
+import { SubagentCard, SubagentStatusChips } from "./subagent-card";
 import { TeamBlockView } from "./team-card";
 import { TextShimmer } from "./text-shimmer";
 import {
@@ -1187,8 +1188,14 @@ function toolCallSignature(data: ToolCallData): ToolCallSignature {
     };
   }
   // Generic cards whose summary/fields can be replaced by result mappers
-  // (`goal`, `team`, or `fields`-backed MCP/mapped tools) match on `(name, kind)`.
-  if (data.goal !== null || data.team !== null || data.fields !== null || data.failed) {
+  // (`goal`, `team`, `subagent`, or `fields`-backed MCP/mapped tools) match on `(name, kind)`.
+  if (
+    data.goal !== null ||
+    data.team !== null ||
+    data.fields !== null ||
+    data.subagent !== null ||
+    data.failed
+  ) {
     return {
       name: data.name,
       kind: data.kind,
@@ -1549,245 +1556,273 @@ export function InlineToolCall({
       agentId={agentId}
       timestamp={timestamp}
       rowKey={rowKey}
-      liveHint={data.status === "running"}
+      liveHint={data.status === "running" || data.subagent?.status === "running"}
     >
-      <View style={styles.root}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel={headAccessibilityLabel}
-          onPress={() => {
-            if (canExpand) setExpanded((value) => !value);
-          }}
-          style={styles.head}
-        >
-          {/* The glyph carries the state: red for a failure, green for a completed
-              edit, plus a bottom-right corner badge (blue ring while running, bare
-              green checkmark when completed, red cross on failure). A Paseo-owned
-              tool with no glyph of its own draws Paseo's mark, tinted the same. */}
-          <RowStatusIcon
-            status={iconStatus}
-            size={iconSize}
+      {data.subagent !== null ? (
+        <View style={styles.root}>
+          <SubagentCard
+            subagent={data.subagent}
             colors={colors}
-            accessibilityLabel={statusLabel || undefined}
+            hairline={StyleSheet.hairlineWidth}
+            expandedMaxHeight={expandedMaxHeight}
+            compact={compact}
+            expanded={expanded}
+            onToggle={() => setExpanded((value) => !value)}
+            error={data.error}
+            errorShort={data.errorShort}
+            errorHint={data.errorHint}
+            errorCode={data.errorCode}
+            errorName={data.errorName}
+            fallbackBody={data.body}
+          />
+        </View>
+      ) : (
+        <View style={styles.root}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={headAccessibilityLabel}
+            onPress={() => {
+              if (canExpand) setExpanded((value) => !value);
+            }}
+            style={styles.head}
           >
-            {data.paseoMark ? (
-              <Image
-                source={{ uri: PASEO_MARK_ICON }}
-                style={{ width: iconSize, height: iconSize }}
-                tintColor={iconColor}
-              />
-            ) : (
-              <Icon name={data.icon} size={iconSize} color={iconColor} />
-            )}
-          </RowStatusIcon>
-          <TextShimmer
-            active={running}
-            contentStyle={styles.text}
-            highlightColor={colors.foreground}
-            surfaceColor={colors.surface0}
-          >
-            {(color) => (
-              <>
-                <Text style={[styles.label, color === null ? null : { color }]}>
-                  {renderInkTrailText(displayLabel, stream.labelProgress, colors.foreground, color)}
-                </Text>
-                {showSummary && stream.showSeparator ? (
-                  <>
-                    {/* A 2x2 square with 1px corners, not a dot — DSH's separator
-                        between the title and its summary. */}
-                    <View style={styles.sep} />
-                    <Text
-                      style={[
-                        styles.summary,
-                        errorHeadline ? styles.summaryError : null,
-                        color === null ? null : { color },
-                      ]}
-                      numberOfLines={1}
-                    >
-                      {renderInkTrailText(headSummary, stream.summaryProgress, colors.foreground, color)}
-                    </Text>
-                  </>
-                ) : null}
-                {stat !== null && stream.showStat ? (
-                  <>
-                    <Text style={[styles.statAdded, color === null ? null : { color }]}>
-                      {`+${stat.added}`}
-                    </Text>
-                    <Text style={[styles.statRemoved, color === null ? null : { color }]}>
-                      {` -${stat.removed}`}
-                    </Text>
-                  </>
-                ) : null}
-              </>
-            )}
-          </TextShimmer>
-        </Pressable>
-        {expanded && canExpand ? (
-          <View style={styles.body}>
-            <Pressable style={styles.bodyInner} onPress={collapseBody}>
-              {/* The whole failure reason first, selectable. */}
-              {data.errorHint !== "" ? (
-                <Text style={styles.hintText} selectable>
-                  {data.errorHint}
-                  <Text style={styles.hintCode}>{`  ${data.errorCode}${data.errorName === undefined ? "" : `（${data.errorName}）`}`}</Text>
-                </Text>
-              ) : null}
-              {data.errorHint === "" && data.errorCode !== "" && data.errorName !== undefined ? (
-                <Text style={styles.hintText} selectable>
-                  <Text style={styles.hintCode}>{`${data.errorCode}（${data.errorName}）`}</Text>
-                </Text>
-              ) : null}
-              {errorBlock !== "" ? (
-                <ScrollView
-                  style={styles.expandedScroll}
-                  nestedScrollEnabled
-                  testID={SCROLL_BOX_TEST_ID}
-                >
-                  <Pressable onPress={collapseBody}>
-                    <Text style={styles.errorText} selectable>
-                      {errorBlock}
-                    </Text>
-                  </Pressable>
-                </ScrollView>
-              ) : null}
-              {data.goal !== null ? (
-                <GoalBlockView data={data.goal} summary={data.summary} styles={styles} onCollapse={collapseBody} />
-              ) : null}
-              {data.team !== null ? (
-                <TeamBlockView
-                  data={data.team}
-                  hairline={StyleSheet.hairlineWidth}
-                  maxHeight={expandedMaxHeight}
-                  onCollapse={collapseBody}
-                  colors={{
-                    ...colors,
-                    foregroundMuted: colors.foregroundMuted,
-                    extraMuted: (colors as unknown as Record<string, string | undefined>).foregroundExtraMuted ?? colors.foregroundMuted,
-                    running: ringColorFor(colors.surface0),
-                    warning: colors.statusWarning,
-                    border: colors.border,
-                  }}
+            {/* The glyph carries the state: red for a failure, green for a completed
+                edit, plus a bottom-right corner badge (blue ring while running, bare
+                green checkmark when completed, red cross on failure). A Paseo-owned
+                tool with no glyph of its own draws Paseo's mark, tinted the same. */}
+            <RowStatusIcon
+              status={iconStatus}
+              size={iconSize}
+              colors={colors}
+              accessibilityLabel={statusLabel || undefined}
+            >
+              {data.paseoMark ? (
+                <Image
+                  source={{ uri: PASEO_MARK_ICON }}
+                  style={{ width: iconSize, height: iconSize }}
+                  tintColor={iconColor}
                 />
-              ) : null}
-              {data.fields !== null ? (
-                <ToolFieldsView
-                  data={data.fields}
-                  styles={styles}
-                  colors={colors}
-                  resultCaption={text.bodyLabels.result}
-                  onCollapse={collapseBody}
-                />
-              ) : null}
-              {terminal ? (
-                <View style={styles.block}>
-                  <View style={styles.commandRow}>
-                    <ScrollView
-                      style={[styles.commandScroll, { flex: 1, minWidth: 0 }]}
-                      contentContainerStyle={styles.command}
-                      nestedScrollEnabled
-                      testID={SCROLL_BOX_TEST_ID}
-                    >
-                      <Pressable onPress={collapseBody}>
-                        <HighlightedCode
-                          text={data.headline}
-                          lang="shell"
-                          colors={colors}
-                          baseStyle={styles.commandText}
-                          selectable
-                        />
-                      </Pressable>
-                    </ScrollView>
-                    {hasBody && data.status !== "running" && data.body.trim() !== "" ? (
-                      <CopyControl text={data.body} style={styles.cardHeadAction} />
-                    ) : null}
-                  </View>
-                  {hasBody ? <View style={styles.divider} /> : null}
-                  {hasBody ? (
-                    <ScrollView
-                      style={styles.terminalOutput}
-                      contentContainerStyle={styles.output}
-                      nestedScrollEnabled
-                      testID={SCROLL_BOX_TEST_ID}
-                    >
-                      <Pressable onPress={collapseBody}>
-                        <Text style={styles.outputText} selectable>
-                          {data.body}
-                        </Text>
-                      </Pressable>
-                    </ScrollView>
-                  ) : null}
-                </View>
-              ) : data.search !== null ? (
-                <SearchBlockView data={data.search} styles={styles} onCollapse={collapseBody} />
-              ) : data.read !== null ? (
-                <ReadBlockView data={data.read} styles={styles} colors={colors} onCollapse={collapseBody} />
-              ) : data.diffBlock !== null ? (
-                <DiffBlockView data={data.diffBlock} styles={styles} colors={colors} onCollapse={collapseBody} />
-              ) : data.web !== null ? (
-                <WebBlockView data={data.web} styles={styles} onCollapse={collapseBody} />
-              ) : data.diff ? (
-                <View style={styles.block}>
-                  {data.headline !== "" ? (
-                    <View style={styles.code}>
-                      <Text style={styles.codeText} selectable>
-                        {data.headline}
+              ) : (
+                <Icon name={data.icon} size={iconSize} color={iconColor} />
+              )}
+            </RowStatusIcon>
+            <TextShimmer
+              active={running}
+              contentStyle={styles.text}
+              highlightColor={colors.foreground}
+              surfaceColor={colors.surface0}
+            >
+              {(color) => (
+                <>
+                  <Text style={[styles.label, color === null ? null : { color }]}>
+                    {renderInkTrailText(displayLabel, stream.labelProgress, colors.foreground, color)}
+                  </Text>
+                  {showSummary && stream.showSeparator ? (
+                    <>
+                      {/* A 2x2 square with 1px corners, not a dot — DSH's separator
+                          between the title and its summary. */}
+                      <View style={styles.sep} />
+                      <Text
+                        style={[
+                          styles.summary,
+                          errorHeadline ? styles.summaryError : null,
+                          color === null ? null : { color },
+                        ]}
+                        numberOfLines={1}
+                      >
+                        {renderInkTrailText(headSummary, stream.summaryProgress, colors.foreground, color)}
                       </Text>
-                    </View>
+                    </>
                   ) : null}
-                  {hasBody ? (
-                    <ScrollView
-                      style={styles.expandedScroll}
-                      contentContainerStyle={styles.diffBody}
-                      nestedScrollEnabled
-                      testID={SCROLL_BOX_TEST_ID}
-                    >
-                      <Pressable onPress={collapseBody}>
-                        <DiffRows
-                          rows={plainDiffRows}
-                          styles={styles}
-                          keyPrefix="plain"
-                          mode={plainDiffMode}
-                          lang={plainDiffLang}
-                          colors={colors}
-                        />
-                      </Pressable>
-                    </ScrollView>
+                  {stat !== null && stream.showStat ? (
+                    <>
+                      <Text style={[styles.statAdded, color === null ? null : { color }]}>
+                        {`+${stat.added}`}
+                      </Text>
+                      <Text style={[styles.statRemoved, color === null ? null : { color }]}>
+                        {` -${stat.removed}`}
+                      </Text>
+                    </>
                   ) : null}
-                </View>
-              ) : data.headline !== "" || hasBody ? (
-                <View style={styles.block}>
-                  {hasBody && data.body.trim() !== "" ? (
-                    <CardHead lang="" title="" text={data.body} styles={styles} />
-                  ) : null}
+                </>
+              )}
+            </TextShimmer>
+            {data.subagentChips !== null ? (
+              <SubagentStatusChips
+                chips={data.subagentChips}
+                colors={colors}
+                hasSummary={showSummary}
+                compact={compact}
+              />
+            ) : null}
+          </Pressable>
+          {expanded && canExpand ? (
+            <View style={styles.body}>
+              <Pressable style={styles.bodyInner} onPress={collapseBody}>
+                {/* The whole failure reason first, selectable. */}
+                {data.errorHint !== "" ? (
+                  <Text style={styles.hintText} selectable>
+                    {data.errorHint}
+                    <Text style={styles.hintCode}>{`  ${data.errorCode}${data.errorName === undefined ? "" : `（${data.errorName}）`}`}</Text>
+                  </Text>
+                ) : null}
+                {data.errorHint === "" && data.errorCode !== "" && data.errorName !== undefined ? (
+                  <Text style={styles.hintText} selectable>
+                    <Text style={styles.hintCode}>{`${data.errorCode}（${data.errorName}）`}</Text>
+                  </Text>
+                ) : null}
+                {errorBlock !== "" ? (
                   <ScrollView
-                    style={styles.codeScroll}
-                    contentContainerStyle={styles.code}
+                    style={styles.expandedScroll}
                     nestedScrollEnabled
                     testID={SCROLL_BOX_TEST_ID}
                   >
                     <Pressable onPress={collapseBody}>
-                      {data.headline !== "" ? (
+                      <Text style={styles.errorText} selectable>
+                        {errorBlock}
+                      </Text>
+                    </Pressable>
+                  </ScrollView>
+                ) : null}
+                {data.goal !== null ? (
+                  <GoalBlockView data={data.goal} summary={data.summary} styles={styles} onCollapse={collapseBody} />
+                ) : null}
+                {data.team !== null ? (
+                  <TeamBlockView
+                    data={data.team}
+                    hairline={StyleSheet.hairlineWidth}
+                    maxHeight={expandedMaxHeight}
+                    onCollapse={collapseBody}
+                    colors={{
+                      ...colors,
+                      foregroundMuted: colors.foregroundMuted,
+                      extraMuted: (colors as unknown as Record<string, string | undefined>).foregroundExtraMuted ?? colors.foregroundMuted,
+                      running: ringColorFor(colors.surface0),
+                      warning: colors.statusWarning,
+                      border: colors.border,
+                    }}
+                  />
+                ) : null}
+                {data.fields !== null ? (
+                  <ToolFieldsView
+                    data={data.fields}
+                    styles={styles}
+                    colors={colors}
+                    resultCaption={text.bodyLabels.result}
+                    onCollapse={collapseBody}
+                  />
+                ) : null}
+                {terminal ? (
+                  <View style={styles.block}>
+                    <View style={styles.commandRow}>
+                      <ScrollView
+                        style={[styles.commandScroll, { flex: 1, minWidth: 0 }]}
+                        contentContainerStyle={styles.command}
+                        nestedScrollEnabled
+                        testID={SCROLL_BOX_TEST_ID}
+                      >
+                        <Pressable onPress={collapseBody}>
+                          <HighlightedCode
+                            text={data.headline}
+                            lang="shell"
+                            colors={colors}
+                            baseStyle={styles.commandText}
+                            selectable
+                          />
+                        </Pressable>
+                      </ScrollView>
+                      {hasBody && data.status !== "running" && data.body.trim() !== "" ? (
+                        <CopyControl text={data.body} style={styles.cardHeadAction} />
+                      ) : null}
+                    </View>
+                    {hasBody ? <View style={styles.divider} /> : null}
+                    {hasBody ? (
+                      <ScrollView
+                        style={styles.terminalOutput}
+                        contentContainerStyle={styles.output}
+                        nestedScrollEnabled
+                        testID={SCROLL_BOX_TEST_ID}
+                      >
+                        <Pressable onPress={collapseBody}>
+                          <Text style={styles.outputText} selectable>
+                            {data.body}
+                          </Text>
+                        </Pressable>
+                      </ScrollView>
+                    ) : null}
+                  </View>
+                ) : data.search !== null ? (
+                  <SearchBlockView data={data.search} styles={styles} onCollapse={collapseBody} />
+                ) : data.read !== null ? (
+                  <ReadBlockView data={data.read} styles={styles} colors={colors} onCollapse={collapseBody} />
+                ) : data.diffBlock !== null ? (
+                  <DiffBlockView data={data.diffBlock} styles={styles} colors={colors} onCollapse={collapseBody} />
+                ) : data.web !== null ? (
+                  <WebBlockView data={data.web} styles={styles} onCollapse={collapseBody} />
+                ) : data.diff ? (
+                  <View style={styles.block}>
+                    {data.headline !== "" ? (
+                      <View style={styles.code}>
                         <Text style={styles.codeText} selectable>
                           {data.headline}
                         </Text>
-                      ) : null}
-                      {hasBody ? (
-                        <HighlightedCode
-                          text={data.body}
-                          lang={genericLang}
-                          colors={colors}
-                          baseStyle={styles.codeText}
-                          selectable
-                        />
-                      ) : null}
-                    </Pressable>
-                  </ScrollView>
-                </View>
-              ) : null}
-            </Pressable>
-          </View>
-        ) : null}
-      </View>
+                      </View>
+                    ) : null}
+                    {hasBody ? (
+                      <ScrollView
+                        style={styles.expandedScroll}
+                        contentContainerStyle={styles.diffBody}
+                        nestedScrollEnabled
+                        testID={SCROLL_BOX_TEST_ID}
+                      >
+                        <Pressable onPress={collapseBody}>
+                          <DiffRows
+                            rows={plainDiffRows}
+                            styles={styles}
+                            keyPrefix="plain"
+                            mode={plainDiffMode}
+                            lang={plainDiffLang}
+                            colors={colors}
+                          />
+                        </Pressable>
+                      </ScrollView>
+                    ) : null}
+                  </View>
+                ) : data.headline !== "" || hasBody ? (
+                  <View style={styles.block}>
+                    {hasBody && data.body.trim() !== "" ? (
+                      <CardHead lang="" title="" text={data.body} styles={styles} />
+                    ) : null}
+                    <ScrollView
+                      style={styles.codeScroll}
+                      contentContainerStyle={styles.code}
+                      nestedScrollEnabled
+                      testID={SCROLL_BOX_TEST_ID}
+                    >
+                      <Pressable onPress={collapseBody}>
+                        {data.headline !== "" ? (
+                          <Text style={styles.codeText} selectable>
+                            {data.headline}
+                          </Text>
+                        ) : null}
+                        {hasBody ? (
+                          <HighlightedCode
+                            text={data.body}
+                            lang={genericLang}
+                            colors={colors}
+                            baseStyle={styles.codeText}
+                            selectable
+                          />
+                        ) : null}
+                      </Pressable>
+                    </ScrollView>
+                  </View>
+                ) : null}
+              </Pressable>
+            </View>
+          ) : null}
+        </View>
+      )}
     </RowEntrance>
   );
 }

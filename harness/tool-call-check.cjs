@@ -4069,6 +4069,10 @@ console.log("runtime component checks (expandedMaxHeight, Read/HighlightedLine a
         RowStatusIcon: "RowStatusIcon",
         resolveRowIconStatus: (status) => status,
       }),
+      "./subagent-card": () => ({
+        SubagentCard: "SubagentCard",
+        SubagentStatusChips: "SubagentStatusChips",
+      }),
       "./team-card": () => ({ TeamBlockView: "TeamBlockView" }),
       "./text-shimmer": () => ({
         TextShimmer: ({ children }) => (typeof children === "function" ? children(null) : children),
@@ -4710,6 +4714,601 @@ console.log("runtime component checks (expandedMaxHeight, Read/HighlightedLine a
     );
     unmountPrefix("reuse-f-turn2");
     resetToolRowIdentityForTests();
+
+    // 6. InlineToolCall Phase 4 wiring:
+    //    - subagent / subagent_fork render SubagentCard inside RowEntrance;
+    //    - list_agents / archive_subagents keep the regular head + SubagentStatusChips
+    //      and still expand raw details when clicked;
+    //    - regular bash rows render neither SubagentCard nor SubagentStatusChips.
+    const subagentWireData = toolCallData(
+      {
+        callId: "call-sub-wire-1",
+        name: "subagent",
+        status: "completed",
+        detail: { type: "sub_agent", description: "Inspect modules", log: "All good." },
+        metadata: {
+          dshSubagent: {
+            kind: "subagent",
+            status: "completed",
+            role: "scout-alpha",
+            title: "Inspect modules",
+            task: "Check exports in server/.",
+            report: "All good.",
+            preset: "explorer",
+            steps: 4,
+            durationMs: 3200,
+            outputTokens: 640,
+          },
+        },
+      },
+      "complete",
+    );
+    const subagentWireTree = renderInlineToolCall(subagentWireData, { mountKey: "wire-sub-1" });
+    const subagentCards = findAll(subagentWireTree, (el) => el.type === "SubagentCard");
+    equal("InlineToolCall renders SubagentCard for subagent rows", subagentCards.length, 1);
+    equal("SubagentCard receives observed subagent payload", subagentCards[0]?.props.subagent?.role, "scout-alpha");
+    equal("SubagentCard receives expandedMaxHeight from settings", subagentCards[0]?.props.expandedMaxHeight, currentStyleSettings.expandedMaxHeight);
+    unmountPrefix("wire-sub-1");
+
+    const listAgentsWireData = toolCallData(
+      {
+        callId: "call-list-wire-1",
+        name: "list_agents",
+        status: "completed",
+        detail: {
+          type: "unknown",
+          input: {},
+          output: "lead [running] — root agent\nscout-a [running] — check A\nscout-b [completed] — check B",
+        },
+      },
+      "complete",
+    );
+    const listWireCollapsed = renderInlineToolCall(listAgentsWireData, { mountKey: "wire-list-1", expand: false });
+    const listWireChips = findAll(listWireCollapsed, (el) => el.type === "SubagentStatusChips");
+    equal("InlineToolCall renders SubagentStatusChips inline for list_agents", listWireChips.length, 1);
+    equal("list_agents keeps zero SubagentCard elements", findAll(listWireCollapsed, (el) => el.type === "SubagentCard").length, 0);
+    const listWireExpanded = renderInlineToolCall(listAgentsWireData, { mountKey: "wire-list-1", expand: true });
+    check(
+      "clicking list_agents row still expands raw details body",
+      findAll(listWireExpanded, (el) => el.type === "ScrollView" && el.props.testID === SCROLL_BOX_TEST_ID_STUB).length >= 1,
+    );
+    unmountPrefix("wire-list-1");
+
+    const archiveWireData = toolCallData(
+      {
+        callId: "call-archive-wire-1",
+        name: "archive_subagents",
+        status: "completed",
+        detail: {
+          type: "unknown",
+          input: { scope: "session" },
+          output: [
+            "children of this session: 3 candidate(s)",
+            "archived 2: a, b",
+            "already archived 0: none",
+            "running (skipped) 1: c",
+            "failed: none",
+          ].join("\n"),
+        },
+      },
+      "complete",
+    );
+    const archiveWireCollapsed = renderInlineToolCall(archiveWireData, { mountKey: "wire-archive-1", expand: false });
+    equal("InlineToolCall renders SubagentStatusChips inline for archive_subagents", findAll(archiveWireCollapsed, (el) => el.type === "SubagentStatusChips").length, 1);
+    const archiveWireExpanded = renderInlineToolCall(archiveWireData, { mountKey: "wire-archive-1", expand: true });
+    check(
+      "clicking archive_subagents row still expands raw details body",
+      findAll(archiveWireExpanded, (el) => el.type === "ScrollView" && el.props.testID === SCROLL_BOX_TEST_ID_STUB).length >= 1,
+    );
+    unmountPrefix("wire-archive-1");
+
+    const bashWireTree = renderInlineToolCall(noCallIdData, { mountKey: "wire-bash-1" });
+    equal("regular bash row renders zero SubagentCard elements", findAll(bashWireTree, (el) => el.type === "SubagentCard").length, 0);
+    equal("regular bash row renders zero SubagentStatusChips elements", findAll(bashWireTree, (el) => el.type === "SubagentStatusChips").length, 0);
+    unmountPrefix("wire-bash-1");
+  }
+}
+
+console.log("Phase 4: subagent expandable card & status chips (data layer + real component render)");
+{
+  setLocale("zh-CN");
+  const regular = toolCallData(
+    { name: "bash", status: "completed", detail: { type: "shell", command: "ls" } },
+    "complete",
+  );
+  equal("regular tool sets subagent to null", regular.subagent, null);
+  equal("regular tool sets subagentChips to null", regular.subagentChips, null);
+
+  const runningSub = toolCallData(
+    {
+      name: "subagent",
+      status: "completed",
+      detail: { type: "sub_agent", description: "Audit layout", log: "started subagent scout-1" },
+      metadata: {
+        dshSubagent: {
+          kind: "subagent",
+          status: "running",
+          role: "scout-1",
+          title: "Audit layout",
+          task: "Inspect server/ files.",
+          preset: "explorer",
+          model: "fixture/alpha",
+        },
+      },
+    },
+    "complete",
+  );
+  equal("subagent keeps icon Bot", runningSub.icon, "Bot");
+  equal("subagent keeps kind generic", runningSub.kind, "generic");
+  equal("subagent populates subagent card metadata", runningSub.subagent?.status, "running");
+  equal("subagent preserves unmeasured metrics as absent (steps)", "steps" in (runningSub.subagent ?? {}), false);
+  equal("subagent preserves unmeasured metrics as absent (durationMs)", "durationMs" in (runningSub.subagent ?? {}), false);
+  equal("subagent preserves unmeasured metrics as absent (outputTokens)", "outputTokens" in (runningSub.subagent ?? {}), false);
+  check("subagent with task sets hasDetail=true even before report", runningSub.hasDetail === true);
+
+  const forkSub = toolCallData(
+    {
+      name: "subagent_fork",
+      status: "completed",
+      detail: {
+        type: "unknown",
+        input: { name: "branch-reviewer", description: "Check diff", prompt: "Inspect branch edge cases." },
+        output: "No issues found.",
+      },
+      metadata: {
+        dshSubagent: {
+          kind: "subagent_fork",
+          status: "completed",
+          role: "branch-reviewer",
+          title: "Check diff",
+          task: "Inspect branch edge cases.",
+          report: "No issues found.",
+          steps: 3,
+          durationMs: 4250,
+          outputTokens: 1320,
+        },
+      },
+    },
+    "complete",
+  );
+  equal("subagent_fork keeps icon GitFork", forkSub.icon, "GitFork");
+  equal("subagent_fork keeps zh-CN label 派生子智能体分支", forkSub.label, "派生子智能体分支");
+  equal("subagent_fork sets subagent.kind=subagent_fork", forkSub.subagent?.kind, "subagent_fork");
+  equal("subagent_fork forwards observed steps", forkSub.subagent?.steps, 3);
+  equal("subagent_fork forwards observed durationMs", forkSub.subagent?.durationMs, 4250);
+  equal("subagent_fork forwards observed outputTokens", forkSub.subagent?.outputTokens, 1320);
+
+  const historicalSub = toolCallData(
+    {
+      name: "subagent",
+      status: "completed",
+      detail: { type: "sub_agent", subAgentType: "research", description: "Legacy lookup", log: "Done finding refs." },
+    },
+    "complete",
+  );
+  equal("historical subagent falls back cleanly to detail role", historicalSub.subagent?.role, "research");
+  equal("historical subagent falls back cleanly to detail report", historicalSub.subagent?.report, "Done finding refs.");
+  equal("historical subagent does not fabricate steps", "steps" in (historicalSub.subagent ?? {}), false);
+
+  // Status chips data layer across all 3 list_agents formats + archive_subagents
+  const listText = toolCallData(
+    {
+      name: "list_agents",
+      status: "completed",
+      detail: {
+        type: "unknown",
+        input: {},
+        output: "lead [running] — root\na [running] — task a\nb [completed] — task b\nc [failed] — task c",
+      },
+    },
+    "complete",
+  );
+  equal("list_agents text format populates subagentChips", listText.subagentChips?.kind, "list_agents");
+  equal("list_agents excludes lead from chip counts", listText.subagentChips?.list.counts.total, 3);
+  equal("list_agents counts running=1, completed=1, failed=1", [
+    listText.subagentChips?.list.counts.running,
+    listText.subagentChips?.list.counts.completed,
+    listText.subagentChips?.list.counts.failed,
+  ], [1, 1, 1]);
+
+  const listFailed = toolCallData(
+    {
+      name: "list_agents",
+      status: "failed",
+      detail: { type: "unknown", input: {}, output: "lead [running]" },
+      error: { message: "boom" },
+    },
+    "complete",
+  );
+  equal("failed list_agents drops subagentChips to null", listFailed.subagentChips, null);
+
+  const listMixed = toolCallData(
+    {
+      name: "list_agents",
+      status: "completed",
+      detail: {
+        type: "unknown",
+        input: {},
+        output: JSON.stringify([
+          { target: "lead", role: "lead", status: "running" },
+          { name: "scout", status: "running" },
+        ]),
+      },
+    },
+    "complete",
+  );
+  equal("mixed malformed list_agents drops subagentChips to null", listMixed.subagentChips, null);
+
+  const archiveDryRun = toolCallData(
+    {
+      name: "archive_subagents",
+      status: "completed",
+      detail: {
+        type: "unknown",
+        input: { dryRun: true },
+        output: [
+          "all stored subagent sessions: 4 candidate(s)",
+          "[dry run] would archive 2: s1, s2",
+          "already archived 1: s3",
+          "running (skipped) 1: s4",
+          "failed: none",
+        ].join("\n"),
+      },
+    },
+    "complete",
+  );
+  equal("archive_subagents dry-run populates subagentChips", archiveDryRun.subagentChips?.kind, "archive_subagents");
+  equal("archive_subagents dry-run counts", {
+    dryRun: archiveDryRun.subagentChips?.archive.dryRun,
+    archived: archiveDryRun.subagentChips?.archive.archived,
+    running: archiveDryRun.subagentChips?.archive.running,
+    failed: archiveDryRun.subagentChips?.archive.failed,
+  }, { dryRun: true, archived: 2, running: 1, failed: 0 });
+
+  // Render the real compiled client/subagent-card.js component under Node stubs
+  const subagentCardJs = path.join(compiledBase, "client", "subagent-card.js");
+  check("compiled client/subagent-card.js exists for runtime tests", fs.existsSync(subagentCardJs), subagentCardJs);
+  if (fs.existsSync(subagentCardJs)) {
+    const hookState = new Map();
+    let currentPath = "root";
+    let hookIndex = 0;
+    const copiedPayloads = [];
+    let copyMode = "resolve";
+
+    const reactStub = {
+      useState(initial) {
+        const key = `${currentPath}#${hookIndex++}`;
+        if (!hookState.has(key)) {
+          hookState.set(key, typeof initial === "function" ? initial() : initial);
+        }
+        const setState = (next) => {
+          const prev = hookState.get(key);
+          hookState.set(key, typeof next === "function" ? next(prev) : next);
+        };
+        return [hookState.get(key), setState];
+      },
+      useCallback(fn) {
+        hookIndex += 1;
+        return fn;
+      },
+      useMemo(factory) {
+        hookIndex += 1;
+        return factory();
+      },
+      useRef(initial) {
+        const key = `${currentPath}#${hookIndex++}`;
+        if (!hookState.has(key)) hookState.set(key, { current: initial });
+        return hookState.get(key);
+      },
+      useEffect() {
+        hookIndex += 1;
+      },
+      useLayoutEffect() {
+        hookIndex += 1;
+      },
+      useSyncExternalStore(_subscribe, getSnapshot) {
+        hookIndex += 1;
+        return getSnapshot();
+      },
+    };
+    const jsxRuntimeStub = {
+      jsx: (type, props, key) => ({ type, props: props ?? {}, key }),
+      jsxs: (type, props, key) => ({ type, props: props ?? {}, key }),
+      Fragment: "Fragment",
+    };
+    const rnStub = {
+      ActivityIndicator: "ActivityIndicator",
+      Animated: {
+        View: "AnimatedView",
+        Value: function Value(v) {
+          this.value = v;
+          this.setValue = () => {};
+          this.interpolate = () => "0deg";
+        },
+        loop: () => ({ start() {}, stop() {} }),
+        timing: () => ({ start() {}, stop() {} }),
+      },
+      Easing: { linear: (t) => t },
+      Platform: { OS: "ios", select: (options) => options.ios ?? options.default },
+      Pressable: "Pressable",
+      ScrollView: "ScrollView",
+      StyleSheet: { hairlineWidth: 1, create: (s) => s },
+      Text: "Text",
+      View: "View",
+    };
+    const uiStub = {
+      Icon: "Icon",
+      ScrollView: "ScrollView",
+      copyText: (text) => {
+        copiedPayloads.push(text);
+        if (copyMode === "reject") return Promise.reject(new Error("clipboard denied"));
+        if (copyMode === "throw") throw new Error("clipboard unavailable");
+        return Promise.resolve();
+      },
+    };
+
+    const stubs = {
+      react: () => reactStub,
+      "react/jsx-runtime": () => jsxRuntimeStub,
+      "react-native": () => rnStub,
+      "@getpaseo/plugin/client/ui": () => uiStub,
+      "./row-entrance": () => ({ SCROLL_BOX_TEST_ID: "dsh-scroll-box" }),
+      "./status-ring": () => ({ StatusRingMark: "StatusRingMark" }),
+    };
+
+    const originalLoad = Module._load;
+    const prevCacheKeys = new Set(Object.keys(require.cache));
+    Module._load = function load(request, parent, isMain) {
+      const stub = stubs[request];
+      if (stub !== undefined) return stub();
+      return originalLoad.call(this, request, parent, isMain);
+    };
+
+    let subagentCardMod;
+    try {
+      for (const rel of ["subagent-card.js", "console-ui.js", "console-theme.js", "use-locale.js"]) {
+        const target = path.join(compiledBase, "client", rel);
+        if (fs.existsSync(target)) delete require.cache[require.resolve(target)];
+      }
+      subagentCardMod = require(subagentCardJs);
+    } finally {
+      Module._load = originalLoad;
+      for (const key of Object.keys(require.cache)) {
+        if (!prevCacheKeys.has(key)) delete require.cache[key];
+      }
+    }
+
+    const {
+      SUBAGENT_CARD_BODY_TEST_ID,
+      SUBAGENT_CARD_ICON_TEST_ID,
+      SUBAGENT_CARD_TEST_ID,
+      SUBAGENT_CHIPS_TEST_ID,
+      SubagentCard,
+      SubagentStatusChips,
+      safeCopyText,
+      subagentFactParts,
+      subagentStatusChipItems,
+    } = subagentCardMod;
+
+    function expand(node, nodePath = "root") {
+      if (node === null || node === undefined || typeof node !== "object") return node;
+      if (Array.isArray(node)) return node.map((child, idx) => expand(child, `${nodePath}[${idx}]`));
+      if (typeof node.type === "function") {
+        const prevPath = currentPath;
+        const prevHook = hookIndex;
+        currentPath = `${nodePath}/${node.type.name || "Fn"}`;
+        hookIndex = 0;
+        let rendered;
+        try {
+          rendered = node.type(node.props ?? {});
+        } finally {
+          currentPath = prevPath;
+          hookIndex = prevHook;
+        }
+        return expand(rendered, currentPath);
+      }
+      const nextProps = { ...(node.props ?? {}) };
+      if ("children" in nextProps) nextProps.children = expand(nextProps.children, `${nodePath}/${String(node.type)}`);
+      return { ...node, props: nextProps };
+    }
+    function findAllIn(node, predicate, out = []) {
+      if (node === null || node === undefined || typeof node !== "object") return out;
+      if (Array.isArray(node)) {
+        for (const child of node) findAllIn(child, predicate, out);
+        return out;
+      }
+      if (predicate(node)) out.push(node);
+      if (node.props && "children" in node.props) findAllIn(node.props.children, predicate, out);
+      return out;
+    }
+    function textOf(node) {
+      if (node === null || node === undefined || typeof node === "boolean") return "";
+      if (typeof node === "string" || typeof node === "number") return String(node);
+      if (Array.isArray(node)) return node.map(textOf).join("");
+      if (typeof node === "object" && node.props && "children" in node.props) return textOf(node.props.children);
+      return "";
+    }
+    function flatStyle(style) {
+      if (style === null || style === undefined || typeof style !== "object") return {};
+      if (Array.isArray(style)) return style.reduce((acc, item) => Object.assign(acc, flatStyle(item)), {});
+      return { ...style };
+    }
+
+    const CARD_COLORS = {
+      surface0: "#101011",
+      surface1: "#1c1c1f",
+      border: "#2e2e33",
+      foreground: "#fafafa",
+      foregroundMuted: "#a1a1aa",
+      accent: "#8ba4ff",
+      statusSuccess: "#6cb17b",
+      statusWarning: "#d8b47b",
+      statusDanger: "#d8847b",
+    };
+
+    // Pure helpers: facts never fabricate missing numbers; bilingual zh-CN & en
+    equal("subagentFactParts omits all unmeasured fields", subagentFactParts({}, "zh-CN"), []);
+    equal(
+      "subagentFactParts formats observed metrics in zh-CN",
+      subagentFactParts({ steps: 6, durationMs: 5200, outputTokens: 1300 }, "zh-CN"),
+      ["6 步", "5.2秒", "1.3K 输出"],
+    );
+    equal(
+      "subagentFactParts formats observed metrics in en",
+      subagentFactParts({ steps: 1, durationMs: 420, outputTokens: 850 }, "en"),
+      ["1 step", "420ms", "850 out"],
+    );
+    equal(
+      "subagentStatusChipItems formats list_agents in zh-CN",
+      subagentStatusChipItems(listText.subagentChips, "zh-CN").map((c) => c.label),
+      ["1 运行中", "1 失败", "1 已完成"],
+    );
+    equal(
+      "subagentStatusChipItems formats list_agents in en",
+      subagentStatusChipItems(listText.subagentChips, "en").map((c) => c.label),
+      ["1 running", "1 failed", "1 done"],
+    );
+    equal(
+      "subagentStatusChipItems formats archive_subagents dry-run in zh-CN",
+      subagentStatusChipItems(archiveDryRun.subagentChips, "zh-CN").map((c) => c.label),
+      ["将归档 2 个", "跳过 1 运行中"],
+    );
+    equal(
+      "subagentStatusChipItems formats archive_subagents dry-run in en",
+      subagentStatusChipItems(archiveDryRun.subagentChips, "en").map((c) => c.label),
+      ["Would archive 2", "1 running skipped"],
+    );
+
+    // Running subagent card (collapsed): 28x28 Bot icon, StatusRingMark badge, no fabricated facts
+    setLocale("zh-CN");
+    hookState.clear();
+    const runningTree = expand({
+      type: SubagentCard,
+      props: {
+        subagent: runningSub.subagent,
+        colors: CARD_COLORS,
+        fallbackBody: "started subagent scout-1",
+      },
+    });
+    const iconBox = findAllIn(runningTree, (el) => el.props?.testID === SUBAGENT_CARD_ICON_TEST_ID)[0];
+    equal("SubagentCard icon tile is 28x28", [flatStyle(iconBox?.props.style).width, flatStyle(iconBox?.props.style).height], [28, 28]);
+    equal("SubagentCard uses Bot icon for subagent", findAllIn(iconBox, (el) => el.type === "Icon")[0]?.props.name, "Bot");
+    equal("running SubagentCard uses StatusRingMark in status badge", findAllIn(runningTree, (el) => el.type === "StatusRingMark").length, 1);
+    equal("collapsed SubagentCard hides expanded body", findAllIn(runningTree, (el) => el.props?.testID === SUBAGENT_CARD_BODY_TEST_ID).length, 0);
+    const runningText = textOf(runningTree);
+    check("running SubagentCard renders role, preset/model, status, and expand label in zh-CN", runningText.includes("scout-1") && runningText.includes("explorer · fixture/alpha") && runningText.includes("运行中") && runningText.includes("展开"), runningText);
+    check("running SubagentCard does not fabricate 0 steps or 0ms", !runningText.includes("0 步") && !runningText.includes("0ms"), runningText);
+
+    // Expand running card -> shows task + waiting message, NEVER "started subagent scout-1"
+    const runningToggle = findAllIn(runningTree, (el) => el.type === "Pressable" && el.props.accessibilityRole === "button")[0];
+    runningToggle.props.onPress();
+    const runningExpanded = expand({
+      type: SubagentCard,
+      props: {
+        subagent: runningSub.subagent,
+        colors: CARD_COLORS,
+        fallbackBody: "started subagent scout-1",
+      },
+    });
+    const runningBodyNode = findAllIn(runningExpanded, (el) => el.props?.testID === SUBAGENT_CARD_BODY_TEST_ID)[0];
+    const runningBodyText = textOf(runningBodyNode);
+    check("expanded running card shows full task and running notice, never activation ack", runningBodyText.includes("Inspect server/ files.") && runningBodyText.includes("尚未产生最终报告") && !runningBodyText.includes("started subagent"), runningBodyText);
+
+    // Completed subagent_fork card in English: GitFork icon, tabular facts, in-place expansion + copy buttons
+    setLocale("en");
+    hookState.clear();
+    const forkTree = expand({
+      type: SubagentCard,
+      props: {
+        subagent: forkSub.subagent,
+        colors: CARD_COLORS,
+        expanded: true,
+        expandedMaxHeight: 280,
+      },
+    });
+    const forkIconBox = findAllIn(forkTree, (el) => el.props?.testID === SUBAGENT_CARD_ICON_TEST_ID)[0];
+    equal("subagent_fork card uses GitFork icon", findAllIn(forkIconBox, (el) => el.type === "Icon")[0]?.props.name, "GitFork");
+    check("completed card renders CircleCheck icon", findAllIn(forkTree, (el) => el.type === "Icon" && el.props.name === "CircleCheck").length >= 1);
+    const factTexts = findAllIn(forkTree, (el) => el.type === "Text" && textOf(el).includes("3 steps"));
+    check(
+      "bottom fact row uses tabular-nums fontVariant",
+      factTexts.length === 1 && Array.isArray(flatStyle(factTexts[0].props.style).fontVariant) && flatStyle(factTexts[0].props.style).fontVariant.includes("tabular-nums"),
+      JSON.stringify(flatStyle(factTexts[0]?.props.style)),
+    );
+    const forkBody = findAllIn(forkTree, (el) => el.props?.testID === SUBAGENT_CARD_BODY_TEST_ID)[0];
+    const forkScrolls = findAllIn(forkBody, (el) => el.type === "ScrollView" && el.props.testID === "dsh-scroll-box");
+    equal("expanded SubagentCard caps report scroll height to expandedMaxHeight", flatStyle(forkScrolls[0]?.props.style).maxHeight, 280);
+    const copyButtons = findAllIn(forkBody, (el) => el.type === "Pressable" && el.props.accessibilityLabel === "Copy");
+    equal("expanded SubagentCard renders Copy buttons for task and report", copyButtons.length, 2);
+    copiedPayloads.length = 0;
+    copyMode = "resolve";
+    copyButtons[0].props.onPress({ stopPropagation() {} });
+    copyButtons[1].props.onPress({ stopPropagation() {} });
+    equal("Copy buttons forward exact task and report text", copiedPayloads, ["Inspect branch edge cases.", "No issues found."]);
+    // Guard against rejected or throwing copyText (Hermes / native denial)
+    copyMode = "reject";
+    let safeRejectThrew = false;
+    let rejectPromise = null;
+    try {
+      rejectPromise = safeCopyText("x");
+    } catch {
+      safeRejectThrew = true;
+    }
+    copyMode = "throw";
+    let safeThrowThrew = false;
+    let throwPromise = null;
+    try {
+      throwPromise = safeCopyText("y");
+    } catch {
+      safeThrowThrew = true;
+    }
+    check(
+      "safeCopyText never throws synchronously and returns a handled Promise on reject/throw",
+      !safeRejectThrew &&
+        !safeThrowThrew &&
+        typeof rejectPromise?.then === "function" &&
+        typeof throwPromise?.then === "function",
+    );
+
+    // SubagentStatusChips rendering in zh-CN & en + compact cap
+    setLocale("zh-CN");
+    hookState.clear();
+    const chipsTreeZh = expand({
+      type: SubagentStatusChips,
+      props: { chips: listText.subagentChips, colors: CARD_COLORS },
+    });
+    check("SubagentStatusChips renders testID container", findAllIn(chipsTreeZh, (el) => el.props?.testID === SUBAGENT_CHIPS_TEST_ID).length === 1);
+    const chipsTextZh = textOf(chipsTreeZh);
+    check("SubagentStatusChips renders zh-CN badges", chipsTextZh.includes("1 运行中") && chipsTextZh.includes("1 失败") && chipsTextZh.includes("1 已完成"), chipsTextZh);
+
+    setLocale("en");
+    const chipsTreeEn = expand({
+      type: SubagentStatusChips,
+      props: { chips: archiveDryRun.subagentChips, colors: CARD_COLORS },
+    });
+    const chipsTextEn = textOf(chipsTreeEn);
+    check("SubagentStatusChips renders en archive badges", chipsTextEn.includes("Would archive 2") && chipsTextEn.includes("1 running skipped"), chipsTextEn);
+
+    // Compact overflow (+1) when >3 buckets are active on narrow viewport
+    const manyBucketsTree = expand({
+      type: SubagentStatusChips,
+      props: {
+        chips: {
+          kind: "list_agents",
+          list: {
+            format: "text",
+            leadOnly: false,
+            counts: { total: 4, running: 1, inactive: 1, completed: 1, failed: 1, canceled: 0, archived: 0, diagnostic: 0, other: 0 },
+          },
+        },
+        colors: CARD_COLORS,
+        compact: true,
+      },
+    });
+    check("compact SubagentStatusChips caps visible badges with +1 overflow", textOf(manyBucketsTree).includes("+1"), textOf(manyBucketsTree));
+
+    // Reset locale to default zh-CN after tests
+    setLocale("zh-CN");
   }
 }
 
