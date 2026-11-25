@@ -9,7 +9,9 @@ import { DiagnosticsService, registerDiagnosticsRpc } from "./server/diagnostics
 import { DshPlugins } from "./server/dsh-plugins";
 import { registerDshPluginsRpc } from "./server/dsh-plugins-rpc";
 import { createPillFeed } from "./server/pill-feed";
+import { PricingStore, registerPricingRpc } from "./server/pricing";
 import { capturePaseo } from "./server/rewind-notice-append";
+import { UsageStatsEngine, registerUsageStatsRpc } from "./server/usage-stats";
 import {
   controlAgentGoal,
   createDshProvider,
@@ -118,6 +120,19 @@ export default function contribute(server: PluginServerContext) {
   const diagnostics = new DiagnosticsService();
   const disposeDiagnostics = registerDiagnosticsRpc(server, diagnostics, { onCall: capture });
 
+  // Dual-currency pricing store & incremental DSH session usage analytics for Console Tab 1 & Tab 3.
+  const pricingStore = new PricingStore();
+  const usageEngine = new UsageStatsEngine({ pricer: pricingStore });
+  const disposePricing = registerPricingRpc(server, pricingStore, {
+    getSeenModels: () => usageEngine.seenPricingModels({ waitMs: 0 }),
+    onContext: capture,
+  });
+  const disposeUsageStats = registerUsageStatsRpc(server, usageEngine, {
+    startPrewarm: true,
+    prewarmDelayMs: 3_000,
+    onContext: capture,
+  });
+
   /**
    * One feed per pill. Each is a singleton for the plugin process, which is what
    * makes "two app windows, one read" true: the second window's subscription
@@ -203,6 +218,8 @@ export default function contribute(server: PluginServerContext) {
   });
 
   return () => {
+    disposeUsageStats();
+    disposePricing();
     disposeDiagnostics();
     disposeDshPlugins();
     for (const cleanup of cleanups) cleanup();

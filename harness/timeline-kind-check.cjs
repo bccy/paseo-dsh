@@ -39,6 +39,9 @@ function readKinds(source) {
     }
     if (id === './client/rewind-notice-live') return { startRewindLiveMonitor: () => noop };
     if (id === './client/console-diagnostics') return { ConsoleDiagnosticsSection: () => null };
+    if (id === './client/console-usage') return { ConsoleUsageTab: () => null };
+    if (id === './client/console-pricing') return { PricingDialog: () => null };
+    if (id === './client/console-heatmap') return { ConsoleHeatmap: () => null };
     if (id === './client/console-screen') {
       return {
         CONSOLE_SCREEN_ID: 'dsh-console',

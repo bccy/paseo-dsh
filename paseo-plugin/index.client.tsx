@@ -403,11 +403,17 @@ function buildContributions(client: PluginClientContext): () => void {
     compact: boolean;
   }) => <ConsoleDiagnosticsSection client={client} colors={colors} compact={compact} />;
   const ConsoleScreen = (props: PluginScreenProps) => (
-    <DshConsoleScreen {...props} initialTab="usage" renderEnvironment={renderEnvironment} />
+    <DshConsoleScreen
+      {...props}
+      client={client}
+      initialTab="usage"
+      renderEnvironment={renderEnvironment}
+    />
   );
   const ConsoleSettingsEntry = (props: PluginSurfaceProps) => (
     <DshConsoleScreen
       {...props}
+      client={client}
       initialTab="settings"
       subscribeTabRequests={false}
       renderEnvironment={renderEnvironment}

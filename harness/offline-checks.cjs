@@ -51,6 +51,8 @@ const pluginTests = [
   'test/process.test.cjs',
   'test/dsh-plugins.test.cjs',
   'test/diagnostics.test.cjs',
+  'test/pricing.test.cjs',
+  'test/usage-stats.test.cjs',
   'test/paseo-0171.test.cjs',
   'test/paseo-0173.test.cjs',
   'test/timeline-spacing.test.cjs',

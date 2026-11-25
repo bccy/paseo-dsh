@@ -10,13 +10,22 @@
  *
  * @module dsh-paseo/client/console-screen
  */
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ScrollView as RnScrollView, Text, View } from "react-native";
 import type {
+  PluginClientContext,
   PluginScreenParams,
   PluginScreenProps,
 } from "@getpaseo/plugin/client";
 import * as PaseoUi from "@getpaseo/plugin/client/ui";
+import {
+  DEFAULT_USD_TO_CNY_RATE,
+  pricingGetRpc,
+  pricingUpdateRpc,
+  type Currency,
+  type PricingState,
+} from "../shared/pricing";
+import { PricingDialog } from "./console-pricing";
 import {
   ConsoleSettingsTab,
   type ConsoleSettingsEnvironmentProps,
@@ -24,8 +33,9 @@ import {
 } from "./console-settings";
 import { font, radius, space, tint, type Colors } from "./console-theme";
 import { Avatar, Badge, Card, Divider, Muted, SegmentedControl } from "./console-ui";
+import { ConsoleUsageTab } from "./console-usage";
 import { DEEPSEEK_MARK_SVG } from "./deepseek-mark-svg";
-import { PluginsBoundary, PluginsFailedCard } from "./dsh-plugins-guard";
+import { PluginsBoundary, PluginsFailedCard, report } from "./dsh-plugins-guard";
 import { DshPluginsContent } from "./dsh-plugins-page";
 import type { Locale } from "./locale";
 import { useCurrentLocale, useLocaleText } from "./use-locale";
@@ -104,6 +114,8 @@ export interface ConsoleTabRenderContext {
 export interface DshConsoleScreenProps
   extends Omit<PluginScreenProps, "params">,
     ConsoleSettingsEnvironmentProps {
+  /** Plugin client context used by Usage analytics, Pricing dialog, and Tab 3 pricing prefs. */
+  readonly client?: PluginClientContext;
   /** Route params supplied by `addScreen`; optional so `addSettingsScreen` can mount directly. */
   readonly params?: PluginScreenParams;
   /** Default tab when `params?.tab` does not specify one (default `"usage"`). */
@@ -173,6 +185,7 @@ function UsagePlaceholder({ colors, compact }: { colors: Colors; compact: boolea
 }
 
 function DshConsoleBody({
+  client,
   theme,
   host,
   layout,
@@ -190,6 +203,140 @@ function DshConsoleBody({
   const copy = useLocaleText().console;
   const locale = useCurrentLocale();
   const [width, setWidth] = useState(0);
+
+  // Shared dual-currency & pricing modal state across Tab 1 (Usage) and Tab 3 (Settings).
+  const mountedRef = useRef(true);
+  const pricingSeqRef = useRef(0);
+  const [pricingState, setPricingState] = useState<PricingState | null>(null);
+  const [currencyOverride, setCurrencyOverride] = useState<Currency | undefined>(undefined);
+  const [pricingSaving, setPricingSaving] = useState(false);
+  const [pricingError, setPricingError] = useState<string | null>(null);
+  const [pricingRevision, setPricingRevision] = useState(0);
+  const [pricingModalOpen, setPricingModalOpen] = useState(false);
+  const [pricingFocusModel, setPricingFocusModel] = useState<string | null>(null);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!client) return;
+    const seq = ++pricingSeqRef.current;
+    void client
+      .rpc(pricingGetRpc, {})
+      .then((state) => {
+        if (!mountedRef.current || seq !== pricingSeqRef.current) return;
+        setPricingState(state);
+        setCurrencyOverride(undefined);
+        setPricingError(null);
+      })
+      .catch((error) => {
+        report("pricing get", error);
+      });
+  }, [client]);
+
+  const openPricingModal = useCallback((focusModel?: string | null) => {
+    setPricingFocusModel(focusModel ?? null);
+    setPricingModalOpen(true);
+  }, []);
+
+  const closePricingModal = useCallback(() => {
+    setPricingModalOpen(false);
+    setPricingFocusModel(null);
+  }, []);
+
+  const handleUsageCurrencyChange = useCallback((next: Currency) => {
+    pricingSeqRef.current += 1;
+    setCurrencyOverride(next);
+    setPricingState((prev) => (prev ? { ...prev, displayCurrency: next } : prev));
+    setPricingError(null);
+  }, []);
+
+  const handlePricingDialogUpdated = useCallback((next: PricingState) => {
+    pricingSeqRef.current += 1;
+    setPricingState(next);
+    setCurrencyOverride(undefined);
+    setPricingError(null);
+    setPricingRevision((rev) => rev + 1);
+  }, []);
+
+  const handleSettingsCurrencyChange = useCallback(
+    async (next: Currency) => {
+      if (!client) return;
+      const seq = ++pricingSeqRef.current;
+      setPricingSaving(true);
+      setPricingError(null);
+      try {
+        const updated = await client.rpc(pricingUpdateRpc, { displayCurrency: next });
+        if (!mountedRef.current || seq !== pricingSeqRef.current) return;
+        setPricingState(updated);
+        setCurrencyOverride(undefined);
+        setPricingRevision((rev) => rev + 1);
+      } catch (error) {
+        if (mountedRef.current && seq === pricingSeqRef.current) {
+          setPricingError(error instanceof Error ? error.message : String(error));
+        }
+        throw error;
+      } finally {
+        if (mountedRef.current) setPricingSaving(false);
+      }
+    },
+    [client],
+  );
+
+  const handleSettingsExchangeRateChange = useCallback(
+    async (rate: number) => {
+      if (!client) return;
+      const seq = ++pricingSeqRef.current;
+      setPricingSaving(true);
+      setPricingError(null);
+      try {
+        const updated = await client.rpc(pricingUpdateRpc, { usdToCnyRate: rate });
+        if (!mountedRef.current || seq !== pricingSeqRef.current) return;
+        setPricingState(updated);
+        setCurrencyOverride(undefined);
+        setPricingRevision((rev) => rev + 1);
+      } catch (error) {
+        if (mountedRef.current && seq === pricingSeqRef.current) {
+          setPricingError(error instanceof Error ? error.message : String(error));
+        }
+        throw error;
+      } finally {
+        if (mountedRef.current) setPricingSaving(false);
+      }
+    },
+    [client],
+  );
+
+  const effectiveDisplayCurrency = currencyOverride ?? pricingState?.displayCurrency;
+  const resolvedPricingSlot = useMemo<PricingPreferencesSlot | undefined>(() => {
+    if (pricing) return pricing;
+    if (!client) return undefined;
+    return {
+      currency: effectiveDisplayCurrency ?? "USD",
+      usdToCnyRate: pricingState?.usdToCnyRate ?? DEFAULT_USD_TO_CNY_RATE,
+      hasCustomOverrides: pricingState?.hasCustomOverrides ?? false,
+      saving: pricingSaving,
+      error: pricingError,
+      onChangeCurrency: handleSettingsCurrencyChange,
+      onChangeExchangeRate: handleSettingsExchangeRateChange,
+      onOpenPricingModal: () => openPricingModal(null),
+    };
+  }, [
+    pricing,
+    client,
+    effectiveDisplayCurrency,
+    pricingState?.usdToCnyRate,
+    pricingState?.hasCustomOverrides,
+    pricingSaving,
+    pricingError,
+    handleSettingsCurrencyChange,
+    handleSettingsExchangeRateChange,
+    openPricingModal,
+  ]);
 
   const paramTab = parseConsoleTab(params?.tab);
   const lastParamTabRef = useRef<ConsoleTabId | undefined>(paramTab);
@@ -333,6 +480,15 @@ function DshConsoleBody({
           {activeTab === "usage" ? (
             renderUsage ? (
               renderUsage(tabContext)
+            ) : client ? (
+              <ConsoleUsageTab
+                client={client}
+                colors={colors}
+                displayCurrency={effectiveDisplayCurrency}
+                pricingRevision={pricingRevision}
+                onCurrencyChange={handleUsageCurrencyChange}
+                onOpenPricing={openPricingModal}
+              />
             ) : (
               <UsagePlaceholder colors={colors} compact={compact} />
             )
@@ -354,11 +510,22 @@ function DshConsoleBody({
               compact={compact}
               environment={environment}
               renderEnvironment={renderEnvironment}
-              pricing={pricing}
+              pricing={resolvedPricingSlot}
             />
           )}
         </View>
       </HostScrollView>
+
+      {client ? (
+        <PricingDialog
+          visible={pricingModalOpen}
+          onClose={closePricingModal}
+          client={client}
+          colors={colors}
+          focusModel={pricingFocusModel}
+          onUpdated={handlePricingDialogUpdated}
+        />
+      ) : null}
     </View>
   );
 }
