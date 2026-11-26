@@ -360,95 +360,23 @@ export const GOAL_OBJECTIVE_LINE_HEIGHT = 20;
 export const GOAL_FACTS_LINE_HEIGHT = 16;
 
 /* -------------------------------------------------------------------------- */
-/* The edit page: a small Paseo composer (design-opus-v4, direction C)         */
+/* Editing in the host composer                                               */
 /* -------------------------------------------------------------------------- */
 
-/**
- * The editor box: the host composer's `inputWrapper`
- * (`composer/input/input.tsx:2259-2287`) at its compact padding — 16px radius,
- * 8px top/bottom, 12px left/right, 12px between the text and the button row.
- * The box sits 8px in from the panel edge so its 16px corner is concentric with
- * the surface's 8px one.
- */
-export const GOAL_EDITOR_RADIUS = 16;
-export const GOAL_EDITOR_PADDING_VERTICAL = 8;
-export const GOAL_EDITOR_PADDING_HORIZONTAL = 12;
-export const GOAL_EDITOR_GAP = 12;
-export const GOAL_EDITOR_MARGIN_HORIZONTAL = 8;
-
-/** The composer's 28px round send button (`input.tsx:2390-2398`). */
-export const GOAL_SAVE_BUTTON_SIZE = 28;
-
-/** A disabled send button is the same button at half opacity (`input.tsx:2429-2431`). */
-export const GOAL_SAVE_DISABLED_OPACITY = 0.5;
-
-/** The field grows from two lines to six, then scrolls inside the box. */
-export const GOAL_EDITOR_MIN_LINES = 2;
-export const GOAL_EDITOR_MAX_LINES = 6;
+/** Prefix handed to the host composer when editing the current goal. */
+export const GOAL_EDIT_PROMPT_PREFIX = "/goal edit ";
 
 /**
- * The field's type: the host's `fontSize.content` (15 on web, 16 on native) at
- * the composer's 1.4 line height (`input.tsx:2325-2345`). The plugin theme has
- * no `fontSize`, so the two host values are restated here.
- */
-export interface GoalEditorType {
-  readonly fontSize: number;
-  readonly lineHeight: number;
-}
-
-export function goalEditorType(web: boolean): GoalEditorType {
-  const fontSize = web ? 15 : 16;
-  return { fontSize, lineHeight: Math.round(fontSize * 1.4) };
-}
-
-/**
- * The field's height for a measured text height: at least two lines, at most
- * six. An unmeasured text (0, or a layout that never ran) is the two-line floor,
- * never zero — an editor must never collapse to nothing.
- */
-export function goalEditorHeight(measured: number, lineHeight: number): number {
-  const floor = GOAL_EDITOR_MIN_LINES * lineHeight;
-  const ceiling = GOAL_EDITOR_MAX_LINES * lineHeight;
-  if (!Number.isFinite(measured) || measured <= 0) return floor;
-  return Math.min(ceiling, Math.max(floor, Math.ceil(measured)));
-}
-
-/** The keys the edit field reacts to, as read from a key event. */
-export interface GoalEditKey {
-  readonly key: string;
-  readonly shiftKey: boolean;
-  /** An IME composition is in progress (`isComposing` or keyCode 229). */
-  readonly composing: boolean;
-  /**
-   * Whether Enter submits here: a pointer layout on web only, the host
-   * composer's rule (`input.tsx:1768`, `isWeb && !isCompact`). On a phone Enter
-   * is a newline and only the ✓ button saves.
-   */
-  readonly submitOnEnter: boolean;
-}
-
-/**
- * What a key does in the edit field.
+ * Build the `/goal edit <objective>` prompt pre-filled into the host composer.
  *
- * - Escape cancels (a phone has no Escape, so this is a desktop key in practice).
- * - Enter saves only where Enter submits, never with Shift (Shift+Enter is the
- *   newline, `composer/input/state.ts:167-176`), and never mid-composition (the
- *   Enter that commits an IME candidate is not a submit).
- * - Everything else is typing.
+ * Editing is delegated to Paseo's own composer (`client.composers({ agentId })`)
+ * instead of an inline popover field: the host input owns sizing, shortcuts,
+ * IME composition, attachments and mobile keyboard behaviour, and DSH's
+ * `/goal edit` parses both single-line and multi-line objectives verbatim.
  */
-export function goalEditKeyAction(input: GoalEditKey): "save" | "cancel" | null {
-  if (input.key === "Escape") return "cancel";
-  if (input.key !== "Enter") return null;
-  if (!input.submitOnEnter || input.shiftKey || input.composing) return null;
-  return "save";
+export function goalEditComposerPrompt(objective: string): string {
+  return `${GOAL_EDIT_PROMPT_PREFIX}${objective}`;
 }
-
-/**
- * The edit page's width on wide layouts: the popover surface's own 420 minus
- * the 12px content padding on each side, so replacing the objective row with
- * the field does not shrink the surface under the pointer.
- */
-export const GOAL_EDITOR_WIDTH_WIDE = 396;
 
 /**
  * The clear confirmation (UI-v9, direction B): the view page's objective row
@@ -591,56 +519,34 @@ export function goalCurrentTaskLine(goal: GoalState): string | undefined {
 }
 
 /* -------------------------------------------------------------------------- */
-/* The edit page's rules                                                       */
+/* The panel's transition rules                                               */
 /* -------------------------------------------------------------------------- */
 
 /** What happened in the panel that may move it to another page or close it. */
 export type GoalPanelEvent =
-  /** The edit page's 取消, or Escape in its field. */
-  | { readonly kind: "cancelEdit" }
   /** The clear confirmation page's 取消. */
   | { readonly kind: "cancelClear" }
   /** A `/goal` control action answered. */
   | { readonly kind: "control"; readonly action: "pause" | "resume" | "clear" | "edit"; readonly ok: boolean };
 
 /**
- * Where the panel goes after one event (UI-v8).
+ * Where the panel goes after one event.
  *
- * - `close`: call the host's `close()`, back to the conversation. Leaving the
- *   editor — cancelled, or saved successfully — closes the panel outright; the
- *   user was done with it the moment they started editing the one thing in it.
+ * - `close`: call the host's `close()`, back to the conversation.
  * - `view`: the panel's main page. The clear page's 取消 returns there (it is a
  *   detour from the main page, not a task of its own), and so does every other
- *   successful action.
+ *   successful control action.
  * - `stay`: a refused or failed action keeps the current page, so DSH's sentence
- *   is shown where the user acted (an edit keeps the draft).
+ *   is shown where the user acted.
  */
 export function goalPanelNext(event: GoalPanelEvent): "close" | "view" | "stay" {
   switch (event.kind) {
-    case "cancelEdit":
-      return "close";
     case "cancelClear":
       return "view";
     case "control":
       if (!event.ok) return "stay";
       return event.action === "edit" ? "close" : "view";
   }
-}
-
-/** Whether the draft can be submitted: non-blank **and** changed. */
-export function goalEditDraftValid(draft: string): boolean {
-  return draft.trim() !== "";
-}
-
-/**
- * Whether the save action is enabled.
- *
- * Two rules from the design: an empty objective cannot be saved (DSH would
- * reject it), and an unchanged draft cannot be saved either — the host disables
- * a rename's submit when the value did not change (`rename-modal.tsx:111`).
- */
-export function goalEditSubmittable(draft: string, original: string): boolean {
-  return goalEditDraftValid(draft) && draft !== original;
 }
 
 /* -------------------------------------------------------------------------- */

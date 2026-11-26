@@ -74,7 +74,7 @@ import {
 } from "./goal-running";
 import {
   goalCompleteSeenStep,
-  goalEditSubmittable,
+  goalEditComposerPrompt,
   goalIconColorToken,
   goalIconName,
   goalPillCopy,
@@ -243,8 +243,7 @@ export function makeGoalPopover(
     }, []);
     const [busy, setBusy] = useState<GoalAction | null>(null);
     const [error, setError] = useState<string | undefined>(undefined);
-    const [mode, setMode] = useState<"view" | "edit" | "confirm">("view");
-    const [draft, setDraft] = useState("");
+    const [mode, setMode] = useState<"view" | "confirm">("view");
 
     useEffect(() => {
       const current = store.get(agentId);
@@ -300,7 +299,6 @@ export function makeGoalPopover(
           return;
         }
         setMode("view");
-        setDraft("");
         // No read here: `goal.control` asks the server's goal feed to re-read
         // immediately (`index.server.ts`), so the new phase arrives through this
         // panel's own subscription — the same answer the pill's trigger sees.
@@ -322,30 +320,31 @@ export function makeGoalPopover(
     };
 
     const onBeginEdit = (): void => {
-      // The header shows one truncated line, so this is where the full objective
-      // becomes visible and editable.
-      setDraft(goal.objective);
-      setMode("edit");
+      // Hand editing directly to Paseo's native composer: prefill `/goal edit …`,
+      // close the popover, and focus the input with the caret at the end.
+      const composer = typeof client.composers === "function" ? client.composers({ agentId })[0] : undefined;
+      if (composer === undefined) {
+        setError(text.composerUnavailable);
+        return;
+      }
+      const prompt = goalEditComposerPrompt(goal.objective);
+      try {
+        composer.setPrompt(prompt);
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : String(caught));
+        return;
+      }
+      setError(undefined);
+      close();
+      void composer
+        .focus({ selection: { start: prompt.length, end: prompt.length } })
+        .catch(() => {
+          /* focus rejects if the agent closed or could not be revealed */
+        });
     };
 
     const onBeginClear = (): void => {
       setMode("confirm");
-    };
-
-    const onSave = (): void => {
-      if (busyNow) return;
-      if (!goalEditSubmittable(draft, goal.objective)) return;
-      void run("edit", draft);
-    };
-
-    // 取消 and Escape (the body routes both here) close the panel.
-    const onCancelEdit = (): void => {
-      if (goalPanelNext({ kind: "cancelEdit" }) === "close") {
-        close();
-        return;
-      }
-      setMode("view");
-      setDraft("");
     };
 
     const onConfirmClear = (): void => {
@@ -370,15 +369,11 @@ export function makeGoalPopover(
         mode={mode}
         busy={busyNow}
         error={error}
-        draft={draft}
         onToggleRunning={onToggleRunning}
         onBeginEdit={onBeginEdit}
         onBeginClear={onBeginClear}
-        onSave={onSave}
-        onCancelEdit={onCancelEdit}
         onConfirmClear={onConfirmClear}
         onCancelClear={onCancelClear}
-        onChangeDraft={setDraft}
       />
     );
   }

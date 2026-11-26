@@ -762,39 +762,15 @@ export interface GoalText {
     pauseTarget: string;
     /** Accessibility name of the continue icon button (goal is not continuing). */
     resumeTarget: string;
-    /** Accessibility name of the objective row, which opens the editor. */
+    /** Accessibility name of the objective row, which hands off to the host composer. */
     edit: string;
     /** Accessibility name of the trash icon button and the clear page's red row. */
     clearTarget: string;
     /** The clear page's cancel row. */
     cancel: string;
   };
-  /**
-   * The edit page (design-opus-v4 direction C: a small Paseo composer).
-   *
-   * `enterKey` / `shiftEnterKey` / `escKey` are key names drawn in the host's
-   * shortcut chips and stay as the keyboard prints them; the words after them
-   * are translated.
-   */
-  editor: {
-    /** The edit page's header next to the whale. */
-    title: string;
-    /** Accessibility name of the round ✓ button. */
-    save: string;
-    /** The quiet text button left of ✓. */
-    cancel: string;
-    escKey: string;
-    /** Header hint after the Esc chip (desktop only). */
-    escHint: string;
-    enterKey: string;
-    /** Footer hint after the Enter chip (desktop only). */
-    enterHint: string;
-    shiftEnterKey: string;
-    /** Footer hint after the Shift Enter chip (desktop only). */
-    shiftEnterHint: string;
-  };
-  /** Placeholder of the edit field. */
-  editPlaceholder: string;
+  /** Shown when clicking edit cannot resolve the session's composer input. */
+  composerUnavailable: string;
   /** Accessibility name of the running ring on the whale. */
   runningA11y: string;
   /** Shown while one control action is in flight. */
@@ -1321,18 +1297,7 @@ const TEXT: Record<Locale, UiText> = {
         clearTarget: "Clear goal",
         cancel: "Cancel",
       },
-      editor: {
-        title: "Edit goal",
-        save: "Save goal",
-        cancel: "Cancel",
-        escKey: "Esc",
-        escHint: "to cancel",
-        enterKey: "Enter",
-        enterHint: "Save",
-        shiftEnterKey: "Shift Enter",
-        shiftEnterHint: "New line",
-      },
-      editPlaceholder: "New objective",
+      composerUnavailable: "Could not reach the composer input for this session.",
       runningA11y: "Goal running",
       busy: "Working…",
       controlFailed: "The goal command failed.",
@@ -2061,18 +2026,7 @@ const TEXT: Record<Locale, UiText> = {
         clearTarget: "清除目标",
         cancel: "取消",
       },
-      editor: {
-        title: "编辑目标",
-        save: "保存目标",
-        cancel: "取消",
-        escKey: "Esc",
-        escHint: "取消",
-        enterKey: "Enter",
-        enterHint: "保存",
-        shiftEnterKey: "Shift Enter",
-        shiftEnterHint: "换行",
-      },
-      editPlaceholder: "新的目标内容",
+      composerUnavailable: "无法访问当前会话的输入框。",
       runningA11y: "目标运行中",
       busy: "处理中…",
       controlFailed: "目标命令执行失败。",

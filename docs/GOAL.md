@@ -148,23 +148,13 @@ agent status**（`PillAgent.status`，和「已读」元数据走同一条订阅
   glyph 14/18，`goalIconButton`）。
 - **点整行进入编辑**（除两个图标按钮外；图标按钮 `stopPropagation`）：行是 `ComposerTrackRow`
   形态（桌面 hover/按下填 `surface2`），a11y 名「编辑目标」。它是面板里唯一的编辑入口。
-- **编辑页（原位，UI-v6 = design-opus-v4 方向 C：小号 Paseo 输入框）**：头部鲸鱼 +「编辑目标」
-  （手机也保留；桌面右侧 `Esc` 芯片 +「取消」）；下面是宿主 composer 同款框（`composer/input/input.tsx`
-  `inputWrapper`：圆角 16、与面板同层 `surface1`、1px 边、上下 8 / 左右 12、文字与按钮行间距 12，
-  距面板边 8）。字段预填全文、自动聚焦、光标在开头；字号同 composer（web 15 / 原生 16，行高 1.4×）；
-  高度随内容 2–6 行（隐藏镜像文字量高，宿主 composer 同法；`goalEditorHeight`），超出框内滚动。
-  按钮行：右下 28px accent 圆形 ✓（无障碍名「保存目标」；空文本或「值未变」时 `opacity 0.5` 且不可点，
-  宿主 composer 发送键同规则；保存中换转圈）；其左淡色「取消」文字按钮；桌面左侧按键提示芯片
-  「Enter 保存」「Shift Enter 换行」。按键（纯函数 `goalEditKeyAction`，宿主 composer 约定）：
-  **桌面** Enter 保存、Shift+Enter 换行、IME 组字中的 Enter 不提交、Esc 取消；**手机** Enter 换行，只能点 ✓。
-  **失焦不提交**（没有任何 blur / submitEditing 提交路径）。失败原文显示在框下方（`statusDanger`），保持编辑态。
-  **离开编辑框即关闭面板**（UI-v8）：「取消」、桌面 Esc、保存**成功**都调用宿主给的 `close()`，直接回到对话，
-  不再回到展开的面板；保存失败不关（留在编辑框显示原文、保留草稿）。规则是纯函数 `goalPanelNext`
-  （`client/goal-polling.ts`）。关闭经 `client/seen-close-gate.ts` 的确认窗后才触发完成态的「已读」记录（宿主打开面板时会重挂载一次内容，
-  见下文「何时隐藏」），但编辑只出现在非 complete 目标上，所以编辑后关闭不会把任何目标记为已读。
-  编辑时隐藏「正在」与受阻行。插件主题缺宿主的 `borderAccent`/`surface3`/`surface4`：边框用 `border`、
-  按键芯片底用 `surface2`、placeholder 用 `foregroundMuted`（design-opus-v4 §6 的回退），暗色下边框比
-  宿主 composer 弱一档。
+- **透传到 Paseo 原生输入框编辑**（2026-11-26，替代原内置 `GoalEditor`）：点目标行时，经
+  `client.composers({ agentId })` 拿到当前会话的 `PluginComposer`，直接调用
+  `composer.setPrompt("/goal edit " + goal.objective)`（`goalEditComposerPrompt`），关闭面板，
+  再调用 `composer.focus({ selection: { start: prompt.length, end: prompt.length } })` 把光标落到
+  输入框末尾。完整复用 Paseo 原生输入框的高度自适应、快捷键、IME、附件与移动端键盘体验，面板里不再
+  维护小号编辑框。拿不到 composer 或写入抛错时在面板内原地报错，不关闭、不静默忽略。编辑只出现在
+  非 complete 目标上，因此不会把任何目标记为已读。
 - **正在行**：`CircleDot` + 「正在：<当前 todo>」（前缀 muted、内容 foreground，单行；
   `goalCurrentTaskLine`）。
 - **blocked 行**：`CircleAlert` + DSH 的 blockedReason 原文（两行内）；**disarmed 提示**（文案 B，

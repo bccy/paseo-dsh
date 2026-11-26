@@ -397,8 +397,7 @@ console.log("the goal pill's copy is covered in both languages");
     "disarmedHint",
     "clearHint",
     "actions",
-    "editor",
-    "editPlaceholder",
+    "composerUnavailable",
     "runningA11y",
     "busy",
     "controlFailed",
@@ -495,7 +494,7 @@ console.log("the goal pill's copy is covered in both languages");
       "disarmedHint",
       "clearHint",
       "currentTaskPrefix",
-      "editPlaceholder",
+      "composerUnavailable",
       "runningA11y",
       "busy",
       "controlFailed",
@@ -538,34 +537,6 @@ console.log("the goal pill's copy is covered in both languages");
     [],
   );
 
-  // The edit page (design-opus-v4 direction C). Key names stay as the keyboard
-  // prints them in both languages; every other string is translated.
-  equal("goal.editor keys match", Object.keys(en.editor).sort(), Object.keys(zh.editor).sort());
-  const editorKeys = ["title", "save", "cancel", "escKey", "escHint", "enterKey", "enterHint", "shiftEnterKey", "shiftEnterHint"];
-  equal("goal.editor has exactly the page's strings", Object.keys(zh.editor).sort(), [...editorKeys].sort());
-  for (const locale of LOCALES) {
-    const editor = allText()[locale].goal.editor;
-    for (const key of editorKeys) {
-      check(
-        `goal.editor.${key} is a non-empty string in ${locale}`,
-        typeof editor[key] === "string" && editor[key].trim() !== "",
-        JSON.stringify(editor[key]),
-      );
-    }
-  }
-  check("the editor header is 编辑目标 (zh-CN)", zh.editor.title === "编辑目标", JSON.stringify(zh.editor.title));
-  check("the ✓ button is named 保存目标 (zh-CN)", zh.editor.save === "保存目标", JSON.stringify(zh.editor.save));
-  equal(
-    "key names are the keyboard's in both languages",
-    [en.editor.escKey, en.editor.enterKey, en.editor.shiftEnterKey],
-    [zh.editor.escKey, zh.editor.enterKey, zh.editor.shiftEnterKey],
-  );
-  equal(
-    "the English editor words are not the Chinese ones",
-    ["title", "save", "cancel", "escHint", "enterHint", "shiftEnterHint"].filter((key) => en.editor[key] === zh.editor[key]),
-    [],
-  );
-
   // The English column must not be a copy of the Chinese one.
   const copied = [
     "title",
@@ -576,7 +547,7 @@ console.log("the goal pill's copy is covered in both languages");
     "disarmedHint",
     "clearHint",
     "currentTaskPrefix",
-    "editPlaceholder",
+    "composerUnavailable",
     "runningA11y",
     "busy",
     "controlFailed",

@@ -58,16 +58,7 @@ const {
   goalSnapshot,
 } = require("./shared/goal.js");
 const {
-  GOAL_EDITOR_GAP,
-  GOAL_EDITOR_MARGIN_HORIZONTAL,
-  GOAL_EDITOR_MAX_LINES,
-  GOAL_EDITOR_MIN_LINES,
-  GOAL_EDITOR_PADDING_HORIZONTAL,
-  GOAL_EDITOR_PADDING_VERTICAL,
-  GOAL_EDITOR_RADIUS,
-  GOAL_EDITOR_WIDTH_WIDE,
-  GOAL_SAVE_BUTTON_SIZE,
-  GOAL_SAVE_DISABLED_OPACITY,
+  GOAL_EDIT_PROMPT_PREFIX,
   GOAL_FACTS_LINE_HEIGHT,
   GOAL_HINT_PADDING_HORIZONTAL,
   GOAL_HINT_PADDING_VERTICAL,
@@ -85,11 +76,7 @@ const {
   goalCompleteSeenStep,
   goalConfirmControls,
   goalCurrentTaskLine,
-  goalEditDraftValid,
-  goalEditKeyAction,
-  goalEditSubmittable,
-  goalEditorHeight,
-  goalEditorType,
+  goalEditComposerPrompt,
   goalFactsLine,
   goalIconButton,
   goalIconColorToken,
@@ -441,18 +428,6 @@ console.log("\nthe panel rows use the host's track geometry");
   equal("the corner ring offset is the host's -5", GOAL_RING_OFFSET, -5);
   equal("the objective line is 20", GOAL_OBJECTIVE_LINE_HEIGHT, 20);
   equal("the facts line is 16", GOAL_FACTS_LINE_HEIGHT, 16);
-  // The edit box is the host composer's `inputWrapper` at compact padding and
-  // its 28px send button (composer/input/input.tsx:2259-2287, :2390-2398).
-  equal("the edit box radius is the composer's 16", GOAL_EDITOR_RADIUS, 16);
-  equal("the edit box pads 8 vertically", GOAL_EDITOR_PADDING_VERTICAL, 8);
-  equal("the edit box pads 12 horizontally", GOAL_EDITOR_PADDING_HORIZONTAL, 12);
-  equal("the edit box's text-to-buttons gap is 12", GOAL_EDITOR_GAP, 12);
-  equal("the edit box sits 8 in from the panel edge", GOAL_EDITOR_MARGIN_HORIZONTAL, 8);
-  equal("the save button is the composer's 28", GOAL_SAVE_BUTTON_SIZE, 28);
-  equal("a disabled save button is half opacity", GOAL_SAVE_DISABLED_OPACITY, 0.5);
-  equal("the field grows from two lines", GOAL_EDITOR_MIN_LINES, 2);
-  equal("the field stops growing at six lines", GOAL_EDITOR_MAX_LINES, 6);
-  equal("the edit page is the popover's content width", GOAL_EDITOR_WIDTH_WIDE, 396);
   equal("the hint pads 12 horizontally", GOAL_HINT_PADDING_HORIZONTAL, 12);
   equal("the hint pads 8 vertically", GOAL_HINT_PADDING_VERTICAL, 8);
   equal("the running hold is 1.5s", GOAL_RUNNING_HOLD_MS, 1500);
@@ -538,42 +513,17 @@ console.log("\nthe trigger glyph is muted, warning or danger");
   equal("an error goal is danger", goalIconColorToken("error"), "statusDanger");
 }
 
-/* The edit page's rules ----------------------------------------------------- */
+/* Editing hands off to Paseo's native composer ------------------------------ */
 
-console.log("\nthe edit page refuses empty and unchanged drafts");
+console.log("\nediting builds the /goal edit prompt for the host composer");
 {
-  for (const value of ["", "   ", "\n\t"]) {
-    check(`${JSON.stringify(value)} is not submittable`, goalEditSubmittable(value, "old"), false);
-  }
-  equal("a changed draft is submittable", goalEditSubmittable("new", "old"), true);
-  equal("an unchanged draft is not submittable", goalEditSubmittable("old", "old"), false);
-  equal("the same text with spaces is a change", goalEditSubmittable(" old ", "old"), true);
-  equal("the empty-draft rule alone", goalEditDraftValid(""), false);
-  equal("a non-empty draft alone", goalEditDraftValid("x"), true);
-}
-
-console.log("\nthe edit field's height grows from two lines to six");
-{
-  equal("web type is the composer's 15/21", goalEditorType(true), { fontSize: 15, lineHeight: 21 });
-  equal("native type is the composer's 16/22", goalEditorType(false), { fontSize: 16, lineHeight: 22 });
-  equal("an unmeasured field is two lines", goalEditorHeight(0, 21), 42);
-  equal("a NaN measurement is two lines", goalEditorHeight(Number.NaN, 21), 42);
-  equal("one line of text still gets two", goalEditorHeight(21, 21), 42);
-  equal("four lines are four lines", goalEditorHeight(84, 21), 84);
-  equal("a fractional height rounds up", goalEditorHeight(84.4, 21), 85);
-  equal("twelve lines stop at six", goalEditorHeight(252, 21), 126);
-}
-
-console.log("\nkeys in the edit field follow the host composer");
-{
-  const desk = { shiftKey: false, composing: false, submitOnEnter: true };
-  const phone = { shiftKey: false, composing: false, submitOnEnter: false };
-  equal("desktop Enter saves", goalEditKeyAction({ ...desk, key: "Enter" }), "save");
-  equal("desktop Shift+Enter is a newline", goalEditKeyAction({ ...desk, key: "Enter", shiftKey: true }), null);
-  equal("Enter that commits an IME candidate is not a save", goalEditKeyAction({ ...desk, key: "Enter", composing: true }), null);
-  equal("desktop Escape cancels", goalEditKeyAction({ ...desk, key: "Escape" }), "cancel");
-  equal("phone Enter is a newline", goalEditKeyAction({ ...phone, key: "Enter" }), null);
-  equal("typing does nothing", goalEditKeyAction({ ...desk, key: "a" }), null);
+  equal("the prefix is `/goal edit `", GOAL_EDIT_PROMPT_PREFIX, "/goal edit ");
+  equal("a single-line objective is prefixed verbatim", goalEditComposerPrompt("重构支付模块"), "/goal edit 重构支付模块");
+  equal(
+    "a multi-line objective preserves newlines verbatim",
+    goalEditComposerPrompt("第一行\n第二行"),
+    "/goal edit 第一行\n第二行",
+  );
 }
 
 console.log("\nthe pill's label and title are 目标 in every state; the panel row speaks the state");
@@ -648,12 +598,11 @@ console.log("\na completed goal's seen state");
   check("after the completed panel is closed the pill is hidden", goalPillPresentation({ available: true, goal: done }, step(final, { kind: "closed", goal: done }).seen).visible, false);
 }
 
-console.log("\nleaving the editor closes the panel (UI-v8)");
+console.log("\npanel transition rules");
 {
-  equal("the editor's 取消 / Escape closes", goalPanelNext({ kind: "cancelEdit" }), "close");
   equal("the clear page's 取消 returns to the main page", goalPanelNext({ kind: "cancelClear" }), "view");
   equal("a saved edit closes", goalPanelNext({ kind: "control", action: "edit", ok: true }), "close");
-  equal("a refused edit stays in the editor", goalPanelNext({ kind: "control", action: "edit", ok: false }), "stay");
+  equal("a refused edit stays", goalPanelNext({ kind: "control", action: "edit", ok: false }), "stay");
   for (const action of ["pause", "resume", "clear"]) {
     equal(`a successful ${action} returns to the main page`, goalPanelNext({ kind: "control", action, ok: true }), "view");
     equal(`a refused ${action} stays`, goalPanelNext({ kind: "control", action, ok: false }), "stay");
@@ -717,8 +666,11 @@ console.log("\nthe trigger and popover wiring");
   assert("the clear page's row end comes from the pure rule", /goalConfirmControls\(compact\)/.test(popover));
   assert("the clear page has no menu rows", !/function MenuRow/.test(popover) && !/goalMenuItem/.test(popover));
   assert("the clear page has no separator", !/function Separator/.test(popover));
-  assert("the edit page has no save menu row", !/label=\{text\.actions\.save\}/.test(popover));
-  assert("the edit keys go through the pure rule", /goalEditKeyAction\(\{/.test(popover));
+  assert("the inline GoalEditor is removed", !/function GoalEditor/.test(popover));
+  assert(
+    "editing hands off to the host composer via client.composers",
+    /client\.composers\(\{ agentId \}\)/.test(pill) && /composer\.setPrompt\(prompt\)/.test(pill) && /composer\s*\.focus\(/.test(pill),
+  );
   assert("the clear page's red button is statusDanger", /backgroundColor: theme\.colors\.statusDanger/.test(popover));
   // Every place that shows a control error goes through the translated display.
   assert("control errors render through ControlError", /<ControlError theme=\{theme\} text=\{text\} error=\{error\} \/>/.test(popover));

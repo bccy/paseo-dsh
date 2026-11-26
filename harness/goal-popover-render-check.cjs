@@ -214,7 +214,7 @@ function assert(what, condition, detail) {
 
 /** Render one panel state; every callback is a counting spy unless overridden. */
 function render(props = {}) {
-  const calls = { toggle: 0, beginEdit: 0, beginClear: 0, save: 0, cancelEdit: 0, confirmClear: 0, cancelClear: 0 };
+  const calls = { toggle: 0, beginEdit: 0, beginClear: 0, confirmClear: 0, cancelClear: 0 };
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
@@ -231,7 +231,6 @@ function render(props = {}) {
         mode: props.mode ?? "view",
         busy: props.busy ?? false,
         error: props.error,
-        draft: props.draft ?? "",
         onToggleRunning: () => {
           calls.toggle += 1;
         },
@@ -241,19 +240,12 @@ function render(props = {}) {
         onBeginClear: () => {
           calls.beginClear += 1;
         },
-        onSave: () => {
-          calls.save += 1;
-        },
-        onCancelEdit: () => {
-          calls.cancelEdit += 1;
-        },
         onConfirmClear: () => {
           calls.confirmClear += 1;
         },
         onCancelClear: () => {
           calls.cancelClear += 1;
         },
-        onChangeDraft: () => {},
       }),
     );
   });
@@ -269,14 +261,6 @@ function click(node) {
   flushSync(() => {
     node.dispatchEvent(new window.MouseEvent("click", { bubbles: true, cancelable: true }));
   });
-}
-function keydown(node, key, init = {}) {
-  flushSync(() => {
-    node.dispatchEvent(new window.KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...init }));
-  });
-}
-function field(container) {
-  return container.querySelector("input, textarea");
 }
 
 console.log("the objective row is the panel's only action target");
@@ -294,20 +278,23 @@ console.log("the objective row is the panel's only action target");
   assert("the pause icon button is named 暂停目标", byLabel(container, "暂停目标") !== undefined);
   assert("the clear icon button is named 清除目标", byLabel(container, "清除目标") !== undefined);
 
-  // Multi-line readable objective (up to 3 lines) + semantic status pill + rounds.
+  // One truncated objective line + semantic status pill + rounds.
   const objective = [...container.querySelectorAll("div,span")].find((node) =>
     (node.textContent ?? "").trim() === baseGoal.objective,
   );
   assert("the objective is drawn", objective !== undefined);
   if (objective !== undefined) {
+    // `numberOfLines={1}` reaches the DOM as react-native-web's single-line
+    // class (`r-whiteSpace-*` / `r-overflow-*` / `r-textOverflow-*`), not as an
+    // inline style; jsdom also computes it when the injected sheet is present.
     const style = objective.getAttribute("style") ?? "";
     const classes = objective.getAttribute("class") ?? "";
     const computed = global.getComputedStyle(objective);
     assert(
-      "the objective allows up to 3 lines (not single-line nowrap)",
-      !/nowrap/.test(computed.whiteSpace ?? "") &&
-        !/white-space:\s*nowrap/.test(style) &&
-        (/font-size:\s*14\.5px/.test(style) || /WebkitLineClamp|line-clamp|maxWidth/.test(`${style} | ${classes}`)),
+      "the objective is one truncated line",
+      /nowrap/.test(computed.whiteSpace ?? "") ||
+        /white-space:\s*nowrap/.test(style) ||
+        (/whiteSpace/.test(classes) && /textOverflow/.test(classes)),
       `${style} | ${classes}`,
     );
   }
@@ -347,92 +334,6 @@ console.log("\nthe running ring turns on the whale's corner");
   check("the ring is labelled 目标运行中", ring?.getAttribute("aria-label"), "目标运行中");
   const idle = render({ running: false }).container;
   assert("a non-running goal draws no ring", idle.querySelector('[role="progressbar"]') === null);
-}
-
-console.log("\nthe edit page is a small composer");
-{
-  const { container, calls } = render({ mode: "edit", draft: baseGoal.objective });
-  assert("the edit page names itself 编辑目标", container.textContent.includes("编辑目标"));
-  assert("the edit page keeps the whale", container.querySelector('[data-icon="svg"]') !== null);
-  const input = field(container);
-  assert("the edit page renders a real multi-line field", input !== null && input.tagName === "TEXTAREA");
-  check("the field is pre-filled with the full objective", input.value, baseGoal.objective);
-  check("the caret starts at the beginning", input.selectionStart, 0);
-  // The field grows from two lines (2 × 21 on web) and stops at six (6 × 21).
-  // jsdom never lays the measuring copy out, so this is the two-line floor.
-  const style = input.getAttribute("style") ?? "";
-  assert("an unmeasured field is two lines tall", /(^|;)\s*height:\s*42px/.test(style), style);
-  assert("the field stops growing at six lines", /max-height:\s*126px/.test(style), style);
-  assert("the field uses the composer's 15px type", /font-size:\s*15px/.test(style), style);
-  // The old menu-row page is gone: no 保存 row, no separator under the field.
-  assert("there is no 保存 menu row", byLabel(container, "保存") === undefined);
-  assert("the save button is named 保存目标", byLabel(container, "保存目标") !== undefined);
-  // The now line is hidden while editing: the panel does one thing at a time.
-  assert("the now line is hidden while editing", !container.textContent.includes(baseGoal.currentTask) && !container.textContent.includes("正在"));
-  click(byLabel(container, "取消"));
-  check("取消 leaves the edit page", calls.cancelEdit, 1);
-}
-
-console.log("\nthe round ✓ is inert for an empty or unchanged draft");
-{
-  for (const [what, draft] of [["blank", "   "], ["unchanged", baseGoal.objective]]) {
-    const { container, calls } = render({ mode: "edit", draft });
-    const save = byLabel(container, "保存目标");
-    assert(`✓ is disabled for a ${what} draft`, save.getAttribute("aria-disabled") === "true", save.outerHTML);
-    assert(`✓ is half opacity for a ${what} draft`, /opacity:\s*0\.5/.test(save.getAttribute("style") ?? ""), save.getAttribute("style"));
-    click(save);
-    check(`clicking ✓ on a ${what} draft submits nothing`, calls.save, 0);
-    keydown(field(container), "Enter");
-    check(`desktop Enter on a ${what} draft submits nothing`, calls.save, 0);
-  }
-  const changed = render({ mode: "edit", draft: `${baseGoal.objective}（已改）` });
-  const save = byLabel(changed.container, "保存目标");
-  assert("✓ is enabled for a changed draft", save.getAttribute("aria-disabled") !== "true", save.outerHTML);
-  assert("an enabled ✓ is fully opaque", /opacity:\s*1(;|$)/.test(save.getAttribute("style") ?? ""), save.getAttribute("style"));
-  click(save);
-  check("clicking ✓ submits", changed.calls.save, 1);
-}
-
-console.log("\ndesktop keys: Enter saves, Shift+Enter and an IME commit do not, Escape cancels");
-{
-  const dirty = `${baseGoal.objective}（已改）`;
-  const desk = render({ mode: "edit", draft: dirty });
-  assert("desktop shows the Enter hint", desk.container.textContent.includes("Enter保存"));
-  assert("desktop shows the Shift Enter hint", desk.container.textContent.includes("Shift Enter换行"));
-  assert("desktop shows the Esc hint", desk.container.textContent.includes("Esc取消"));
-  keydown(field(desk.container), "Enter", { shiftKey: true });
-  check("Shift+Enter does not save", desk.calls.save, 0);
-  keydown(field(desk.container), "Enter", { isComposing: true });
-  check("an Enter that commits an IME candidate does not save", desk.calls.save, 0);
-  keydown(field(desk.container), "Enter");
-  check("desktop Enter saves", desk.calls.save, 1);
-  keydown(field(desk.container), "Escape");
-  check("Escape cancels", desk.calls.cancelEdit, 1);
-
-  const phone = render({ mode: "edit", draft: dirty, compact: true });
-  keydown(field(phone.container), "Enter");
-  check("phone Enter is a newline, not a save", phone.calls.save, 0);
-  assert("phone shows no key hints", !phone.container.textContent.includes("Enter"));
-  assert("phone shows no Esc hint", !phone.container.textContent.includes("Esc"));
-  assert("phone keeps the 编辑目标 header", phone.container.textContent.includes("编辑目标"));
-  click(byLabel(phone.container, "保存目标"));
-  check("phone ✓ saves", phone.calls.save, 1);
-}
-
-console.log("\nblur never saves");
-{
-  const blur = render({ mode: "edit", draft: `${baseGoal.objective}（已改）` });
-  const blurred = field(blur.container);
-  // React's onBlur is delegated from `focusout`; dispatching `blur` alone never
-  // reaches it, which would make this check pass no matter what the component
-  // does. `blur()` + focusout is the real path.
-  flushSync(() => {
-    blurred.focus();
-    blurred.blur();
-    blurred.dispatchEvent(new window.FocusEvent("focusout", { bubbles: true }));
-  });
-  check("blur never saves", blur.calls.save, 0);
-  check("blur never cancels either", blur.calls.cancelEdit, 0);
 }
 
 console.log("\nthe clear page holds the view page's row in place (UI-v9 direction B)");
@@ -535,15 +436,16 @@ console.log("\nthe complete page is read-only, with only clear (UI-v7)");
   assert("the row is not a button", row?.getAttribute("role") !== "button", row?.getAttribute("role"));
   click(row);
   check("clicking the row opens no editor", calls.beginEdit, 0);
-  // Up to 3 readable lines, same typography as active view mode.
+  // One truncated line, the same rule as the other states.
   const objective = [...container.querySelectorAll("div,span")].find(
     (node) => (node.textContent ?? "").trim() === baseGoal.objective,
   );
+  const classes = objective?.getAttribute("class") ?? "";
   const style = objective?.getAttribute("style") ?? "";
   assert(
-    "the complete objective allows up to 3 lines",
-    objective !== undefined && !/white-space:\s*nowrap/.test(style) && /font-size:\s*14\.5px/.test(style),
-    style,
+    "the complete objective is one truncated line",
+    objective !== undefined && ((/whiteSpace/.test(classes) && /textOverflow/.test(classes)) || /white-space:\s*nowrap/.test(style)),
+    `${style} | ${classes}`,
   );
   assert("the status pill says 目标已完成", container.textContent.includes("目标已完成"));
   assert("the rounds text is drawn on complete", container.textContent.includes("第 3 轮 · 预算 10"));
@@ -599,11 +501,9 @@ console.log("\ncontrol errors are shown in Chinese, DSH's sentence kept (UI-v9)"
   const unknownLine = [...raw.querySelectorAll('[dir="auto"]')].find((node) => (node.textContent ?? "").trim() === unknown);
   assert("…in red", /color:\s*rgb\(157, 67, 59\)/.test(unknownLine?.getAttribute("style") ?? ""), unknownLine?.outerHTML);
 
-  // The same display on the view page and the edit page.
+  // The same display on the view page and the complete page.
   const view = render({ error: "The goal command is not valid for the current state. Run /goal to view available commands." }).container;
   assert("the view page translates a pause/resume refusal", view.textContent.includes("目标当前的状态不允许这个操作"), view.textContent);
-  const edit = render({ mode: "edit", draft: "x", error: "Goal editing requires a replacement objective." }).container;
-  assert("the edit page translates a save refusal", edit.textContent.includes("编辑目标需要填写新的目标内容。"), edit.textContent);
   const done = { ...baseGoal, phase: "complete", activation: "disarmed", currentTask: undefined };
   const completeView = render({ goal: done, error: "No goal to clear." }).container;
   assert("the complete page translates too", completeView.textContent.includes("没有可清除的目标。"), completeView.textContent);
@@ -652,13 +552,26 @@ function containerProps(spies) {
   };
 }
 
-function mountContainer(answer, goal = baseGoal) {
-  const spies = { close: 0, rpc: [], closed: [] };
+function mountContainer(answer, goal = baseGoal, options = {}) {
+  const spies = { close: 0, rpc: [], closed: [], prompts: [], focuses: [], selectors: [] };
   const store = new Map([["agent-1", { goal, available: true, listeners: new Set() }]]);
+  const defaultComposer = {
+    setPrompt: (text) => {
+      if (options.setPromptError !== undefined) throw options.setPromptError;
+      spies.prompts.push(text);
+    },
+    focus: async (focusOptions) => {
+      spies.focuses.push(focusOptions);
+    },
+  };
   const client = {
     rpc: async (_definition, input) => {
       spies.rpc.push(input);
       return answer;
+    },
+    composers: (selector) => {
+      spies.selectors.push(selector);
+      return options.noComposer ? [] : [defaultComposer];
     },
   };
   // No refresh callback: a successful control asks the **server's** goal feed to
@@ -687,29 +600,25 @@ function remountContainer(Popover, spies) {
   return { container, root };
 }
 
-function openEditor(container) {
+function clickObjectiveRow(container) {
   click(byLabel(container, "目标进行中，编辑目标"));
 }
 
-/** Type into the edit field the way a browser does: set the value, fire `input`. */
-function typeInto(input, value) {
-  flushSync(() => {
-    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
-    setter.call(input, value);
-    input.dispatchEvent(new window.Event("input", { bubbles: true }));
-  });
-}
-
 async function containerChecks() {
-  console.log("\nthe real container: leaving the editor closes the panel (UI-v8)");
+  console.log("\nthe real container: pressing the objective row hands off to Paseo's composer");
 
   {
     const { container, root, spies } = mountContainer({ ok: true, message: "ok" });
-    openEditor(container);
-    assert("the row opens the editor", field(container) !== null);
-    click(byLabel(container, "取消"));
-    check("the editor's 取消 calls close() once", spies.close, 1);
-    check("…and sends no command", spies.rpc.length, 0);
+    clickObjectiveRow(container);
+    const expected = `/goal edit ${baseGoal.objective}`;
+    check("looks up the agent's own composer", spies.selectors.length, 1);
+    check("…by agentId", spies.selectors[0]?.agentId, "agent-1");
+    check("prefills `/goal edit <objective>` in the host composer", spies.prompts[0], expected);
+    check("closes the popover right away", spies.close, 1);
+    check("focuses the composer once", spies.focuses.length, 1);
+    check("…with the caret at the end of the prompt", spies.focuses[0]?.selection?.start, expected.length);
+    check("…as a collapsed caret", spies.focuses[0]?.selection?.end, expected.length);
+    check("…and sends no control RPC itself", spies.rpc.length, 0);
     // A close is confirmed, not read off one unmount (`./seen-close-gate`): the
     // report lands only after the window, so a host remount can never fake it.
     flushSync(() => root.unmount());
@@ -717,6 +626,42 @@ async function containerChecks() {
     await sleep(SEEN_CLOSE_CONFIRM_MS + 80);
     check("closing reports the goal it showed", spies.closed.length, 1);
     check("…which is not complete, so nothing is marked seen", spies.closed[0]?.phase, "active");
+  }
+
+  {
+    const multiLine = { ...baseGoal, objective: "第一步\n第二步" };
+    const { container, spies } = mountContainer({ ok: true, message: "ok" }, multiLine);
+    clickObjectiveRow(container);
+    check("a multi-line objective is preserved verbatim in the composer", spies.prompts[0], "/goal edit 第一步\n第二步");
+    check("…and closes the popover", spies.close, 1);
+  }
+
+  {
+    // Loud failure: if the host cannot resolve the agent's composer, stay open
+    // and show an error instead of silently doing nothing.
+    const { container, spies } = mountContainer({ ok: true, message: "ok" }, baseGoal, { noComposer: true });
+    clickObjectiveRow(container);
+    check("missing composer does not close the popover", spies.close, 0);
+    assert(
+      "…and explains why in place",
+      container.textContent.includes("无法访问当前会话的输入框。"),
+      container.textContent,
+    );
+  }
+
+  {
+    // Loud failure: if `setPrompt` throws, surface the error and stay open.
+    const { container, spies } = mountContainer({ ok: true, message: "ok" }, baseGoal, {
+      setPromptError: new Error("The composer is locked."),
+    });
+    clickObjectiveRow(container);
+    check("a failing setPrompt does not close the popover", spies.close, 0);
+    check("…and does not focus", spies.focuses.length, 0);
+    assert(
+      "…and displays the thrown error in place",
+      container.textContent.includes("The composer is locked."),
+      container.textContent,
+    );
   }
 
   {
@@ -734,39 +679,6 @@ async function containerChecks() {
     await sleep(SEEN_CLOSE_CONFIRM_MS + 80);
     check("a real close reports the goal it showed, exactly once", first.spies.closed.length, 1);
     check("…with the completed goal", first.spies.closed[0]?.phase, "complete");
-  }
-
-  {
-    const { container, spies } = mountContainer({ ok: true, message: "ok" });
-    openEditor(container);
-    keydown(field(container), "Escape");
-    check("Escape in the editor calls close() once", spies.close, 1);
-  }
-
-  {
-    const { container, spies } = mountContainer({ ok: true, message: "Goal updated" });
-    openEditor(container);
-    typeInto(field(container), `${baseGoal.objective}（已改）`);
-    click(byLabel(container, "保存目标"));
-    await settle();
-    await settle();
-    check("a save sends one edit", spies.rpc.length, 1);
-    check("…with the new objective", spies.rpc[0]?.objective, `${baseGoal.objective}（已改）`);
-    check("a successful save calls close() once", spies.close, 1);
-    check("…and issues exactly the one control call", spies.rpc.length, 1);
-  }
-
-  {
-    const { container, spies } = mountContainer({ ok: false, error: "The goal command is not valid for the current state." });
-    openEditor(container);
-    typeInto(field(container), `${baseGoal.objective}（已改）`);
-    click(byLabel(container, "保存目标"));
-    await settle();
-    await settle();
-    check("a refused save does not close", spies.close, 0);
-    assert("…it stays in the editor", field(container) !== null);
-    check("…keeping the draft", field(container)?.value, `${baseGoal.objective}（已改）`);
-    assert("…and shows DSH's sentence", container.textContent.includes("The goal command is not valid"), container.textContent);
   }
 
   {
