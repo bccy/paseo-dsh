@@ -149,6 +149,8 @@ export interface DshConsoleScreenProps
   readonly client?: PluginClientContext;
   /** Live host CLI/data capability snapshot driving tab visibility and usage source defaults. */
   readonly capabilities?: CapabilitiesSnapshot;
+  /** Optional trigger to re-fetch host capabilities if startup detection failed or has not resolved yet. */
+  readonly onEnsureCapabilities?: () => void;
   /** Route params supplied by `addScreen`; optional so `addSettingsScreen` can mount directly. */
   readonly params?: PluginScreenParams;
   /** Default tab when `params?.tab` does not specify one (default derived from `capabilities`). */
@@ -222,6 +224,7 @@ function UsagePlaceholder({ colors, compact }: { colors: Colors; compact: boolea
 function DshConsoleBody({
   client,
   capabilities,
+  onEnsureCapabilities,
   theme,
   host,
   layout,
@@ -240,6 +243,21 @@ function DshConsoleBody({
   const copy = useLocaleText().console;
   const locale = useCurrentLocale();
   const [width, setWidth] = useState(0);
+
+  // If startup capability detection failed (e.g. transient iOS relay disconnect),
+  // trigger one fresh lookup when the console screen opens so Antigravity tabs
+  // and usage sources recover automatically without restarting the app.
+  const ensuredCapabilitiesRef = useRef(false);
+  useEffect(() => {
+    if (capabilities !== undefined) {
+      ensuredCapabilitiesRef.current = false;
+      return;
+    }
+    if (!ensuredCapabilitiesRef.current && onEnsureCapabilities) {
+      ensuredCapabilitiesRef.current = true;
+      onEnsureCapabilities();
+    }
+  }, [capabilities, onEnsureCapabilities]);
 
   // Shared dual-currency & pricing modal state across Tab 1 (Usage) and Tab 3 (Settings).
   const mountedRef = useRef(true);

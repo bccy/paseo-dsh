@@ -35,8 +35,8 @@ export const PILL_CORNER_RING = PILL_CORNER_FRAME - 2 * PILL_CORNER_KNOCKOUT;
 /** Offset from the glyph's bottom-right: one pixel out, still inside the host's 16px box. */
 export const PILL_CORNER_OFFSET = -1;
 
-/** The glyph names the three pills draw under the corner ring. */
-export type PillGlyph = "Users" | "Target" | "CircleCheck" | "SquareTerminal";
+/** The glyph names the composer pills draw under the corner ring. */
+export type PillGlyph = "Users" | "Target" | "CircleCheck" | "SquareTerminal" | "Bot";
 
 /**
  * The base glyph, plus the corner ring when `running`.

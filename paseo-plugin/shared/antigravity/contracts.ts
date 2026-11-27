@@ -616,6 +616,9 @@ export const setOrchestratorRpc = defineRpc({
 export const subagentStateSchema = z.enum(["running", "done", "stopped", "failed", "idle"]);
 export type SubagentState = z.infer<typeof subagentStateSchema>;
 
+export const subagentOriginSchema = z.enum(["subagent", "swarm"]);
+export type SubagentOrigin = z.infer<typeof subagentOriginSchema>;
+
 export const subagentSummarySchema = z.object({
   /** agy conversation id of the subagent. */
   id: z.string(),
@@ -624,6 +627,8 @@ export const subagentSummarySchema = z.object({
   depth: z.number().int().min(1),
   role: z.string().nullable(),
   type: z.string().nullable(),
+  /** Whether this child came from a regular subagent or an Antigravity `/swarm` worker. */
+  origin: subagentOriginSchema.optional(),
   /** Start of the task the parent gave it. */
   task: z.string(),
   state: subagentStateSchema,
@@ -646,6 +651,7 @@ export type SubagentSummary = z.infer<typeof subagentSummarySchema>;
 
 export const subagentListSchema = z.object({
   conversationId: z.string().nullable(),
+  swarmTitle: z.string().nullable().optional(),
   subagents: z.array(subagentSummarySchema),
 });
 export type SubagentList = z.infer<typeof subagentListSchema>;
@@ -660,7 +666,14 @@ export const subagentCountsRpc = defineRpc({
   name: "subagents.counts",
   input: z.object({ agentIds: z.array(z.string().min(1).max(200)).max(200) }).strict(),
   output: z.object({
-    counts: z.record(z.string(), z.object({ total: z.number().int(), running: z.number().int() })),
+    counts: z.record(
+      z.string(),
+      z.object({
+        total: z.number().int(),
+        running: z.number().int(),
+        failed: z.number().int().default(0),
+      }),
+    ),
   }),
 });
 
@@ -734,6 +747,48 @@ export const subagentArtifactRpc = defineRpc({
   }),
 });
 
+export const toolSummariesSchema = z.object({
+  byCommand: z.record(z.string(), z.string()),
+  prefixes: z.array(z.object({ prefix: z.string(), summary: z.string() })),
+});
+export type ToolSummaries = z.infer<typeof toolSummariesSchema>;
+
+export const toolSummariesRpc = defineRpc({
+  name: "antigravity.tool_summaries",
+  input: z
+    .object({
+      agentId: z.string().min(1).max(200),
+    })
+    .strict(),
+  output: toolSummariesSchema,
+});
+
+/** Collapses whitespace so transcript CommandLine and ACP detail.command match reliably. */
+export function normalizeCommandKey(command: string): string {
+  return command.replace(/\s+/g, " ").trim();
+}
+
+/** Matches an Antigravity `run_command` headline against cached `toolSummary` entries. */
+export function matchAntigravityCommandSummary(summaries: ToolSummaries | undefined, command: string): string {
+  if (!summaries) return "";
+  const norm = normalizeCommandKey(command);
+  if (!norm) return "";
+  if (Object.prototype.hasOwnProperty.call(summaries.byCommand, norm)) {
+    return summaries.byCommand[norm] ?? "";
+  }
+  let best = "";
+  let bestLen = 0;
+  for (const entry of summaries.prefixes) {
+    const p = entry.prefix;
+    if (p.length < 16) continue;
+    if ((norm.startsWith(p) || p.startsWith(norm)) && p.length >= bestLen) {
+      best = entry.summary;
+      bestLen = p.length;
+    }
+  }
+  return best;
+}
+
 export const SUBAGENT_TIMELINE_KIND = "antigravity-subagent";
 export const SUBAGENT_LIST_TIMELINE_KIND = "antigravity-subagents-check";
 export const ASK_QUESTION_TIMELINE_KIND = "antigravity-ask-question";
@@ -742,6 +797,7 @@ export const subagentCardSchema = z.object({
   id: z.string(),
   role: z.string().nullable().optional(),
   type: z.string().nullable(),
+  origin: subagentOriginSchema.optional(),
   task: z.string(),
   status: z.enum(["running", "completed", "failed", "canceled"]),
 });
@@ -751,6 +807,7 @@ export const subagentCheckSchema = z.object({
   action: z.string(),
   /** States reported by that check, keyed by subagent id. */
   states: z.array(z.object({ id: z.string(), role: z.string().nullable(), state: z.string() })),
+  title: z.string().nullable().optional(),
   status: z.enum(["running", "completed", "failed", "canceled"]),
 });
 export type SubagentCheck = z.infer<typeof subagentCheckSchema>;

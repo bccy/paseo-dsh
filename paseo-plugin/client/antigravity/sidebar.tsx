@@ -1,10 +1,10 @@
-import { useTranslation, type PluginSidebarItemProps } from "@getpaseo/plugin/client";
+import type { PluginSidebarItemProps } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/ui";
 import { Pressable, Text, View } from "react-native";
 import type { QuotaBucket, QuotaGroup } from "../../shared/antigravity/contracts";
 import { percent } from "./format";
 import { antigravityLogoSvg } from "./logo";
-import { messages } from "./messages";
+import { useAntigravityTranslation } from "./messages";
 import { remainingTone, tabular, tint, type Colors } from "./theme";
 import { Bar } from "./ui";
 import { useAccounts } from "./useAccounts";
@@ -64,7 +64,7 @@ function QuotaSidebarItemBody({
   onOpenAntigravity,
 }: Omit<QuotaSidebarItemProps, "visible">) {
   const { colors } = theme;
-  const { t, locale } = useTranslation(messages);
+  const { t, locale } = useAntigravityTranslation();
   const { data } = useAccounts();
   const account = data?.accounts.find((entry) => entry.id === data.defaultAccountId);
   const group = account?.quota ? primaryGroup(account.quota) : null;

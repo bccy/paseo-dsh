@@ -2,7 +2,6 @@ import {
   useAgent,
   useComposers,
   usePaseo,
-  useTranslation,
   type PluginSurfaceProps,
   type PluginTimelineItemProps,
 } from "@getpaseo/plugin/client";
@@ -11,7 +10,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import { isAntigravityProvider, type AskQuestionCard, type AskQuestionEntry } from "../../shared/antigravity/contracts";
-import { errorMessage, messages } from "./messages";
+import { errorMessage, useAntigravityTranslation } from "./messages";
 import {
   SKIPPED_REPLY,
   buildSubmission,
@@ -92,7 +91,7 @@ function SettledQuestionCard({
   questions: readonly AskQuestionEntry[];
   resolution: Exclude<QuestionResolution, { state: "pending" } | { state: "loading" }>;
 }) {
-  const { t } = useTranslation(messages);
+  const { t } = useAntigravityTranslation();
   const skipped = resolution.state === "skipped";
   const answered = resolution.state === "answered";
   const icon = skipped ? "CircleSlash" : answered ? "CircleCheck" : "CircleHelp";
@@ -168,7 +167,7 @@ function PendingQuestionForm({
   questions: readonly AskQuestionEntry[];
   onResolved(next: QuestionResolution): void;
 }) {
-  const { t } = useTranslation(messages);
+  const { t } = useAntigravityTranslation();
   const paseo = usePaseo();
   const toast = useToast();
   const composers = useComposers({ agentId });

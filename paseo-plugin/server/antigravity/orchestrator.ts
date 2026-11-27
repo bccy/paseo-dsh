@@ -27,6 +27,7 @@ const PLANNER_FAMILIES = ["gemini-4-neon", "gemini-4-carbon", "gemini-4-argon", 
 const EXECUTOR_FAMILIES = ["gemini-4-hydrogen", "claude-sonnet-5-5"];
 
 const EFFORT_SUFFIX = /-(low|medium|high|xhigh|max)$/;
+const MODEL_EFFORT_SUFFIX = /-(minimal|low|medium|high|xhigh|max)$/;
 const LABEL_EFFORT = /^(.*?)\s*\(([^()]+)\)\s*$/;
 const CATALOG_TTL_MS = 10 * 60_000;
 
@@ -164,7 +165,16 @@ export class OrchestratorSettings {
     const cached = this.catalogs.get(accountId);
     if (!cached) return null;
     const normalized = model.trim().toLowerCase().replace(/^antigravity\//, "");
-    return cached.models.some((entry) => entry.id.toLowerCase() === normalized || entry.label.toLowerCase() === normalized);
+    const stripped = normalized.replace(MODEL_EFFORT_SUFFIX, "");
+    return cached.models.some((entry) => {
+      const entryId = entry.id.toLowerCase();
+      const entryLabel = entry.label.toLowerCase();
+      if (entryId === normalized || entryLabel === normalized) return true;
+      // Paseo stores base model ids (e.g. "gemini-4-neon") separately from thinkingOptionId,
+      // while `agy models` lists effort-suffixed variants (e.g. "gemini-4-neon-high").
+      if (normalized === stripped && entryId.replace(MODEL_EFFORT_SUFFIX, "") === normalized) return true;
+      return false;
+    });
   }
 
   private catalog(accountId: string, identity: string, refresh: boolean): Promise<CatalogModel[] | null> {

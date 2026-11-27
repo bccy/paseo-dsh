@@ -45,6 +45,7 @@ import {
   timelineStyleSettings,
   type TimelineStyleValues,
 } from "../shared/settings";
+import { useAntigravityCommandSummary } from "./antigravity/tool-summaries";
 import { highlightModeFor, tokenizeCodeLines, type CodeToken, type HighlightMode } from "./code-highlight";
 import { HighlightedCode, HighlightedLine } from "./highlighted-code";
 import { ringColorFor } from "./jobs-popover-layout";
@@ -62,6 +63,7 @@ import { SubagentCard, SubagentStatusChips } from "./subagent-card";
 import { TeamBlockView } from "./team-card";
 import { TextShimmer } from "./text-shimmer";
 import {
+  agyFastToolLabel,
   blockCopy,
   paseoMcpLabel,
   type GoalBlockData,
@@ -1473,10 +1475,28 @@ export function InlineToolCall({
   // may carry what was *requested* rather than what went wrong.
   const errorLine = data.error === "" ? "" : data.error.split("\n")[0];
   const errorHeadline = data.failed && errorLine !== "";
-  const headSummary = errorHeadline ? (data.errorShort !== "" ? data.errorShort : errorLine) : data.summary;
+  const normalizedName = data.name.trim().toLowerCase();
+  const needsAgSummary =
+    normalizedName === "run_command" &&
+    !data.titled &&
+    !errorHeadline &&
+    data.headline !== "" &&
+    typeof agentId === "string" &&
+    agentId !== "";
+  const agSummary = useAntigravityCommandSummary(
+    agentId,
+    data.headline,
+    data.status,
+    rowKey,
+    needsAgSummary,
+  );
+
+  const effectiveSummary = agSummary !== "" ? agSummary : data.summary;
+  const effectiveTitled = data.titled || agSummary !== "";
+  const headSummary = errorHeadline ? (data.errorShort !== "" ? data.errorShort : errorLine) : effectiveSummary;
   // Once expanded the block carries the subject in full, so a row whose title
   // *is* that subject does not repeat a compact copy of it above.
-  const showSummary = headSummary !== "" && !(expanded && !data.titled && data.headline !== "");
+  const showSummary = headSummary !== "" && !(expanded && !effectiveTitled && data.headline !== "");
   const compact = layout.compact;
   const iconSize = compact ? 14 : 16;
   const running = shouldPulse(data.status, useRowPulse(agentId, timestamp, rowKey));
@@ -1497,7 +1517,6 @@ export function InlineToolCall({
   // Subscribe via `useLocaleText()` so language changes immediately re-render
   // this row (including tool labels and all nested block views reading `blockCopy()`).
   const text = useLocaleText();
-  const normalizedName = data.name.trim().toLowerCase();
   const displayLabel =
     normalizedName === "mcp_call_tool" || normalizedName === "agent_message"
       ? data.label
@@ -1505,7 +1524,7 @@ export function InlineToolCall({
         ? text.toolLabels[data.name]
         : Object.prototype.hasOwnProperty.call(text.toolLabels, normalizedName)
           ? text.toolLabels[normalizedName]
-          : (paseoMcpLabel(data.name) ?? data.label);
+          : (paseoMcpLabel(data.name) ?? agyFastToolLabel(data.name) ?? data.label);
 
   const stream = useInkStreamReveal({
     agentId,

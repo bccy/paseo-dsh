@@ -11,13 +11,25 @@ import { sessionEnv } from "./agy";
 import { conversationIdFrom } from "./context";
 import type { PaseoApi } from "./types";
 
-/** Agents that switch account once their running turn ends, plus in-flight manual switches. */
+const DEFERRED_TURN_WINDOW_MS = 10_000;
+
+/** Agents that switch account once their running turn ends, plus in-flight manual/controlled switches. */
 export class PendingSwitches {
   private readonly pending = new Map<string, string>();
-  private readonly manualSwitching = new Set<string>();
+  private readonly executing = new Set<string>();
+  private readonly deferredTurns = new Map<string, { turnId: string | null; at: number }>();
+  private readonly manualCounts = new Map<string, number>();
 
   set(agentId: string, accountId: string): void {
     this.pending.set(agentId, accountId);
+  }
+
+  has(agentId: string): boolean {
+    return this.pending.has(agentId);
+  }
+
+  hasPendingOrActive(agentId: string): boolean {
+    return this.pending.has(agentId) || this.executing.has(agentId);
   }
 
   take(agentId: string): string | undefined {
@@ -26,20 +38,56 @@ export class PendingSwitches {
     return value;
   }
 
+  beginDeferred(agentId: string): void {
+    this.executing.add(agentId);
+  }
+
+  endDeferred(agentId: string): void {
+    this.executing.delete(agentId);
+  }
+
+  /**
+   * Records that this agent's turn was claimed by a deferred manual switch.
+   * Needed because Paseo dispatches `agent.turn.after` handlers serially: by the time
+   * `FallbackController`'s handler runs, the deferred switch handler may have already finished.
+   */
+  markDeferredTurn(agentId: string, turnId?: string | null): void {
+    this.deferredTurns.set(agentId, { turnId: turnId ?? null, at: Date.now() });
+  }
+
+  /**
+   * True when `turnId` matches the turn claimed by a deferred manual switch, or within a short
+   * fallback window when `turnId` is absent.
+   */
+  wasDeferredForTurn(agentId: string, turnId?: string | null): boolean {
+    const record = this.deferredTurns.get(agentId);
+    if (!record) return false;
+    if (record.turnId && turnId) return record.turnId === turnId;
+    if (Date.now() - record.at <= DEFERRED_TURN_WINDOW_MS) return true;
+    this.deferredTurns.delete(agentId);
+    return false;
+  }
+
+  clearDeferredTurn(agentId: string): void {
+    this.deferredTurns.delete(agentId);
+  }
+
   delete(agentId: string): void {
     this.pending.delete(agentId);
   }
 
   beginManual(agentId: string): void {
-    this.manualSwitching.add(agentId);
+    this.manualCounts.set(agentId, (this.manualCounts.get(agentId) ?? 0) + 1);
   }
 
   endManual(agentId: string): void {
-    this.manualSwitching.delete(agentId);
+    const next = (this.manualCounts.get(agentId) ?? 0) - 1;
+    if (next <= 0) this.manualCounts.delete(agentId);
+    else this.manualCounts.set(agentId, next);
   }
 
   isManual(agentId: string): boolean {
-    return this.manualSwitching.has(agentId);
+    return (this.manualCounts.get(agentId) ?? 0) > 0;
   }
 }
 
@@ -86,15 +134,18 @@ export async function switchAgentAccount(
     pending.delete(input.agentId);
     return { result: "unchanged", accountLabel };
   }
-  // An explicit "default" keeps the system choice even when another account is the default.
-  await handle.setMetadata({ [ACCOUNT_METADATA_KEY]: input.accountId });
   const running = agent.status === "running" || agent.status === "initializing";
   if (input.when === "after-turn" && running) {
+    // Do not overwrite metadata while the turn is still executing on `current`:
+    // turn-after attribution and fallback must see the account that actually ran this turn.
     pending.set(input.agentId, input.accountId);
     return { result: "scheduled", accountLabel };
   }
+  // An explicit "default" keeps the system choice even when another account is the default.
+  await handle.setMetadata({ [ACCOUNT_METADATA_KEY]: input.accountId });
   pending.delete(input.agentId);
-  if (input.manual) pending.beginManual(input.agentId);
+  // Protect both forward reload and failure rollback reload from re-entering `redirectForOpen`.
+  pending.beginManual(input.agentId);
   try {
     await handle.reload();
   } catch (error) {
@@ -110,7 +161,7 @@ export async function switchAgentAccount(
         (restored ? ` The agent stays on "${service.labelOf(current)}".` : ""),
     );
   } finally {
-    if (input.manual) pending.endManual(input.agentId);
+    pending.endManual(input.agentId);
   }
   return { result: "switched", accountLabel };
 }
@@ -343,20 +394,45 @@ export function registerHooks(
 
   // Deferred switches run as soon as the agent's turn ends.
   removers.push(
-    server.addHook("agent.turn.after", async ({ agent }, ctx) => {
+    server.addHook("agent.turn.after", async ({ agent, turnId }, ctx) => {
       observers?.onContext?.(ctx);
       const { paseo } = ctx;
       const target = pending.take(agent.id);
       if (!target) return;
-      if (accountIdFromMetadata(agent.metadata) !== target) return;
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      pending.beginManual(agent.id);
+      pending.beginDeferred(agent.id);
+      pending.markDeferredTurn(agent.id, turnId);
       try {
-        await paseo.agents.ref(agent.id).reload();
-      } catch (error) {
-        console.error(`dsh-paseo/antigravity: deferred switch of ${agent.id} failed`, error);
+        await service.init();
+        if (target !== SYSTEM_ACCOUNT_ID) {
+          const account = service.store.get(target);
+          if (!account || account.unsafeDetail) return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const handle = paseo.agents.ref(agent.id);
+        const snapshot = await handle.refresh().catch(() => null);
+        if (!snapshot || snapshot.agent.archivedAt) return;
+        const previous = accountIdFromMetadata(snapshot.agent.metadata);
+        if (previous === target) return;
+        pending.beginManual(agent.id);
+        try {
+          await handle.setMetadata({ [ACCOUNT_METADATA_KEY]: target });
+          try {
+            await handle.reload();
+          } catch (reloadError) {
+            await handle.setMetadata({ [ACCOUNT_METADATA_KEY]: previous }).catch(() => undefined);
+            await handle.reload().catch(() => undefined);
+            throw reloadError;
+          }
+        } catch (error) {
+          console.error(`dsh-paseo/antigravity: deferred switch of ${agent.id} failed`, error);
+        } finally {
+          pending.endManual(agent.id);
+        }
       } finally {
-        pending.endManual(agent.id);
+        // Refresh timestamp on exit so a slow reload never expires the turnId-less fallback window
+        // before the next serial `agent.turn.after` handler runs.
+        pending.markDeferredTurn(agent.id, turnId);
+        pending.endDeferred(agent.id);
       }
     }),
   );
@@ -365,6 +441,7 @@ export function registerHooks(
     server.addHook("agent.archive.after", async ({ agent }, ctx) => {
       observers?.onContext?.(ctx);
       pending.delete(agent.id);
+      pending.clearDeferredTurn(agent.id);
       observers?.onAgentArchived?.(agent.id);
     }),
   );

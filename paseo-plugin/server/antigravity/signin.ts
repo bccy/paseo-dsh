@@ -32,10 +32,36 @@ export interface SubmitOutcome {
   submittedAt: number;
 }
 
+interface StartingSignIn {
+  loginId: string;
+  accountId: string;
+  child: ChildProcessWithoutNullStreams;
+  exited: Promise<number | null>;
+  cancelled: boolean;
+}
+
+function terminateChild(child: ChildProcessWithoutNullStreams, exited: Promise<number | null>): void {
+  try {
+    child.kill("SIGTERM");
+  } catch {
+    // Already exited.
+  }
+  const killTimer = setTimeout(() => {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Already exited.
+    }
+  }, 2000);
+  killTimer.unref?.();
+  void exited.then(() => clearTimeout(killTimer));
+}
+
 function redact(text: string): string {
   return text
     .replace(/https:\/\/\S+/g, "<url>")
-    .replace(/\b[\w./~-]{40,}\b/g, "<redacted>")
+    .replace(/\b(code|token|access_token|refresh_token|id_token|client_secret)\s*[:=]\s*[^\s"'&,;)}\]]+/gi, "$1=<redacted>")
+    .replace(/(^|[\s"'=:,(])[\w./~+%=-]{32,}(?=$|[\s"'&;,)}\]])/g, "$1<redacted>")
     .trim();
 }
 
@@ -91,61 +117,85 @@ export function normalizeSignInResponse(pending: { state: string | null }, raw: 
 /** Runs `agy acp --login` per profile and relays the code the user pastes. */
 export class SignInManager {
   private readonly pending = new Map<string, PendingSignIn>();
+  private readonly starting = new Map<string, StartingSignIn>();
+  private disposed = false;
 
   async start(agyPath: string, accountId: string): Promise<{ loginId: string; url: string; expiresAt: string }> {
-    for (const existing of this.pending.values()) {
-      if (existing.accountId === accountId) this.cancel(existing.loginId);
-    }
+    if (this.disposed) throw new Error("Sign-in manager has been disposed.");
+    this.cancelForAccount(accountId);
     const child = spawn(agyPath, ["acp", "--disable-telemetry", "--login"], {
       cwd: profileHome(accountId),
       env: commandEnv(accountId),
       stdio: ["pipe", "pipe", "pipe"],
     });
+    // Prevent unhandled 'error' events (e.g. EPIPE / ERR_STREAM_DESTROYED) from crashing plugin-process.
+    child.stdin.on("error", () => undefined);
     const loginId = randomUUID();
     let output = "";
     const exited = new Promise<number | null>((resolve) => {
       child.on("close", (code) => resolve(code));
       child.on("error", () => resolve(null));
     });
-    const url = await new Promise<string>((resolve, reject) => {
-      let settled = false;
-      const cleanup = () => {
-        clearTimeout(timer);
-        child.stdout.off("data", onData);
-        child.stderr.off("data", onData);
-        child.off("error", onError);
-      };
-      const done = (callback: () => void) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        callback();
-      };
-      const timer = setTimeout(() => {
-        done(() => {
-          child.kill("SIGTERM");
-          setTimeout(() => child.kill("SIGKILL"), 2000).unref?.();
-          reject(new Error(`agy did not print a sign-in link within ${URL_WAIT_MS / 1000} seconds. ${tail(output)}`));
+    const startingEntry: StartingSignIn = {
+      loginId,
+      accountId,
+      child,
+      exited,
+      cancelled: false,
+    };
+    this.starting.set(loginId, startingEntry);
+    let url: string;
+    try {
+      url = await new Promise<string>((resolve, reject) => {
+        let settled = false;
+        const cleanup = () => {
+          clearTimeout(timer);
+          child.stdout.off("data", onData);
+          child.stderr.off("data", onData);
+          child.off("error", onError);
+        };
+        const done = (callback: () => void) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          callback();
+        };
+        const timer = setTimeout(() => {
+          done(() => {
+            terminateChild(child, exited);
+            reject(new Error(`agy did not print a sign-in link within ${URL_WAIT_MS / 1000} seconds. ${tail(output)}`));
+          });
+        }, URL_WAIT_MS);
+        timer.unref?.();
+        const onData = (chunk: Buffer) => {
+          output += chunk.toString("utf8");
+          if (output.length > 64 * 1024) output = output.slice(-32 * 1024);
+          const match = URL_PATTERN.exec(output);
+          if (match) done(() => resolve(match[0]));
+        };
+        const onError = (error: Error) => {
+          done(() => reject(new Error(`Could not start agy: ${error.message}`)));
+        };
+        child.stdout.on("data", onData);
+        child.stderr.on("data", onData);
+        child.on("error", onError);
+        void exited.then((code) => {
+          done(() =>
+            reject(
+              startingEntry.cancelled
+                ? new Error("Sign-in was cancelled.")
+                : new Error(`agy exited (code ${String(code)}) before printing a sign-in link. ${tail(output)}`),
+            ),
+          );
         });
-      }, URL_WAIT_MS);
-      const onData = (chunk: Buffer) => {
-        output += chunk.toString("utf8");
-        if (output.length > 64 * 1024) output = output.slice(-32 * 1024);
-        const match = URL_PATTERN.exec(output);
-        if (match) done(() => resolve(match[0]));
-      };
-      const onError = (error: Error) => {
-        done(() => reject(new Error(`Could not start agy: ${error.message}`)));
-      };
-      child.stdout.on("data", onData);
-      child.stderr.on("data", onData);
-      child.on("error", onError);
-      void exited.then((code) => {
-        done(() =>
-          reject(new Error(`agy exited (code ${String(code)}) before printing a sign-in link. ${tail(output)}`)),
-        );
       });
-    });
+    } finally {
+      this.starting.delete(loginId);
+    }
+    if (startingEntry.cancelled || this.disposed) {
+      terminateChild(child, exited);
+      throw new Error("Sign-in was cancelled.");
+    }
     let state: string | null = null;
     try {
       state = new URL(url).searchParams.get("state");
@@ -180,7 +230,7 @@ export class SignInManager {
   }
 
   accountOf(loginId: string): string | undefined {
-    return this.pending.get(loginId)?.accountId;
+    return this.pending.get(loginId)?.accountId ?? this.starting.get(loginId)?.accountId;
   }
 
   /**
@@ -196,15 +246,27 @@ export class SignInManager {
     entry.submitting = true;
     const before = entry.output.length;
     const submittedAt = Date.now() - 5000;
+    let submitTimer: NodeJS.Timeout | undefined;
     try {
-      entry.child.stdin.write(`${response}\n`);
+      const stdin = entry.child.stdin;
+      if (!stdin || stdin.destroyed || !stdin.writable) {
+        throw new Error("Sign-in process is no longer accepting input. Start again.");
+      }
+      await new Promise<void>((resolve, reject) => {
+        stdin.write(`${response}\n`, (err) => {
+          if (err) reject(new Error(`Could not send sign-in code to agy: ${err.message}`));
+          else resolve();
+        });
+      });
       const code = await Promise.race([
         entry.exited,
-        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), SUBMIT_WAIT_MS)),
+        new Promise<"timeout">((resolve) => {
+          submitTimer = setTimeout(() => resolve("timeout"), SUBMIT_WAIT_MS);
+          submitTimer.unref?.();
+        }),
       ]);
       if (code === "timeout") {
-        entry.child.kill("SIGTERM");
-        setTimeout(() => entry.child.kill("SIGKILL"), 2000).unref?.();
+        terminateChild(entry.child, entry.exited);
         return { exitedCleanly: false, submittedAt };
       }
       if (code !== 0) {
@@ -213,25 +275,36 @@ export class SignInManager {
       }
       return { exitedCleanly: true, submittedAt };
     } finally {
+      if (submitTimer) clearTimeout(submitTimer);
       this.drop(loginId);
     }
   }
 
   cancel(loginId: string): void {
+    const startingEntry = this.starting.get(loginId);
+    if (startingEntry) {
+      startingEntry.cancelled = true;
+      this.starting.delete(loginId);
+      terminateChild(startingEntry.child, startingEntry.exited);
+    }
     const entry = this.pending.get(loginId);
     if (!entry) return;
-    entry.child.kill("SIGTERM");
-    setTimeout(() => entry.child.kill("SIGKILL"), 2000).unref?.();
+    terminateChild(entry.child, entry.exited);
     this.drop(loginId);
   }
 
   cancelForAccount(accountId: string): void {
+    for (const entry of [...this.starting.values()]) {
+      if (entry.accountId === accountId) this.cancel(entry.loginId);
+    }
     for (const entry of [...this.pending.values()]) {
       if (entry.accountId === accountId) this.cancel(entry.loginId);
     }
   }
 
   cancelAll(): void {
+    this.disposed = true;
+    for (const loginId of [...this.starting.keys()]) this.cancel(loginId);
     for (const loginId of [...this.pending.keys()]) this.cancel(loginId);
   }
 

@@ -1158,6 +1158,46 @@ const TOOL_NAME_ICONS: Record<string, string> = {
   remote_download_file: "Download",
   remote_upload_file: "Upload",
   remote_get_operation: "FileCheck",
+  // Antigravity built-in tools: keeps proper glyphs both when ACP sends typed
+  // details and when tools arrive as `unknown` (swarm/subagent/task/resource)
+  // or without a detail payload (subagent transcript rows).
+  run_command: "SquareTerminal",
+  command_status: "SquareTerminal",
+  send_command_input: "SquareTerminal",
+  read_file: "Eye",
+  write_file: "Pencil",
+  edit_file: "Pencil",
+  view_file: "Eye",
+  view_file_outline: "FileCode",
+  view_code_item: "FileCode",
+  replace_file_content: "Pencil",
+  multi_replace_file_content: "Pencil",
+  write_to_file: "Pencil",
+  grep_search: "Search",
+  find_by_name: "Search",
+  list_dir: "FolderOpen",
+  search_web: "Globe",
+  read_url_content: "Eye",
+  manage_task: "Timer",
+  schedule: "CalendarClock",
+  update_steps: "ListChecks",
+  ask_question: "MessageCircleQuestion",
+  define_subagent: "Bot",
+  invoke_subagent: "Bot",
+  manage_subagents: "Bot",
+  run_workflow: "Workflow",
+  swarm: "Users",
+  post_message: "Send",
+  read_board: "ClipboardList",
+  swarm_wait: "Hourglass",
+  list_resources: "Server",
+  read_resource: "FileText",
+  // agy-fast MCP batch accelerator tools.
+  batch_search: "Search",
+  apply_edits: "Pencil",
+  read_slices: "Eye",
+  quick_outline: "FileCode",
+  run_checks: "SquareTerminal",
 };
 
 /**
@@ -1181,13 +1221,35 @@ export const TOOL_ICON_NAMES: readonly string[] = Object.freeze(Object.keys(TOOL
  * Read through `localeText()` on every call: the tables live in `./locale`, one
  * per language, and a locale relayed after import must apply to the next row.
  */
+const AGY_FAST_TOOLS = new Set([
+  "batch_search",
+  "apply_edits",
+  "read_slices",
+  "quick_outline",
+  "run_checks",
+]);
+
+function agyFastBareName(name: string): string | undefined {
+  const normalized = name.trim().toLowerCase();
+  if (AGY_FAST_TOOLS.has(normalized)) return normalized;
+  const match = /^(?:mcp__?(?:agy-fast_)?fast__?|(?:agy-fast_)?fast\.)([a-z0-9_]+)$/.exec(normalized);
+  if (match && AGY_FAST_TOOLS.has(match[1]!)) return match[1]!;
+  return undefined;
+}
+
+/** Localized label for an `agy-fast` MCP tool across dotted/underscore wire forms. */
+export function agyFastToolLabel(name: string): string | undefined {
+  const bare = agyFastBareName(name);
+  return bare === undefined ? undefined : localeText().toolLabels[bare];
+}
+
 export function toolLabel(name: string, detail?: ToolDetail): string {
   const gateway = gatewayPaseoTool(name, detail);
   if (gateway !== undefined) {
     const label = paseoMcpLabel(gateway);
     if (label !== undefined) return label;
   }
-  return localeText().toolLabels[name] ?? paseoMcpLabel(name) ?? name;
+  return localeText().toolLabels[name] ?? paseoMcpLabel(name) ?? agyFastToolLabel(name) ?? name;
 }
 
 /**
@@ -1235,6 +1297,8 @@ const PLAIN_ICONS: Record<string, string> = {
 const WEB_ROW_ICONS: Record<string, string> = {
   web_search: "Globe",
   web_fetch: "Eye",
+  search_web: "Globe",
+  read_url_content: "Eye",
 };
 
 /**
@@ -1265,8 +1329,10 @@ export function toolIcon(name: string, detail: ToolDetail | undefined): string {
   // carries a better icon than the tool's name would suggest. A gateway
   // meta-call borrows the proxied Paseo tool's icon when its input names one.
   const gateway = gatewayPaseoTool(name, detail);
+  const agyFastBare = agyFastBareName(normalized);
   const named = (gateway === undefined ? undefined : paseoMcpIcon(gateway))
     ?? TOOL_NAME_ICONS[normalized]
+    ?? (agyFastBare === undefined ? undefined : TOOL_NAME_ICONS[agyFastBare])
     ?? paseoMcpIcon(name);
   // A `plain_text` row that names no protocol icon key is the second gap the name
   // map fills: the two goal timeline rows (`server/activity-timeline.ts`) are
@@ -2877,6 +2943,10 @@ function paseoMcpName(name: string): string | undefined {
     const [first] = normalized.split(".");
     if (first !== "paseo" && !first.startsWith("paseo_")) return undefined;
     return normalized.split(".").slice(1).join(".");
+  }
+  if (normalized.startsWith("mcp_paseo_")) {
+    const rest = normalized.slice("mcp_paseo_".length);
+    return rest.length > 0 ? rest : undefined;
   }
   return undefined;
 }

@@ -1,12 +1,14 @@
 import type {
   PluginButton,
+  PluginButtonContentProps,
+  PluginButtonIconProps,
   PluginButtonMenuEntry,
   PluginButtonRegistration,
   PluginClientContext,
   PluginText,
 } from "@getpaseo/plugin/client";
 import { useToast, type ToastApi } from "@getpaseo/plugin/client/ui";
-import { useEffect } from "react";
+import { createElement, useEffect, type ComponentType } from "react";
 import {
   SYSTEM_ACCOUNT_ID,
   accountIdFromMetadata,
@@ -23,8 +25,10 @@ import {
   type ModelFamily,
   type OrchestratorState,
 } from "../../shared/antigravity/contracts";
+import { CornerRingIcon } from "../corner-ring";
+import { subscribeLocale } from "../locale";
 import { displayLabel } from "./labels";
-import { errorMessage, messages } from "./messages";
+import { errorMessage, translateAntigravity } from "./messages";
 import { resolvePresets, shortModelLabel } from "./orchestrator";
 
 type AgentRow = {
@@ -53,6 +57,61 @@ export interface ObserveAgentsNavigation {
 }
 
 type OpenSubagents = (agentId: string, workspaceId: string | null | undefined, subagentId?: string) => void;
+type MakeSubagentPopover = (
+  agentId: string,
+  workspaceId: string | null | undefined,
+) => ComponentType<PluginButtonContentProps>;
+
+type SubagentPillIconState = "running" | "failed" | "idle";
+type SubagentCount = { total: number; running: number; failed: number };
+
+interface SubagentPillEntry {
+  readonly registration: PluginButtonRegistration<PluginText>;
+  iconState: SubagentPillIconState;
+  label: string;
+  title: string;
+}
+
+/**
+ * Stable module-level icon components, one per pill state, matching `team-pill.tsx`
+ * so `pill.update()` swaps a stable component identity and never restarts the
+ * corner ring animation unnecessarily.
+ */
+function SubagentRunningIcon({ size, theme }: PluginButtonIconProps) {
+  return createElement(CornerRingIcon, {
+    name: "Bot",
+    size,
+    color: theme.colors.foregroundMuted,
+    running: true,
+    theme,
+  });
+}
+
+function SubagentFailedIcon({ size, theme }: PluginButtonIconProps) {
+  return createElement(CornerRingIcon, {
+    name: "Bot",
+    size,
+    color: theme.colors.statusDanger,
+    running: false,
+    theme,
+  });
+}
+
+function SubagentIdleIcon({ size, theme }: PluginButtonIconProps) {
+  return createElement(CornerRingIcon, {
+    name: "Bot",
+    size,
+    color: theme.colors.foregroundMuted,
+    running: false,
+    theme,
+  });
+}
+
+const SUBAGENT_PILL_ICONS: Record<SubagentPillIconState, ComponentType<PluginButtonIconProps>> = {
+  running: SubagentRunningIcon,
+  failed: SubagentFailedIcon,
+  idle: SubagentIdleIcon,
+};
 
 /** An empty icon that keeps menu labels aligned with the checked one. */
 const BLANK_ICON = {
@@ -78,14 +137,15 @@ function chunk<T>(items: readonly T[], size: number): T[][] {
 export function observeAgents(
   client: PluginClientContext,
   openSubagents: OpenSubagents,
+  makeSubagentPopover?: MakeSubagentPopover,
   navigation?: ObserveAgentsNavigation,
 ) {
   const lifetime = new AbortController();
   const agents = new Map<string, ObservedAgent>();
   const accountPills = new Map<string, PluginButtonRegistration<PluginText>>();
-  const subagentPills = new Map<string, PluginButtonRegistration<PluginText>>();
+  const subagentPills = new Map<string, SubagentPillEntry>();
   const orchestratorPills = new Map<string, PluginButtonRegistration<PluginText>>();
-  const subagentCounts = new Map<string, { total: number; running: number }>();
+  const subagentCounts = new Map<string, SubagentCount>();
   const lastPolledAt = new Map<string, number>();
   let orchestrator: OrchestratorState | undefined;
   const listeners = new Set<() => void>();
@@ -129,7 +189,7 @@ export function observeAgents(
   }
 
   const nameOf = (label: string, kind?: AccountSummary["kind"]) =>
-    displayLabel(label, (key) => client.i18n.t(messages, key), kind);
+    displayLabel(label, (key) => translateAntigravity(key), kind);
 
   function emit() {
     listeners.forEach((listener) => listener());
@@ -153,8 +213,12 @@ export function observeAgents(
   }
 
   async function switchTo(agentId: string, account: AccountSummary, when: "now" | "after-turn") {
-    const result = await client.rpc(switchAgentAccountRpc, { agentId, accountId: account.id, when });
-    notify(client.i18n.t(messages, result.result, { label: nameOf(result.accountLabel, account.kind) }));
+    try {
+      const result = await client.rpc(switchAgentAccountRpc, { agentId, accountId: account.id, when });
+      notify(translateAntigravity(result.result, { label: nameOf(result.accountLabel, account.kind) }));
+    } catch (error) {
+      notify(errorMessage(error));
+    }
   }
 
   // ---- Account pill -------------------------------------------------------------------------
@@ -186,8 +250,8 @@ export function observeAgents(
           ? {
               kind: "menu",
               items: [
-                { kind: "item", id: "now", title: messages.message("now"), icon: "Zap", behavior: action("now") },
-                { kind: "item", id: "after", title: messages.message("after"), icon: "Clock", behavior: action("after-turn") },
+                { kind: "item", id: "now", title: translateAntigravity("now"), icon: "Zap", behavior: action("now") },
+                { kind: "item", id: "after", title: translateAntigravity("after"), icon: "Clock", behavior: action("after-turn") },
               ],
             }
           : action("now"),
@@ -197,13 +261,13 @@ export function observeAgents(
     choices.push({
       kind: "item",
       id: "manage",
-      title: messages.message("manage"),
+      title: translateAntigravity("manage"),
       icon: "Settings2",
       behavior: { kind: "action", onPress: openAntigravityConsole },
     });
     const button: PluginButton<PluginText> = {
       icon: healthy ? "UserRound" : "UserX",
-      title: healthy ? messages.message("pill") : messages.message("pillSignedOut"),
+      title: healthy ? translateAntigravity("pill") : translateAntigravity("pillSignedOut"),
       label: current ? nameOf(current.label, current.kind) : agent.account,
       behavior: { kind: "menu", items: choices },
     };
@@ -222,33 +286,44 @@ export function observeAgents(
   function renderSubagentPill(agent: ObservedAgent) {
     const count = subagentCounts.get(agent.id);
     if (!agent.workspace || !count?.total) {
-      subagentPills.get(agent.id)?.remove();
+      subagentPills.get(agent.id)?.registration.remove();
       subagentPills.delete(agent.id);
       return;
     }
-    const label = count.running
-      ? messages.message("subagents.pillLabel", { running: count.running, total: count.total })
-      : messages.message("subagents.pillLabelIdle", { total: count.total });
-    const pill = subagentPills.get(agent.id);
-    if (pill) {
-      pill.update({ label });
+    const iconState: SubagentPillIconState =
+      count.running > 0 ? "running" : count.failed > 0 ? "failed" : "idle";
+    const label = translateAntigravity("subagents.pill");
+    const title = label;
+    const entry = subagentPills.get(agent.id);
+    if (entry) {
+      if (entry.iconState === iconState && entry.label === label && entry.title === title) {
+        return;
+      }
+      entry.registration.update({
+        icon: SUBAGENT_PILL_ICONS[iconState],
+        label,
+        title,
+      });
+      entry.iconState = iconState;
+      entry.label = label;
+      entry.title = title;
       return;
     }
     const workspace = agent.workspace;
-    subagentPills.set(
-      agent.id,
-      client.addComposerPill({
-        id: "subagents",
-        agentId: agent.id,
-        workspaceId: workspace,
-        button: {
-          icon: "Bot",
-          title: messages.message("subagents.pill"),
-          label,
-          behavior: { kind: "action", onPress: () => openSubagents(agent.id, workspace) },
-        },
-      }),
-    );
+    const registration = client.addComposerPill({
+      id: "subagents",
+      agentId: agent.id,
+      workspaceId: workspace,
+      button: {
+        icon: SUBAGENT_PILL_ICONS[iconState],
+        title,
+        label,
+        behavior: makeSubagentPopover
+          ? { kind: "popover", Content: makeSubagentPopover(agent.id, workspace) }
+          : { kind: "action", onPress: () => openSubagents(agent.id, workspace) },
+      },
+    });
+    subagentPills.set(agent.id, { registration, iconState, label, title });
   }
 
   // ---- Orchestrator pill --------------------------------------------------------------------
@@ -276,7 +351,7 @@ export function observeAgents(
       const { state, applied } = await client.rpc(setOrchestratorRpc, { ...patch, applyTo: agent.id });
       orchestrator = state;
       agents.forEach(renderOrchestratorPill);
-      notify(client.i18n.t(messages, `orchestrator.applied.${applied}`));
+      notify(translateAntigravity(`orchestrator.applied.${applied}`));
     } catch (error) {
       notify(errorMessage(error));
     }
@@ -330,7 +405,7 @@ export function observeAgents(
     entries.push({
       kind: "item",
       id: `${role}-default`,
-      title: messages.message("orchestrator.default"),
+      title: translateAntigravity("orchestrator.default"),
       icon: saved ? BLANK_ICON : "Check",
       behavior: { kind: "action", onPress: () => chooseOrchestrator(agent, { ...scope, [role]: null }) },
     });
@@ -352,23 +427,23 @@ export function observeAgents(
     } else if (effectivePlanner) {
       label = shortModelLabel(effectivePlanner);
     } else if (effectiveExecutor) {
-      label = `${client.i18n.t(messages, "orchestrator.pillDefault")} / ${shortModelLabel(effectiveExecutor)}`;
+      label = `${translateAntigravity("orchestrator.pillDefault")} / ${shortModelLabel(effectiveExecutor)}`;
     } else {
-      label = messages.message("orchestrator.pillDefault");
+      label = translateAntigravity("orchestrator.pillDefault");
     }
 
     const menuItems: PluginButtonMenuEntry<PluginText>[] = [
       {
         kind: "item",
         id: "planner",
-        title: messages.message("orchestrator.planner"),
+        title: translateAntigravity("orchestrator.planner"),
         icon: "Sparkles",
         behavior: { kind: "menu", items: roleMenu(agent, "planner", state.planners, savedPlanner, overrideAccountId) },
       },
       {
         kind: "item",
         id: "executor",
-        title: messages.message("orchestrator.executor"),
+        title: translateAntigravity("orchestrator.executor"),
         icon: "Cpu",
         behavior: { kind: "menu", items: roleMenu(agent, "executor", state.executors, savedExecutor, overrideAccountId) },
       },
@@ -376,7 +451,7 @@ export function observeAgents(
       {
         kind: "item",
         id: "manage",
-        title: messages.message("orchestrator.manage"),
+        title: translateAntigravity("orchestrator.manage"),
         icon: "Settings2",
         behavior: { kind: "action", onPress: openAntigravityConsole },
       },
@@ -384,7 +459,7 @@ export function observeAgents(
 
     const button: PluginButton<PluginText> = {
       icon: "Workflow",
-      title: isOverride ? messages.message("orchestrator.pillOverride") : messages.message("orchestrator.pillTitle"),
+      title: isOverride ? translateAntigravity("orchestrator.pillOverride") : translateAntigravity("orchestrator.pillTitle"),
       label,
       behavior: { kind: "menu", items: menuItems },
     };
@@ -430,8 +505,15 @@ export function observeAgents(
         for (const id of batch) {
           lastPolledAt.set(id, Date.now());
           const found = subagentRes.counts[id];
-          if (found) subagentCounts.set(id, found);
-          else subagentCounts.delete(id);
+          if (found) {
+            subagentCounts.set(id, {
+              total: found.total,
+              running: found.running,
+              failed: (found as { failed?: number }).failed ?? 0,
+            });
+          } else {
+            subagentCounts.delete(id);
+          }
           const agent = agents.get(id);
           if (agent) {
             renderSubagentPill(agent);
@@ -512,7 +594,7 @@ export function observeAgents(
   function remove(id: string) {
     accountPills.get(id)?.remove();
     accountPills.delete(id);
-    subagentPills.get(id)?.remove();
+    subagentPills.get(id)?.registration.remove();
     subagentPills.delete(id);
     orchestratorPills.get(id)?.remove();
     orchestratorPills.delete(id);
@@ -585,118 +667,150 @@ export function observeAgents(
 
   // ---- /account & /orchestrator -------------------------------------------------------------
 
-  const slashAccount = client.addSlashCommand({
-    name: "account",
-    context: "agent",
-    description: messages.message("slash"),
-    argumentHint: messages.message("hint"),
-    async onSubmit({ agent, args }) {
-      if (!isAntigravityProvider(agent.provider)) return notify(client.i18n.t(messages, "only"));
-      const state = await client.rpc(listAccountsRpc, {});
-      applyAccounts(state);
-      const list = state.accounts;
-      const current = accountIdFromMetadata(agent.metadata);
-      const input = args.trim().toLowerCase();
-      if (!input) {
-        const curAccount = list.find((account) => account.id === current);
-        return notify(
-          client.i18n.t(messages, "choices", {
-            label: curAccount ? nameOf(curAccount.label, curAccount.kind) : current,
-            list: list.map((account, index) => `${index + 1}. ${nameOf(account.label, account.kind)}`).join("\n"),
-          }),
-        );
-      }
-      const named = (account: AccountSummary) => nameOf(account.label, account.kind).toLowerCase();
-      let matches = list.filter((account) => named(account) === input || account.label.toLowerCase() === input);
-      if (/^\d+$/.test(input)) matches = list.slice(Number(input) - 1, Number(input));
-      else if (!matches.length) matches = list.filter((account) => named(account).startsWith(input));
-      if (matches.length !== 1) return notify(client.i18n.t(messages, matches.length ? "ambiguous" : "noMatch"));
-      const target = matches[0]!;
-      if (!target.usable || target.status === "signed-out") {
-        return notify(target.statusDetail || client.i18n.t(messages, "unusable"));
-      }
-      const busy = agent.status === "running" || agent.status === "initializing";
-      await switchTo(agent.id, target, busy ? "after-turn" : "now");
-    },
-  });
+  const registerSlashAccount = () =>
+    client.addSlashCommand({
+      name: "account",
+      context: "agent",
+      description: translateAntigravity("slash"),
+      argumentHint: translateAntigravity("hint"),
+      async onSubmit({ agent, args }) {
+        if (!isAntigravityProvider(agent.provider)) return notify(translateAntigravity("only"));
+        try {
+          const state = await client.rpc(listAccountsRpc, {});
+          applyAccounts(state);
+          const list = state.accounts;
+          const current = accountIdFromMetadata(agent.metadata);
+          const input = args.trim().toLowerCase();
+          if (!input) {
+            const curAccount = list.find((account) => account.id === current);
+            return notify(
+              translateAntigravity("choices", {
+                label: curAccount ? nameOf(curAccount.label, curAccount.kind) : current,
+                list: list.map((account, index) => `${index + 1}. ${nameOf(account.label, account.kind)}`).join("\n"),
+              }),
+            );
+          }
+          const named = (account: AccountSummary) => nameOf(account.label, account.kind).toLowerCase();
+          let matches = list.filter((account) => named(account) === input || account.label.toLowerCase() === input);
+          if (/^\d+$/.test(input)) matches = list.slice(Number(input) - 1, Number(input));
+          else if (!matches.length) matches = list.filter((account) => named(account).startsWith(input));
+          if (matches.length !== 1) return notify(translateAntigravity(matches.length ? "ambiguous" : "noMatch"));
+          const target = matches[0]!;
+          if (!target.usable || target.status === "signed-out") {
+            return notify(target.statusDetail || translateAntigravity("unusable"));
+          }
+          const busy = agent.status === "running" || agent.status === "initializing";
+          await switchTo(agent.id, target, busy ? "after-turn" : "now");
+        } catch (error) {
+          notify(errorMessage(error));
+        }
+      },
+    });
 
-  const slashOrchestrator = client.addSlashCommand({
-    name: "orchestrator",
-    context: "agent",
-    description: messages.message("orchestrator.slash"),
-    argumentHint: messages.message("orchestrator.slashHint"),
-    async onSubmit({ agent, args }) {
-      if (!isAntigravityProvider(agent.provider)) return notify(client.i18n.t(messages, "only"));
-      const state = await client.rpc(getOrchestratorRpc, {});
-      orchestrator = state;
-      const member = agents.get(agent.id) ?? {
-        id: agent.id,
-        workspace: agent.workspaceId ?? null,
-        account: accountIdFromMetadata(agent.metadata),
-        running: agent.status === "running" || agent.status === "initializing",
-        model: agent.model ?? null,
-        title: agent.title ?? null,
-      };
-      const input = args.trim();
-      if (!input) {
-        const eff = effectiveOrchestrator(member, state);
-        return notify(
-          client.i18n.t(messages, "orchestrator.slashCurrent", {
-            planner: eff.savedPlanner ?? client.i18n.t(messages, "orchestrator.default"),
-            executor: eff.savedExecutor ?? client.i18n.t(messages, "orchestrator.default"),
-          }),
-        );
-      }
-      const lower = input.toLowerCase();
-      const presets = resolvePresets(state);
-      const preset = presets.find((p) => p.id === lower);
-      if (preset) {
-        await chooseOrchestrator(member, { planner: preset.planner, executor: preset.executor });
-        return;
-      }
-      const [first, ...rest] = input.split(/\s+/);
-      const role = first?.toLowerCase() === "planner" || first?.toLowerCase() === "executor" ? (first.toLowerCase() as "planner" | "executor") : null;
-      const query = (role ? rest.join(" ") : input).trim().toLowerCase();
-      const findVariant = (families: readonly ModelFamily[]) => {
-        if (query === "default" || query === "reset") return null;
-        for (const family of families) {
-          for (const variant of family.variants) {
-            if (
-              variant.label.toLowerCase() === query ||
-              variant.id.toLowerCase() === query ||
-              shortModelLabel(variant.label).toLowerCase() === query
-            ) {
-              return variant.label;
-            }
+  const registerSlashOrchestrator = () =>
+    client.addSlashCommand({
+      name: "orchestrator",
+      context: "agent",
+      description: translateAntigravity("orchestrator.slash"),
+      argumentHint: translateAntigravity("orchestrator.slashHint"),
+      async onSubmit({ agent, args }) {
+        if (!isAntigravityProvider(agent.provider)) return notify(translateAntigravity("only"));
+        try {
+          const state = await client.rpc(getOrchestratorRpc, {});
+          orchestrator = state;
+          const member = agents.get(agent.id) ?? {
+            id: agent.id,
+            workspace: agent.workspaceId ?? null,
+            account: accountIdFromMetadata(agent.metadata),
+            running: agent.status === "running" || agent.status === "initializing",
+            model: agent.model ?? null,
+            title: agent.title ?? null,
+          };
+          const eff = effectiveOrchestrator(member, state);
+          const scope = eff.isOverride ? { accountId: member.account } : {};
+          const input = args.trim();
+          if (!input) {
+            return notify(
+              translateAntigravity("orchestrator.slashCurrent", {
+                planner: eff.savedPlanner ?? translateAntigravity("orchestrator.default"),
+                executor: eff.savedExecutor ?? translateAntigravity("orchestrator.default"),
+              }),
+            );
           }
-        }
-        for (const family of families) {
-          for (const variant of family.variants) {
-            if (variant.label.toLowerCase().includes(query) || variant.id.toLowerCase().includes(query)) {
-              return variant.label;
-            }
+          const lower = input.toLowerCase();
+          const presets = resolvePresets(state);
+          const preset = presets.find((p) => p.id === lower);
+          if (preset) {
+            await chooseOrchestrator(member, { ...scope, planner: preset.planner, executor: preset.executor });
+            return;
           }
+          const [first, ...rest] = input.split(/\s+/);
+          const role = first?.toLowerCase() === "planner" || first?.toLowerCase() === "executor" ? (first.toLowerCase() as "planner" | "executor") : null;
+          const query = (role ? rest.join(" ") : input).trim().toLowerCase();
+          const findVariant = (families: readonly ModelFamily[]) => {
+            if (!query) return undefined;
+            if (query === "default" || query === "reset") return null;
+            for (const family of families) {
+              for (const variant of family.variants) {
+                if (
+                  variant.label.toLowerCase() === query ||
+                  variant.id.toLowerCase() === query ||
+                  shortModelLabel(variant.label).toLowerCase() === query
+                ) {
+                  return variant.label;
+                }
+              }
+            }
+            for (const family of families) {
+              for (const variant of family.variants) {
+                if (variant.label.toLowerCase().includes(query) || variant.id.toLowerCase().includes(query)) {
+                  return variant.label;
+                }
+              }
+            }
+            return undefined;
+          };
+          if (role) {
+            const picked = findVariant(role === "planner" ? state.planners : state.executors);
+            if (picked === undefined) return notify(translateAntigravity("orchestrator.slashNoMatch"));
+            await chooseOrchestrator(member, { ...scope, [role]: picked });
+            return;
+          }
+          const asPlanner = findVariant(state.planners);
+          if (asPlanner !== undefined) {
+            await chooseOrchestrator(member, { ...scope, planner: asPlanner });
+            return;
+          }
+          const asExecutor = findVariant(state.executors);
+          if (asExecutor !== undefined) {
+            await chooseOrchestrator(member, { ...scope, executor: asExecutor });
+            return;
+          }
+          notify(translateAntigravity("orchestrator.slashNoMatch"));
+        } catch (error) {
+          notify(errorMessage(error));
         }
-        return undefined;
-      };
-      if (role) {
-        const picked = findVariant(role === "planner" ? state.planners : state.executors);
-        if (picked === undefined) return notify(client.i18n.t(messages, "orchestrator.slashNoMatch"));
-        await chooseOrchestrator(member, { [role]: picked });
-        return;
-      }
-      const asPlanner = findVariant(state.planners);
-      if (asPlanner !== undefined) {
-        await chooseOrchestrator(member, { planner: asPlanner });
-        return;
-      }
-      const asExecutor = findVariant(state.executors);
-      if (asExecutor !== undefined) {
-        await chooseOrchestrator(member, { executor: asExecutor });
-        return;
-      }
-      notify(client.i18n.t(messages, "orchestrator.slashNoMatch"));
-    },
+      },
+    });
+
+  let slashAccount = registerSlashAccount();
+  let slashOrchestrator = registerSlashOrchestrator();
+
+  const unsubscribeLocale = subscribeLocale(() => {
+    if (lifetime.signal.aborted) return;
+    agents.forEach((agent) => {
+      renderAccountPill(agent);
+      renderSubagentPill(agent);
+      renderOrchestratorPill(agent);
+    });
+    const prevAccount = slashAccount;
+    const prevOrchestrator = slashOrchestrator;
+    slashAccount = () => {};
+    slashOrchestrator = () => {};
+    void prevAccount();
+    void prevOrchestrator();
+    slashAccount = registerSlashAccount();
+    slashOrchestrator = registerSlashOrchestrator();
   });
 
   return {
@@ -719,6 +833,7 @@ export function observeAgents(
     },
     stop() {
       lifetime.abort();
+      unsubscribeLocale();
       clearTimeout(retry);
       clearTimeout(reconnect);
       clearTimeout(soon);
@@ -727,7 +842,7 @@ export function observeAgents(
       void slashAccount();
       void slashOrchestrator();
       accountPills.forEach((pill) => pill.remove());
-      subagentPills.forEach((pill) => pill.remove());
+      subagentPills.forEach((entry) => entry.registration.remove());
       orchestratorPills.forEach((pill) => pill.remove());
       accountPills.clear();
       subagentPills.clear();

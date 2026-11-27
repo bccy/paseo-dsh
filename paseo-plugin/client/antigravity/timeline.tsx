@@ -1,15 +1,15 @@
-import { useTranslation, type PluginTimelineItemProps } from "@getpaseo/plugin/client";
+import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/ui";
 import { Text, View } from "react-native";
 import type { FallbackEvent } from "../../shared/antigravity/contracts";
 import { displayLabel } from "./labels";
-import { messages } from "./messages";
+import { useAntigravityTranslation } from "./messages";
 import { font, space, tint } from "./theme";
 
 /** One line in the agent's timeline: a retry, an account switch, or the end of the fallback chain. */
 export function FallbackNote({ item, theme }: PluginTimelineItemProps<FallbackEvent>) {
   const { colors } = theme;
-  const { t } = useTranslation(messages);
+  const { t } = useAntigravityTranslation();
   const event = item.data;
   const from = displayLabel(event.from, t);
   const reason = t(`fallback.reason.${event.reason}`);

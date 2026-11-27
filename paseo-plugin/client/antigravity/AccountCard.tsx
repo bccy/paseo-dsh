@@ -1,11 +1,10 @@
-import { useTranslation } from "@getpaseo/plugin/client";
 import { Icon, Modal } from "@getpaseo/plugin/client/ui";
 import { Platform, Pressable, Text, View } from "react-native";
 import type { AccountSummary, QuotaBucket, QuotaGroup } from "../../shared/antigravity/contracts";
 import { percent, relative, upper } from "./format";
 import { displayLabel } from "./labels";
 import { antigravityLogoSvg } from "./logo";
-import { messages } from "./messages";
+import { useAntigravityTranslation } from "./messages";
 import { font, radius, remainingTone, space, tabular, tint, toneColor, type Colors, type Tone } from "./theme";
 import { Avatar, Badge, Bar, Button, Callout, Card, Divider, hueFor, IconButton, Muted } from "./ui";
 
@@ -60,7 +59,7 @@ function Meter({
   now: number;
   locale: string;
 }) {
-  const { t } = useTranslation(messages);
+  const { t } = useAntigravityTranslation();
   // An empty slot keeps a lone meter at half width, so groups line up across cards.
   if (!bucket) return <View style={{ flex: 1 }} />;
   const fraction = bucket.remainingFraction;
@@ -108,7 +107,7 @@ function QuotaGroupView({
   locale: string;
   compact: boolean;
 }) {
-  const { t: translate } = useTranslation(messages);
+  const { t: translate } = useAntigravityTranslation();
   const t = (key: KnownWindow) => translate(`window.${key}`);
   // Two meters per row: the usual pair is weekly and 5-hour.
   const rows: Array<[QuotaBucket, QuotaBucket | null]> = [];
@@ -231,7 +230,7 @@ export function AccountCard({
   onToggleMenu(): void;
   onAction(action: CardAction): void;
 }) {
-  const { t, locale } = useTranslation(messages);
+  const { t, locale } = useAntigravityTranslation();
   const isProfile = account.kind === "profile";
   const signedIn = account.status === "signed-in";
   const tone = statusTone(account);

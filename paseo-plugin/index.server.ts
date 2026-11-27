@@ -9,6 +9,7 @@ import { isTerminalTeamErrorCode, teamSnapshot, type TeamAnswer } from "./shared
 import { subagentLiveSnapshot } from "./shared/subagent-live";
 import { rewindNoticeArm } from "./shared/rewind-notice";
 import { languageSettings, timelineStyleSettings } from "./shared/settings";
+import { translateThinkingRpc } from "./shared/translate";
 import { registerAntigravityServer } from "./server/antigravity";
 import { dshHome, ensurePaseoProfile } from "./server/bootstrap";
 import { DiagnosticsService, registerDiagnosticsRpc } from "./server/diagnostics";
@@ -18,6 +19,7 @@ import { registerDshPluginsRpc } from "./server/dsh-plugins-rpc";
 import { createPillFeed } from "./server/pill-feed";
 import { PricingStore, registerPricingRpc } from "./server/pricing";
 import { capturePaseo } from "./server/rewind-notice-append";
+import { ThinkingTranslator } from "./server/translate";
 import { UsageStatsEngine, registerUsageStatsRpc } from "./server/usage-stats";
 import {
   controlAgentGoal,
@@ -369,6 +371,12 @@ export default function contribute(server: PluginServerContext) {
       : { ok: false, error: result.error };
   });
 
+  const thinkingTranslator = new ThinkingTranslator();
+  server.handle(translateThinkingRpc, async ({ text, target }, context) => {
+    capture(context);
+    return thinkingTranslator.translate(text, target);
+  });
+
   server.handle(rewindNoticeArm, (_input, context) => {
     capture(context);
     return {};
@@ -390,6 +398,7 @@ export default function contribute(server: PluginServerContext) {
   });
 
   return () => {
+    thinkingTranslator.dispose();
     antigravity.dispose();
     disposeUsageStats();
     disposePricing();

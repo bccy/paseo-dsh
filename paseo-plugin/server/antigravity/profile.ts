@@ -10,6 +10,7 @@ import {
   RECOVERY_DIR,
   SHARED_CLI_DIRS,
   displayPath,
+  isProfileHomePath,
   profileCliDir,
   profileHome,
   profileRoot,
@@ -53,8 +54,27 @@ async function readDirSafe(dir: string): Promise<Dirent[]> {
   }
 }
 
-/** Ensures `link` is a symlink to `target`. Leaves real files and directories alone. */
+/**
+ * Ensures `link` is a symlink to `target`. Leaves real files and directories alone.
+ * Refuses self-referential links (`link === target`) and cross-profile targets so a
+ * misconfigured `HOME` can never create an `ELOOP` symlink cycle.
+ */
 async function ensureLink(link: string, target: string): Promise<void> {
+  const resolvedLink = path.resolve(link);
+  const resolvedTarget = path.resolve(target);
+  if (resolvedLink === resolvedTarget || isProfileHomePath(resolvedTarget)) {
+    const existing = await fs.lstat(link).catch(() => null);
+    if (existing?.isSymbolicLink()) {
+      const currentTarget = await fs.readlink(link).catch(() => "");
+      if (
+        path.resolve(path.dirname(link), currentTarget) === resolvedLink ||
+        isProfileHomePath(path.resolve(path.dirname(link), currentTarget))
+      ) {
+        await fs.unlink(link).catch(() => undefined);
+      }
+    }
+    return;
+  }
   try {
     const stat = await fs.lstat(link);
     if (!stat.isSymbolicLink()) return;
@@ -83,13 +103,24 @@ async function ensureRealDir(dir: string): Promise<void> {
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
 }
 
-/** Removes symlinks in `dir` that point into `sourceDir` at entries that no longer exist. */
+/**
+ * Removes symlinks in `dir` that point into `sourceDir` at entries that no longer exist,
+ * as well as stale cross-profile or self-loop symlinks left behind by an earlier profile-HOME leak.
+ */
 async function pruneLinks(dir: string, sourceDir: string, keep: ReadonlySet<string>): Promise<void> {
   for (const entry of await readDirSafe(dir)) {
     if (!entry.isSymbolicLink() || keep.has(entry.name)) continue;
     const link = path.join(dir, entry.name);
-    const target = await fs.readlink(link).catch(() => "");
-    if (path.dirname(target) === sourceDir) await fs.unlink(link).catch(() => undefined);
+    const rawTarget = await fs.readlink(link).catch(() => "");
+    if (!rawTarget) continue;
+    const resolvedTarget = path.resolve(dir, rawTarget);
+    if (
+      path.dirname(rawTarget) === sourceDir ||
+      resolvedTarget === path.resolve(link) ||
+      isProfileHomePath(resolvedTarget)
+    ) {
+      await fs.unlink(link).catch(() => undefined);
+    }
   }
 }
 
@@ -188,8 +219,15 @@ async function syncSettings(cli: string, orchestratorOverride?: OrchestratorChoi
 }
 
 /** Creates or refreshes an account's profile and returns its HOME. Safe to call concurrently. */
-export function ensureProfile(accountId: string, orchestratorOverride?: OrchestratorChoice | null): Promise<string> {
-  return withLock(accountId, () => syncProfile(accountId, orchestratorOverride));
+export function ensureProfile(
+  accountId: string,
+  orchestratorOverride?: OrchestratorChoice | null,
+  shouldProceed?: () => boolean,
+): Promise<string> {
+  return withLock(accountId, () => {
+    if (shouldProceed && !shouldProceed()) return Promise.resolve(profileHome(accountId));
+    return syncProfile(accountId, orchestratorOverride);
+  });
 }
 
 /**
@@ -553,28 +591,38 @@ export async function scanAfterSignIn(accountId: string, since: number): Promise
 }
 
 /**
- * Deletes the sign-in files recorded for a profile (or found by name when none were recorded).
+ * Deletes the sign-in files recorded for a profile together with any credential-looking files
+ * currently present inside the profile's real `.gemini` / `antigravity-cli` directories.
  * Only files behind real folders: through a linked `.gemini` they would be the system sign-in.
  */
 export function deleteSignIn(accountId: string, recorded: readonly string[]): Promise<string[]> {
   return withLock(accountId, async () => {
     const home = profileHome(accountId);
+    const gemini = path.join(home, ".gemini");
     const cli = profileCliDir(accountId);
-    if (!(await profileEntry(accountId, cli))?.isDirectory()) return [];
+    const geminiIsRealDir = (await profileEntry(accountId, gemini))?.isDirectory() ?? false;
+    const cliIsRealDir = (await profileEntry(accountId, cli))?.isDirectory() ?? false;
+    if (!geminiIsRealDir && !cliIsRealDir) return [];
     const targets = new Set<string>();
     for (const relative of recorded) {
       const full = path.resolve(home, relative);
-      if (full.startsWith(cli + path.sep)) targets.add(full);
+      if (full.startsWith(gemini + path.sep)) targets.add(full);
     }
-    if (targets.size === 0) {
-      for (const file of await scanCredentialFiles(cli, { since: 0, maxDepth: 2 })) targets.add(file);
+    if (geminiIsRealDir) {
+      for (const file of await scanCredentialFiles(gemini, { since: 0, maxDepth: 4 })) targets.add(file);
+    } else if (cliIsRealDir) {
+      for (const file of await scanCredentialFiles(cli, { since: 0, maxDepth: 4 })) targets.add(file);
     }
     const removed: string[] = [];
     for (const file of targets) {
-      // lstat: a link is not a file here.
+      // lstat every path segment from profileRoot: a link or anything behind a linked dir is skipped.
       if (!(await profileEntry(accountId, file))?.isFile()) continue;
-      await fs.unlink(file);
-      removed.push(path.relative(home, file));
+      try {
+        await fs.unlink(file);
+        removed.push(path.relative(home, file));
+      } catch (error) {
+        if (errorCode(error) !== "ENOENT") throw error;
+      }
     }
     return removed;
   });

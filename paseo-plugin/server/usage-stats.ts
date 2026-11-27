@@ -1280,7 +1280,18 @@ export class UsageStatsEngine {
 
     const [, agRecords, accountLabels, pricerSnapshot] = await Promise.all([
       includeDsh ? this.prepareSnapshot(options) : Promise.resolve(),
-      includeAntigravity ? this.loadAntigravityRecords() : Promise.resolve([] as readonly AntigravityUsageRecord[]),
+      includeAntigravity
+        ? effectiveSource === "all"
+          ? this.loadAntigravityRecords().catch((error: unknown) => {
+              console.warn(
+                `dsh-paseo: failed to load Antigravity usage records for unified stats: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+              return [] as readonly AntigravityUsageRecord[];
+            })
+          : this.loadAntigravityRecords()
+        : Promise.resolve([] as readonly AntigravityUsageRecord[]),
       includeAntigravity ? this.loadAntigravityAccountLabels() : Promise.resolve({} as Readonly<Record<string, string>>),
       resolvePricer(this.pricer),
     ]);
@@ -1583,7 +1594,18 @@ export class UsageStatsEngine {
 
     const [, agRecords, pricerSnapshot] = await Promise.all([
       includeDsh ? this.prepareSnapshot(options) : Promise.resolve(),
-      includeAntigravity ? this.loadAntigravityRecords() : Promise.resolve([] as readonly AntigravityUsageRecord[]),
+      includeAntigravity
+        ? effectiveSource === "all"
+          ? this.loadAntigravityRecords().catch((error: unknown) => {
+              console.warn(
+                `dsh-paseo: failed to load Antigravity usage records for unified daily rollup: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+              return [] as readonly AntigravityUsageRecord[];
+            })
+          : this.loadAntigravityRecords()
+        : Promise.resolve([] as readonly AntigravityUsageRecord[]),
       resolvePricer(this.pricer),
     ]);
 
@@ -1641,7 +1663,7 @@ export class UsageStatsEngine {
 
     if (includeAntigravity) {
       for (const record of agRecords) {
-        if (record.at < firstStart || record.at > lastEnd) continue;
+        if (!Number.isFinite(record.at) || record.at < firstStart || record.at > lastEnd) continue;
         if (record.isSubagent) hasSubagents = true;
         if (filterProvider && filterProvider !== ANTIGRAVITY_PROVIDER) continue;
         if (filterAccount && record.accountId !== filterAccount) continue;

@@ -1,8 +1,7 @@
-import {
-  useTranslation,
-  type PluginClientContext,
-  type PluginSidebarItemProps,
-  type PluginWorkspaceRowBadgeItemProps,
+import type {
+  PluginClientContext,
+  PluginSidebarItemProps,
+  PluginWorkspaceRowBadgeItemProps,
 } from "@getpaseo/plugin/client";
 import { WorkspaceRowBadge } from "@getpaseo/plugin/client/ui";
 import { createElement, useSyncExternalStore, type ComponentType } from "react";
@@ -17,13 +16,14 @@ import {
   subagentCardSchema,
   subagentCheckSchema,
 } from "../../shared/antigravity/contracts";
+import { subscribeLocale } from "../locale";
 import { AntigravityTabContent, type AntigravityTabProps } from "./AntigravityTab";
 import { observeAgents, type AgentObservation } from "./agents";
 import { ComposerAccount } from "./composer";
-import { errorMessage, messages } from "./messages";
+import { errorMessage, translateAntigravity, useAntigravityTranslation } from "./messages";
 import { AskQuestionRow } from "./questions";
 import { QuotaSidebarItem } from "./sidebar";
-import { SUBAGENT_PANEL_ID, createSubagentViews } from "./subagents";
+import { SUBAGENT_PANEL_ID, SUBAGENT_SCREEN_ID, createSubagentViews } from "./subagents";
 import { FallbackNote } from "./timeline";
 import {
   createAntigravityTimelineTransforms,
@@ -40,7 +40,7 @@ export type {
 export { AntigravityTabContent } from "./AntigravityTab";
 export { antigravityLogo, antigravityLogoSvg, antigravityMark } from "./logo";
 export { QuotaSidebarItem, type QuotaSidebarItemOptions, type QuotaSidebarItemProps } from "./sidebar";
-export { SUBAGENT_PANEL_ID } from "./subagents";
+export { SUBAGENT_PANEL_ID, SUBAGENT_SCREEN_ID } from "./subagents";
 export { createAntigravityTimelineTransforms } from "./transform";
 
 export interface ContributeAntigravityClientOptions {
@@ -104,8 +104,41 @@ export function contributeAntigravityClient(
     visibilityListeners.forEach((listener) => listener());
   }
 
+  const translate = (key: string): string =>
+    typeof translateAntigravity === "function" ? translateAntigravity(key) : key;
+
+  function registerLiveTitle(
+    label: string,
+    titleOf: () => string,
+    register: (title: string) => () => void,
+  ): () => void {
+    let currentTitle = titleOf();
+    let remove = register(currentTitle);
+    let disposed = false;
+    const unsubscribe = subscribeLocale(() => {
+      if (disposed) return;
+      const nextTitle = titleOf();
+      if (nextTitle === currentTitle) return;
+      currentTitle = nextTitle;
+      try {
+        const prevRemove = remove;
+        remove = () => {};
+        prevRemove();
+        remove = register(nextTitle);
+      } catch (error) {
+        console.warn(`[dsh-paseo:antigravity] ${label} failed`, error);
+      }
+    });
+    return () => {
+      if (disposed) return;
+      disposed = true;
+      unsubscribe();
+      remove();
+    };
+  }
+
   const subagents = createSubagentViews(client);
-  const observation = observeAgents(client, subagents.open, {
+  const observation = observeAgents(client, subagents.open, subagents.makePopover, {
     consoleScreenId: opts.consoleScreenId,
     onOpenAntigravityTab: onOpenAntigravity,
   });
@@ -133,43 +166,59 @@ export function contributeAntigravityClient(
   }
 
   function SubagentsWorkspaceBadge({ workspaceId }: PluginWorkspaceRowBadgeItemProps) {
-    const { t } = useTranslation(messages);
+    const { t } = useAntigravityTranslation();
     const byWorkspace = useSyncExternalStore(observation.subscribe, observation.workspaceRunningSubagents);
     const running = byWorkspace.get(workspaceId) ?? 0;
     if (!running) return null;
     return createElement(WorkspaceRowBadge, {
       icon: "Bot",
       tone: "info",
-      label: t("subagents.workspaceBadge", { count: running }),
+      label: t("subagents.workspaceBadge"),
+      accessibilityLabel: t("subagents.workspaceBadgeA11y", { count: running }),
     });
   }
 
   const cleanups = [
-    client.addSidebarFooterItem({
-      id: "antigravity-quota",
-      title: messages.message("title"),
-      Component: Sidebar,
-    }),
-    client.addWorkspaceRowBadgeItem({
-      id: "running-subagents",
-      title: messages.message("subagents.title"),
-      icon: "Bot",
-      Component: SubagentsWorkspaceBadge,
-    }),
-    client.addCommandCenterItem({
-      id: "refresh-quotas",
-      title: messages.message("commandRefresh"),
-      icon: "RefreshCw",
-      context: "global",
-      onSelect: async ({ rpc }) => {
-        try {
-          await rpc(refreshAccountsRpc, {});
-          observation.notify(client.i18n.t(messages, "commandRefreshed"));
-        } catch (error) {
-          observation.notify(errorMessage(error));
-        }
-      },
-    }),
+    registerLiveTitle(
+      "antigravity quota sidebar title refresh",
+      () => translate("title"),
+      (title) =>
+        client.addSidebarFooterItem({
+          id: "antigravity-quota",
+          title,
+          Component: Sidebar,
+        }),
+    ),
+    registerLiveTitle(
+      "antigravity subagents badge title refresh",
+      () => translate("subagents.title"),
+      (title) =>
+        client.addWorkspaceRowBadgeItem({
+          id: "running-subagents",
+          title,
+          icon: "Bot",
+          Component: SubagentsWorkspaceBadge,
+        }),
+    ),
+    registerLiveTitle(
+      "antigravity refresh quotas command title refresh",
+      () => translate("commandRefresh"),
+      (title) =>
+        client.addCommandCenterItem({
+          id: "refresh-quotas",
+          title,
+          icon: "RefreshCw",
+          context: "global",
+          onSelect: async ({ rpc }) => {
+            try {
+              await rpc(refreshAccountsRpc, {});
+              observation.notify(translate("commandRefreshed"));
+            } catch (error) {
+              observation.notify(errorMessage(error));
+            }
+          },
+        }),
+    ),
     client.addComposerItem({ id: "account", Component: Composer }),
     client.addTimelineRenderer({
       kind: FALLBACK_TIMELINE_KIND,
@@ -196,12 +245,16 @@ export function contributeAntigravityClient(
       Component: AskQuestionRow,
     }),
     transforms.registerEchoTransform(client),
-    client.addAgentPanel({
-      id: SUBAGENT_PANEL_ID,
-      title: messages.message("subagents.title"),
-      icon: "Bot",
-      Component: subagents.SubagentsPanel,
-    }),
+    registerLiveTitle(
+      "antigravity subagents screen title refresh",
+      () => translate("subagents.title"),
+      (title) =>
+        client.addScreen({
+          id: SUBAGENT_SCREEN_ID,
+          title,
+          Component: subagents.SubagentsScreen,
+        }),
+    ),
   ];
 
   function dispose() {

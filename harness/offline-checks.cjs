@@ -45,20 +45,16 @@ const compiledChecks = [
 // `require("../server/…")` and `node_modules` resolve. Each file builds the
 // plugin (or transpiles the TS sources) itself and points `DSH_HOME` at a
 // throwaway directory, so they stay inside the same portable-CI boundary.
-const pluginTests = [
-  'test/runtime-activity.test.cjs',
-  'test/question-answer.test.cjs',
-  'test/process.test.cjs',
-  'test/dsh-plugins.test.cjs',
-  'test/diagnostics.test.cjs',
-  'test/pricing.test.cjs',
-  'test/usage-stats.test.cjs',
-  'test/subagent-card.test.cjs',
-  'test/paseo-0171.test.cjs',
-  'test/paseo-0173.test.cjs',
-  'test/timeline-spacing.test.cjs',
-  'test/antigravity.test.cjs',
-];
+// Auto-discover every `test/*.test.cjs` sorted by name so new tests are never
+// silently skipped by the offline CI gate.
+const pluginTests = fs
+  .readdirSync(path.join(PLUGIN_DIR, 'test'))
+  .filter((name) => name.endsWith('.test.cjs'))
+  .sort()
+  .map((name) => `test/${name}`);
+if (pluginTests.length === 0) {
+  throw new Error(`no *.test.cjs files found under ${path.join(PLUGIN_DIR, 'test')}`);
+}
 const inventory = [
   'typecheck', 'bridge syntax', ...sourceChecks, ...compiledChecks,
   ...pluginTests.map((name) => `paseo-plugin/${name}`),

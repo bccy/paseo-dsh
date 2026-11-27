@@ -1,5 +1,5 @@
 import type { RpcOutput } from "@getpaseo/plugin";
-import { openExternalUrl, useRpc, useTranslation } from "@getpaseo/plugin/client";
+import { openExternalUrl, useRpc } from "@getpaseo/plugin/client";
 import { copyText, Modal, TextInput, useToast } from "@getpaseo/plugin/client/ui";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ActivityIndicator, Text, View } from "react-native";
@@ -12,7 +12,7 @@ import {
 } from "../../shared/antigravity/contracts";
 import { relative } from "./format";
 import { displayLabel } from "./labels";
-import { errorMessage, messages } from "./messages";
+import { errorMessage, useAntigravityTranslation } from "./messages";
 import { font, mono, radius, space, tint, type Colors } from "./theme";
 import { Button, Callout, Muted } from "./ui";
 
@@ -77,7 +77,7 @@ export function SignIn({
   const submit = useRpc(submitSignInRpc);
   const cancel = useRpc(cancelSignInRpc);
   const toast = useToast();
-  const { t, locale } = useTranslation(messages);
+  const { t, locale } = useAntigravityTranslation();
   const [session, setSession] = useState<Session | null>(null);
   const [sessionAlive, setSessionAlive] = useState(false);
   const [code, setCode] = useState("");

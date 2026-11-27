@@ -1,4 +1,4 @@
-import { useRpc, useTranslation } from "@getpaseo/plugin/client";
+import { useRpc } from "@getpaseo/plugin/client";
 import { Icon, Modal, SettingsSelect, TextInput, useToast } from "@getpaseo/plugin/client/ui";
 import { useEffect, useState } from "react";
 import { Pressable, Text, View } from "react-native";
@@ -12,7 +12,7 @@ import {
 } from "../../shared/antigravity/contracts";
 import type { ObservedAgent } from "./agents";
 import { displayLabel } from "./labels";
-import { errorMessage, messages } from "./messages";
+import { errorMessage, useAntigravityTranslation } from "./messages";
 import { font, mono, radius, space, tint, type Colors } from "./theme";
 import { Badge, Button, Callout, Divider, Muted } from "./ui";
 
@@ -33,7 +33,7 @@ export function NameDialog({
   onSubmit(name: string): Promise<void>;
   onClose(): void;
 }) {
-  const { t } = useTranslation(messages);
+  const { t } = useAntigravityTranslation();
   const [name, setName] = useState(initial);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -93,7 +93,7 @@ export function NameDialog({
 const SHOWN_FILES = 6;
 
 function SavedList({ colors, items }: { colors: Colors; items: string[] }) {
-  const { t } = useTranslation(messages);
+  const { t } = useAntigravityTranslation();
   // "and 1 more" takes the same line the last name would.
   const shown = items.length > SHOWN_FILES + 1 ? items.slice(0, SHOWN_FILES) : items;
   const rest = items.length - shown.length;
@@ -122,7 +122,7 @@ export function ConfirmRemove({
   onConfirm(): Promise<void>;
   onClose(): void;
 }) {
-  const { t } = useTranslation(messages);
+  const { t } = useAntigravityTranslation();
   const listSaved = useRpc(savedFilesRpc);
   // null while checking; "unknown" when the check failed (removal still moves the files).
   const [saved, setSaved] = useState<SavedFiles | "unknown" | null>(null);
@@ -197,7 +197,7 @@ export function RecoverFilesDialog({
   account: AccountSummary;
   onClose(): void;
 }) {
-  const { t } = useTranslation(messages);
+  const { t } = useAntigravityTranslation();
   const toast = useToast();
   const listSaved = useRpc(savedFilesRpc);
   const recover = useRpc(recoverSavedFilesRpc);
@@ -308,7 +308,7 @@ export function AccountAgentsDialog({
   onOpenAgent?: (agentId: string) => void;
   onClose(): void;
 }) {
-  const { t } = useTranslation(messages);
+  const { t } = useAntigravityTranslation();
   const toast = useToast();
   const migrate = useRpc(migrateAccountAgentsRpc);
   const label = displayLabel(account.label, t, account.kind);

@@ -4,8 +4,41 @@ import os from "node:os";
 import path from "node:path";
 import { RECOVERY_FOLDER_NAME } from "../../shared/antigravity/contracts";
 
+const PROFILE_HOME_RE = /[\\/]plugin-data[\\/][^\\/]+(?:[\\/]antigravity)?[\\/]profiles[\\/]a[0-9a-f]{8}[\\/]home(?:[\\/].*)?$/i;
+
+/** True when `candidate` points at or inside a plugin-managed Antigravity profile HOME. */
+export function isProfileHomePath(candidate: string): boolean {
+  if (!candidate) return false;
+  return PROFILE_HOME_RE.test(path.resolve(candidate));
+}
+
+/**
+ * Resolves the daemon user's real home directory even when the current process inherited
+ * `HOME=<paseo>/plugin-data/.../profiles/<id>/home` from a profile-isolated Antigravity agent.
+ * Treating a profile HOME as `REAL_HOME` would mirror a profile into itself or across profiles
+ * and produce `ELOOP: too many levels of symbolic links`.
+ */
+export function resolveRealHome(envHome: string = os.homedir(), passwdHome?: string): string {
+  const candidate = envHome ? path.resolve(envHome) : "";
+  if (candidate && !isProfileHomePath(candidate)) return candidate;
+  let fallback = passwdHome;
+  if (fallback === undefined) {
+    try {
+      fallback = os.userInfo().homedir;
+    } catch {
+      fallback = "";
+    }
+  }
+  const resolvedFallback = fallback ? path.resolve(fallback) : "";
+  if (resolvedFallback && !isProfileHomePath(resolvedFallback)) return resolvedFallback;
+  const marker = `${path.sep}.paseo${path.sep}`;
+  const markerIdx = candidate.indexOf(marker);
+  if (markerIdx > 0) return candidate.slice(0, markerIdx);
+  return candidate || os.homedir();
+}
+
 /** The daemon user's real home. agy keeps the system sign-in's data in `<home>/.gemini`. */
-export const REAL_HOME = os.homedir();
+export const REAL_HOME = resolveRealHome();
 export const REAL_GEMINI = path.join(REAL_HOME, ".gemini");
 /** agy's default app-data directory (`--app-data-dir antigravity-cli`). */
 export const REAL_CLI_DIR = path.join(REAL_GEMINI, "antigravity-cli");
@@ -360,11 +393,10 @@ export function migrateLegacyDataDir(options?: MigrateOptions): Promise<MigrateR
   if (existing) return existing;
 
   const task = (async (): Promise<MigrateResult> => {
-    const [hasTargetAccounts, hasTargetProfiles] = await Promise.all([
-      pathExists(path.join(targetDir, "accounts.json")),
-      pathExists(path.join(targetDir, "profiles")),
-    ]);
-    if (hasTargetAccounts || hasTargetProfiles) {
+    // Only skip the whole migration when `accounts.json` (copied last) already exists in targetDir.
+    // Checking `profiles` here would permanently strand a half-finished migration that failed after
+    // copying `profiles` but before copying `accounts.json` and the remaining JSON files.
+    if (await pathExists(path.join(targetDir, "accounts.json"))) {
       return { migrated: false, copiedEntries: [] };
     }
 

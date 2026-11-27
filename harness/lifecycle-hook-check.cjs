@@ -20,8 +20,11 @@ const capture = reports.capturePaseo;
 const origOpenGate = agPaths.shouldRegisterAntigravityOpenHookSync;
 const origDetectPresence = agPaths.detectAntigravityPresence;
 const prevPaseoHome = process.env.PASEO_HOME;
+const prevDshHome = process.env.DSH_HOME;
 const isolatedPaseoHome = fs.mkdtempSync(path.join(os.tmpdir(), 'paseo-lifecycle-hooks-'));
+const isolatedDshHome = fs.mkdtempSync(path.join(os.tmpdir(), 'paseo-lifecycle-dsh-'));
 process.env.PASEO_HOME = isolatedPaseoHome;
+process.env.DSH_HOME = isolatedDshHome;
 const captured = [];
 const handlers = [];
 const released = [];
@@ -38,6 +41,14 @@ agPaths.detectAntigravityPresence = async () => ({
 const expectedCaptureHooks = [
   'agent.create.after', 'agent.turn.before', 'agent.turn.after',
   'agent.permission.before', 'agent.permission.after', 'agent.archive.after',
+];
+// Full allowlist of hooks registered on a pure-DSH host (no `agent.open.before`):
+// 6 DSH capture hooks + 4 Antigravity lifecycle hooks + 3 fallback hooks + 2 orchestrator hooks.
+const expectedPureDshHooks = [
+  ...expectedCaptureHooks,
+  'agent.create.before', 'agent.turn.after', 'agent.turn.after', 'agent.archive.after',
+  'agent.turn.before', 'agent.archive.after', 'agent.turn.after',
+  'agent.turn.after', 'agent.archive.after',
 ];
 (async () => {
   let cleanup;
@@ -67,6 +78,11 @@ const expectedCaptureHooks = [
       registeredNames.includes('agent.open.before'),
       false,
       'pure-DSH host must register zero agent.open.before hooks',
+    );
+    assert.deepEqual(
+      registeredNames,
+      expectedPureDshHooks,
+      'pure-DSH host must match the exact audited hook allowlist',
     );
     for (const { name, handler } of handlers.slice(0, expectedCaptureHooks.length)) {
       const paseo = { marker: name };
@@ -102,6 +118,9 @@ const expectedCaptureHooks = [
     agPaths.detectAntigravityPresence = origDetectPresence;
     if (prevPaseoHome === undefined) delete process.env.PASEO_HOME;
     else process.env.PASEO_HOME = prevPaseoHome;
+    if (prevDshHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prevDshHome;
     fs.rmSync(isolatedPaseoHome, { recursive: true, force: true });
+    fs.rmSync(isolatedDshHome, { recursive: true, force: true });
   }
 })().catch((error) => { console.error(error); process.exitCode = 1; });

@@ -39,6 +39,10 @@ import { DEEPSEEK_MARK_SVG } from "./client/deepseek-mark-svg";
 import { guardCleanup, installFatalGuard, report } from "./client/dsh-plugins-guard";
 import { contributeGoalPill } from "./client/goal-pill";
 import { InlineThinking } from "./client/inline-thinking";
+import { registerAntigravityToolSummariesReader } from "./client/antigravity/tool-summaries";
+import { registerThinkingTranslator } from "./client/thinking-translate";
+import { toolSummariesRpc } from "./shared/antigravity/contracts";
+import { translateThinkingRpc } from "./shared/translate";
 import { contributeJobsPill } from "./client/jobs-pill";
 import {
   DISPLAY_SETTINGS_ID,
@@ -151,13 +155,17 @@ function buildContributions(client: PluginClientContext): () => void {
   // chaining for Paseo 0.16 / headless mocks) so the console and first rows
   // match the host language before the first tool call arrives.
   adoptHostLocale(client.i18n?.locale);
-  bootstrapLanguage(client);
 
   // Reactive host capabilities store populated from `capabilitiesGetRpc` on
   // startup. Defaults safely to `undefined` (DSH-only console baseline, quota
   // footer hidden) until resolved so nothing flashes broken.
+  const CAPABILITIES_MAX_RETRIES = 3;
+  const CAPABILITIES_RETRY_BASE_MS = 800;
   let capabilities: CapabilitiesSnapshot | undefined;
   let disposed = false;
+  let capabilitiesFetchInflight: Promise<void> | null = null;
+  let capabilitiesRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  let unregisterAgToolSummaries: (() => void) | null = null;
   const capabilitiesListeners = new Set<() => void>();
   const getCapabilities = () => capabilities;
   const subscribeCapabilities = (listener: () => void) => {
@@ -169,6 +177,21 @@ function buildContributions(client: PluginClientContext): () => void {
   const notifyCapabilities = () => {
     for (const listener of Array.from(capabilitiesListeners)) listener();
   };
+  const syncAgToolSummariesReader = (visible: boolean) => {
+    if (visible && !disposed) {
+      if (unregisterAgToolSummaries === null) {
+        unregisterAgToolSummaries = registerAntigravityToolSummariesReader((agentId) =>
+          client.rpc(toolSummariesRpc, { agentId }),
+        );
+      }
+      return;
+    }
+    if (unregisterAgToolSummaries !== null) {
+      const cleanup = unregisterAgToolSummaries;
+      unregisterAgToolSummaries = null;
+      cleanup();
+    }
+  };
 
   const antigravity = contributeAntigravityClient(client, {
     consoleScreenId: CONSOLE_SCREEN_ID,
@@ -178,19 +201,57 @@ function buildContributions(client: PluginClientContext): () => void {
     subscribeVisibility: subscribeCapabilities,
   });
 
-  void Promise.resolve()
-    .then(() => client.rpc(capabilitiesGetRpc, {}))
-    .then((raw) => {
-      if (disposed) return;
-      const parsed = capabilitiesSnapshotSchema.safeParse(raw);
-      if (!parsed.success) return;
-      capabilities = parsed.data;
-      antigravity.setVisible(parsed.data.antigravityVisible);
-      notifyCapabilities();
-    })
-    .catch((error) => {
-      report("capabilities get", error);
-    });
+  const clearCapabilitiesRetryTimer = () => {
+    if (capabilitiesRetryTimer !== null) {
+      if (typeof clearTimeout === "function") {
+        clearTimeout(capabilitiesRetryTimer);
+      }
+      capabilitiesRetryTimer = null;
+    }
+  };
+
+  const refreshCapabilities = (attempt = 0): void => {
+    if (disposed || capabilities !== undefined || capabilitiesFetchInflight !== null) return;
+    capabilitiesFetchInflight = Promise.resolve()
+      .then(() => client.rpc(capabilitiesGetRpc, {}))
+      .then((raw) => {
+        if (disposed) return;
+        const parsed = capabilitiesSnapshotSchema.safeParse(raw);
+        if (!parsed.success) {
+          throw new Error("Invalid capabilities snapshot");
+        }
+        clearCapabilitiesRetryTimer();
+        capabilities = parsed.data;
+        antigravity.setVisible(parsed.data.antigravityVisible);
+        syncAgToolSummariesReader(parsed.data.antigravityVisible);
+        notifyCapabilities();
+      })
+      .catch((error) => {
+        report("capabilities get", error);
+        if (
+          !disposed &&
+          capabilities === undefined &&
+          attempt < CAPABILITIES_MAX_RETRIES &&
+          typeof setTimeout === "function"
+        ) {
+          clearCapabilitiesRetryTimer();
+          const delayMs = CAPABILITIES_RETRY_BASE_MS * (attempt + 1);
+          capabilitiesRetryTimer = setTimeout(() => {
+            capabilitiesRetryTimer = null;
+            refreshCapabilities(attempt + 1);
+          }, delayMs);
+        }
+      })
+      .finally(() => {
+        capabilitiesFetchInflight = null;
+      });
+  };
+
+  const ensureCapabilities = () => {
+    if (disposed || capabilities !== undefined) return;
+    clearCapabilitiesRetryTimer();
+    refreshCapabilities(0);
+  };
 
   client.addTimelineTransformer({
     id: "dsh-inline-thinking",
@@ -551,6 +612,7 @@ function buildContributions(client: PluginClientContext): () => void {
         {...props}
         client={client}
         capabilities={caps}
+        onEnsureCapabilities={ensureCapabilities}
         renderAntigravity={renderAntigravity}
         renderEnvironment={renderEnvironment}
       />
@@ -563,6 +625,7 @@ function buildContributions(client: PluginClientContext): () => void {
         {...props}
         client={client}
         capabilities={caps}
+        onEnsureCapabilities={ensureCapabilities}
         initialTab="settings"
         subscribeTabRequests={false}
         renderAntigravity={renderAntigravity}
@@ -578,9 +641,17 @@ function buildContributions(client: PluginClientContext): () => void {
     }
     command.openSettings(DISPLAY_SETTINGS_ID);
   };
+  const unregisterThinkingTranslator = registerThinkingTranslator(async (text, target) => {
+    const res = await client.rpc(translateThinkingRpc, { text, target });
+    return res.translated;
+  });
+
   const cleanups = [
+    unregisterThinkingTranslator,
     () => {
       disposed = true;
+      clearCapabilitiesRetryTimer();
+      syncAgToolSummariesReader(false);
       capabilitiesListeners.clear();
     },
     () => antigravity.dispose(),
@@ -635,6 +706,12 @@ function buildContributions(client: PluginClientContext): () => void {
       },
     }),
   );
+
+  // Start asynchronous startup RPCs only after every synchronous contribution
+  // registration has succeeded, so a failed initialization never leaks
+  // background requests or retry timers.
+  bootstrapLanguage(client);
+  refreshCapabilities(0);
 
   // The jobs pill registers one pill and one poll timer per agent, so its
   // cleanup is the one that actually does work today; running them in order

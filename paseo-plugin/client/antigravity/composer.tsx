@@ -1,13 +1,13 @@
-import { useComposer, useTranslation, type PluginComposer } from "@getpaseo/plugin/client";
+import { useComposer, type PluginComposer } from "@getpaseo/plugin/client";
 import { Select } from "@getpaseo/plugin/client/ui";
 import { ACCOUNT_METADATA_KEY, isAntigravityProvider } from "../../shared/antigravity/contracts";
 import { displayLabel } from "./labels";
-import { messages } from "./messages";
+import { useAntigravityTranslation } from "./messages";
 import { useAccounts } from "./useAccounts";
 
 function DraftAccount({ composer }: { composer: PluginComposer }) {
   const { data } = useAccounts();
-  const { t } = useTranslation(messages);
+  const { t } = useAntigravityTranslation();
   if (!data) return null;
   const selected = composer.agent.metadata[ACCOUNT_METADATA_KEY];
   const activeValue = typeof selected === "string" ? selected : data.defaultAccountId;

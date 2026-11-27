@@ -39,6 +39,9 @@ import {
 } from "./row-entrance";
 import { RowStatusIcon, resolveThinkingIconStatus } from "./row-status-icon";
 import { TextShimmer } from "./text-shimmer";
+import { currentLocale } from "./locale";
+import { useTranslatedThinking } from "./thinking-translate";
+import { isPreviewReadyForTranslation } from "../shared/translate-text";
 import { formatThinkingDuration, reasoningPreview, streamingTail } from "./thinking-text";
 import { BODY_INDENT, ROW_FONT_SIZE, ROW_GAP, ROW_LINE_HEIGHT } from "./tokens";
 import { useLocaleText } from "./use-locale";
@@ -980,6 +983,16 @@ export function InlineThinking({
   // Subscribe via `useLocaleText()` so host-relayed or settings-driven locale
   // changes re-render the label and screen-reader strings live.
   const copy = useLocaleText();
+  const isZhLocale = currentLocale() === "zh-CN";
+  const settledPreview = reasoningPreview(text, false);
+  const previewReady = isZhLocale && isPreviewReadyForTranslation(text, settledPreview, phase);
+  const translatedPreview = useTranslatedThinking(settledPreview, previewReady);
+  const isSingleLineThought = text.trim() === settledPreview.trim();
+  const fullReady = isZhLocale && open && phase === "complete" && !isSingleLineThought;
+  const translatedFull = useTranslatedThinking(text, fullReady);
+  const effectiveFullTranslation = isSingleLineThought ? translatedPreview : translatedFull;
+  const [showOriginal, setShowOriginal] = useState(false);
+  const displayText = effectiveFullTranslation !== "" && !showOriginal ? effectiveFullTranslation : text;
 
 
   // While streaming the collapsed line is a **tail window**: it advances with
@@ -989,10 +1002,14 @@ export function InlineThinking({
   // (avoiding a 300ms tail hold or an empty first frame on short unmeasured
   // thoughts), while the status icon, shimmer, and duration still keep the
   // 300ms `growing` debounce.
-  const line =
+  const rawLine =
     growing && phase === "streaming" && lineWidth > 0
       ? streamingTail(text, lineWidth, ROW_FONT_SIZE)
       : reasoningPreview(text, growing && phase === "streaming");
+  const line =
+    !(growing && phase === "streaming") && translatedPreview !== "" && !showOriginal
+      ? translatedPreview
+      : rawLine;
   const tailSliding = growing && phase === "streaming" && lineWidth > 0 && line.endsWith("…");
   const stream = useInkStreamReveal({
     agentId,
@@ -1142,6 +1159,20 @@ export function InlineThinking({
               )}
             </TextShimmer>
           </View>
+          {open && effectiveFullTranslation !== "" ? (
+            <Pressable
+              accessibilityRole="button"
+              onPress={(event: { stopPropagation?: () => void }) => {
+                event?.stopPropagation?.();
+                setShowOriginal((prev) => !prev);
+              }}
+              style={{ flexShrink: 0, paddingHorizontal: 4, paddingVertical: 1, borderRadius: 4 }}
+            >
+              <Text style={styles.duration} numberOfLines={1}>
+                {showOriginal ? "查看译文" : "查看原文"}
+              </Text>
+            </Pressable>
+          ) : null}
           {durationText !== "" ? (
             <View
               style={styles.durationBox}
@@ -1178,7 +1209,7 @@ export function InlineThinking({
               onPress={collapseBody}
             >
               <Text style={styles.full} selectable>
-                {text}
+                {displayText}
               </Text>
             </Pressable>
           </ScrollView>

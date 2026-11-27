@@ -1,4 +1,4 @@
-import { useRpc, useTranslation, type PluginSurfaceProps } from "@getpaseo/plugin/client";
+import { useRpc, type PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { Icon, SettingsCard, SettingsRow, SettingsSelect, SettingsSwitch, useToast } from "@getpaseo/plugin/client/ui";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { ActivityIndicator, Platform, Pressable, Text, View } from "react-native";
@@ -20,7 +20,7 @@ import { AccountCard, type CardAction } from "./AccountCard";
 import type { AgentObservation } from "./agents";
 import { AccountAgentsDialog, ConfirmRemove, NameDialog, RecoverFilesDialog } from "./dialogs";
 import { displayLabel } from "./labels";
-import { errorMessage, messages } from "./messages";
+import { errorMessage, useAntigravityTranslation } from "./messages";
 import { AccountOrchestratorDialog, OrchestratorRows } from "./orchestrator";
 import { SignIn } from "./signIn";
 import { font, radius, space, tint, type Colors } from "./theme";
@@ -57,7 +57,7 @@ function SectionTitle({ colors, title, count }: { colors: Colors; title: string;
 }
 
 function AddAccountCard({ colors, onAdd }: { colors: Colors; onAdd(): void }) {
-  const { t } = useTranslation(messages);
+  const { t } = useAntigravityTranslation();
   return (
     <View
       style={{
@@ -106,7 +106,7 @@ export function AntigravityTabContent({
   observation,
 }: AntigravityTabProps & { observation: AgentObservation }) {
   const { colors } = theme;
-  const { t } = useTranslation(messages);
+  const { t } = useAntigravityTranslation();
   const toast = useToast();
   const { data, error, accept, refetch } = useAccounts();
   const counts = useSyncExternalStore(observation.subscribe, observation.counts);

@@ -1,15 +1,22 @@
 import {
   useAgent,
   useRpc,
-  useTranslation,
-  type PluginAgentPanelProps,
+  type PluginButtonContentProps,
   type PluginClientContext,
+  type PluginScreenProps,
   type PluginTimelineItemProps,
 } from "@getpaseo/plugin/client";
 import { Icon, Markdown, ScrollView, TextInput, copyText, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Pressable, Text, View, type ScrollView as NativeScrollView } from "react-native";
+import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from "react";
+import {
+  Platform,
+  Pressable,
+  Text,
+  View,
+  type PressableStateCallbackType,
+  type ScrollView as NativeScrollView,
+} from "react-native";
 import {
   isAntigravityProvider,
   listSubagentsRpc,
@@ -35,19 +42,47 @@ import {
   type Currency,
   type PricingState,
 } from "../../shared/pricing";
+import { Badge } from "../console-ui";
+import { toolLabel } from "../tool-call-data";
+import {
+  CHEVRON_BOX,
+  FACTS_FONT_SIZE,
+  MARK_BOX,
+  MARK_DOT_SIZE,
+  TITLE_FONT_SIZE,
+  chevronColorToken,
+  chevronRotation,
+  popoverRootBox,
+  ringColorFor,
+  rowActiveFill,
+  rowBox,
+  rowTextColumn,
+} from "../jobs-popover-layout";
+import {
+  POPOVER_DETAIL_TITLE_LINE,
+  POPOVER_DETAIL_TITLE_SIZE,
+  PopoverHairline,
+  PopoverPill,
+  PopoverSectionHeader,
+  type PopoverPillTone,
+  type PopoverTheme,
+} from "../popover-ui";
+import { StatusRingMark } from "../status-ring";
 import { clockTime, duration, money, tokens, upper } from "./format";
-import { errorMessage, messages } from "./messages";
+import { antigravityLogoSvg } from "./logo";
+import { errorMessage, useAntigravityTranslation } from "./messages";
 import { font, mono, radius, space, tabular, tint, toneColor, type Colors, type Tone } from "./theme";
-import { Badge } from "./ui";
 
 export const SUBAGENT_PANEL_ID = "subagents";
+export const SUBAGENT_SCREEN_ID = "antigravity-subagents";
 
 type ShownState = SubagentState | "starting";
 type ListFilter = "all" | "running" | "failed";
 type ActivityFilter = "all" | "tools" | "errors";
+type HoverState = PressableStateCallbackType & { hovered?: boolean };
 
 function useMessages() {
-  return useTranslation(messages);
+  return useAntigravityTranslation();
 }
 type Translate = ReturnType<typeof useMessages>["t"];
 
@@ -127,16 +162,11 @@ function shownState(summary: SubagentSummary | undefined, status: SubagentCard["
   return "starting";
 }
 
-function StateLabel({ colors, state, t }: { colors: Colors; state: ShownState; t: Translate }) {
-  const color = toneColor(colors, STATE_TONE[state]);
-  return (
-    <View style={{ flexDirection: "row", alignItems: "center", gap: 5 }}>
-      <Icon name={STATE_ICON[state]} size={13} color={color} />
-      <Text numberOfLines={1} style={{ ...font.caption, fontWeight: "500", color }}>
-        {t(`subagents.state.${state}`)}
-      </Text>
-    </View>
-  );
+function statusBadgeIcon(state: ShownState, color: string): string | ReactNode {
+  if (state === "running" || state === "starting") {
+    return <StatusRingMark size={12} ring={10} color={color} />;
+  }
+  return STATE_ICON[state];
 }
 
 function estimateSubagentCost(
@@ -213,32 +243,60 @@ function metaLine(
   return parts.join(" · ");
 }
 
+function localizeActivity(activity: string | null): string | null {
+  if (!activity) return null;
+  const sep = " · ";
+  const idx = activity.indexOf(sep);
+  if (idx === -1) return toolLabel(activity);
+  const head = activity.slice(0, idx);
+  const tail = activity.slice(idx + sep.length);
+  return `${toolLabel(head)}${sep}${tail}`;
+}
+
+const KNOWN_SUBAGENT_TYPES = new Set(["research", "self", "image-generator", "worker", "monitor", "swarm"]);
+
+function subagentTypeLabel(type: string | null | undefined, t: Translate): string | null {
+  if (!type) return null;
+  const normalized = type.trim().toLowerCase();
+  if (KNOWN_SUBAGENT_TYPES.has(normalized)) {
+    return t(`subagents.type.${normalized}`);
+  }
+  return type;
+}
+
 function activityLine(summary: SubagentSummary | undefined, t: Translate): string | null {
   if (!summary) return null;
   if (summary.state === "running" && summary.phase === "thinking") return t("subagents.thinking");
-  return summary.activity;
+  return localizeActivity(summary.activity);
 }
 
-function transcriptToMarkdown(summary: SubagentSummary, entries: readonly TranscriptEntry[], report: string | null): string {
+function transcriptToMarkdown(
+  summary: SubagentSummary,
+  entries: readonly TranscriptEntry[],
+  report: string | null,
+  t: Translate,
+): string {
+  const displayType = subagentTypeLabel(summary.type, t);
   const lines: string[] = [
-    `# ${summary.role ?? summary.type ?? summary.id}`,
+    `# ${summary.role ?? displayType ?? summary.id}`,
     "",
     `- **ID**: \`${summary.id}\``,
-    `- **State**: ${summary.state}`,
-    summary.model ? `- **Model**: ${summary.model}` : "",
-    `- **Tokens**: ${summary.inputTokens} input / ${summary.cachedTokens} cached / ${summary.outputTokens} output`,
+    `- **${t("subagents.markdown.state")}**: ${t(`subagents.state.${summary.state}`)}`,
+    summary.model ? `- **${t("subagents.markdown.model")}**: ${summary.model}` : "",
+    `- **${t("subagents.markdown.tokens")}**: ${summary.inputTokens} ${t("subagents.tokens.input")} / ${summary.cachedTokens} ${t("subagents.tokens.cached")} / ${summary.outputTokens} ${t("subagents.tokens.output")}`,
     "",
   ].filter(Boolean);
   if (report) {
-    lines.push("## Report", "", report, "");
+    lines.push(`## ${t("subagents.markdown.report")}`, "", report, "");
   }
-  lines.push("## Transcript", "");
+  lines.push(`## ${t("subagents.markdown.transcript")}`, "");
   for (const entry of entries) {
     const stamp = entry.at ? `[${entry.at}] ` : "";
-    lines.push(`### ${stamp}Step ${entry.index} (${entry.kind})`);
+    lines.push(`### ${stamp}${t("subagents.markdown.step", { index: entry.index })}`);
     if (entry.text) lines.push("", entry.text);
     for (const tool of entry.tools) {
-      lines.push(`- \`${tool.name}\` ${tool.summary}${tool.failed ? " (FAILED)" : ""}`);
+      const label = toolLabel(tool.name);
+      lines.push(`- \`${label}\` ${tool.summary}${tool.failed ? ` (${t("subagents.markdown.failed")})` : ""}`);
       if (tool.output) lines.push("```", tool.output, "```");
     }
     lines.push("");
@@ -278,10 +336,17 @@ function FilterChip({
 }
 
 export function createSubagentViews(client: PluginClientContext) {
-  function open(agentId: string, workspaceId: string | null | undefined, subagentId?: string) {
-    if (!workspaceId) return;
+  function open(agentId: string, _workspaceId?: string | null, subagentId?: string) {
+    if (!agentId) return;
     if (subagentId) requested.set(agentId, subagentId);
-    client.openPanel(SUBAGENT_PANEL_ID, { workspaceId, agentId });
+    else requested.delete(agentId);
+    client.openScreen({
+      screenId: SUBAGENT_SCREEN_ID,
+      params: {
+        agentId,
+        ...(subagentId ? { subagentId } : {}),
+      },
+    });
   }
 
   function insertIntoComposer(agentId: string, text: string): boolean {
@@ -293,119 +358,285 @@ export function createSubagentViews(client: PluginClientContext) {
     return true;
   }
 
-  // ---- Timeline: the row of an `invoke_subagent` call ------------------------------------------
+  // ---- Timeline: the row of an `invoke_subagent` / `swarm` add call ----------------------------
 
   function SubagentCardRow({ agentId, item, theme }: PluginTimelineItemProps<SubagentCard>) {
     const { colors } = theme;
-    const { t, locale } = useTranslation(messages);
+    const { t, locale } = useAntigravityTranslation();
+    const toast = useToast();
+    const readDetail = useRpc(subagentDetailRpc);
     const query = useSubagents(agentId);
     const pricing = useUnifiedPricing();
     const workspaceId = useAgent(agentId, (agent) => agent.workspaceId);
+    const [expanded, setExpanded] = useState(false);
     const card = item.data;
     const summary = useMemo(() => {
       const subagents = query.data?.subagents;
       if (!subagents?.length) return undefined;
       if (card.id) {
-        const byId = subagents.find((subagent) => subagent.id === card.id);
-        if (byId) return byId;
+        return subagents.find((subagent) => subagent.id === card.id);
       }
       const taskPrefix = card.task.replace(/…$/, "").trim().slice(0, 80);
       return subagents.find((subagent) => {
+        if (card.origin && subagent.origin && subagent.origin !== card.origin) return false;
         if (card.role && subagent.role && subagent.role !== card.role) return false;
-        if (card.type && subagent.type && subagent.type !== card.type) return false;
-        if (!taskPrefix) return Boolean(card.role && subagent.role === card.role);
+        const bothSwarm = card.origin === "swarm" && subagent.origin === "swarm";
+        if (!bothSwarm && card.type && subagent.type && subagent.type !== card.type) return false;
         const candidateTask = subagent.task.trim();
+        if (!taskPrefix || !candidateTask) return Boolean(card.role && subagent.role === card.role);
         return (
           candidateTask.startsWith(taskPrefix) ||
-          (candidateTask.length > 0 && taskPrefix.startsWith(candidateTask.slice(0, 80)))
+          taskPrefix.startsWith(candidateTask.slice(0, 80))
         );
       });
-    }, [query.data?.subagents, card.id, card.role, card.type, card.task]);
+    }, [query.data?.subagents, card.id, card.origin, card.role, card.type, card.task]);
     const state = shownState(summary, card.status);
+    const statusTone = STATE_TONE[state];
+    const statusColor = toneColor(colors, statusTone);
     const activity = activityLine(summary, t);
     const thinking = summary?.state === "running" && summary.phase === "thinking";
     const resolvedRole = summary?.role ?? card.role ?? null;
-    const title = resolvedRole ?? card.type ?? t("subagents.title");
+    const isSwarm = summary?.origin === "swarm" || card.origin === "swarm";
+    const typeLabel = subagentTypeLabel(summary?.type ?? card.type, t);
+    const title = resolvedRole ?? typeLabel ?? t("subagents.title");
     const targetId = summary?.id || card.id || undefined;
+
+    const detailQuery = useQuery({
+      queryKey: ["antigravity-accounts", "subagent", agentId, targetId],
+      queryFn: () => readDetail({ agentId, subagentId: targetId! }),
+      enabled: expanded && Boolean(targetId),
+      staleTime: 1000,
+      refetchInterval: expanded && state === "running" ? 3000 : false,
+    });
+    const detail = detailQuery.data;
+    const fullTask = detail?.entries.find((entry) => entry.kind === "task")?.text || summary?.task || card.task;
+    const reportText = detail?.report?.trim() ?? "";
+
     return (
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel={`${title} · ${t(`subagents.state.${state}`)}`}
-        onPress={() => open(agentId, workspaceId, targetId)}
-        style={(pressState) => ({
-          flexDirection: "row",
-          gap: space.md,
-          padding: space.md,
+      <View
+        style={{
           borderRadius: radius.lg,
           borderWidth: 1,
           borderColor: colors.border,
-          backgroundColor: (pressState as { hovered?: boolean }).hovered || pressState.pressed
-            ? tint(colors.foreground, 0.04)
-            : colors.surface1,
-        })}
+          backgroundColor: colors.surface1,
+          overflow: "hidden",
+        }}
       >
-        <View
-          style={{
-            width: 32,
-            height: 32,
-            borderRadius: radius.md,
-            alignItems: "center",
-            justifyContent: "center",
-            backgroundColor: tint(toneColor(colors, STATE_TONE[state]), 0.12),
-          }}
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`${title} · ${t(`subagents.state.${state}`)}`}
+          accessibilityState={{ expanded }}
+          onPress={() => setExpanded((prev) => !prev)}
+          style={(pressState) => ({
+            flexDirection: "row",
+            alignItems: "flex-start",
+            gap: space.sm + 2,
+            paddingHorizontal: space.md,
+            paddingVertical: space.sm + 2,
+            backgroundColor: (pressState as { hovered?: boolean }).hovered || pressState.pressed
+              ? tint(colors.foreground, 0.04)
+              : "transparent",
+          })}
         >
-          <Icon name="Bot" size={17} color={toneColor(colors, STATE_TONE[state])} />
-        </View>
-        <View style={{ flex: 1, minWidth: 0, gap: 3 }}>
-          <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
-            <Text numberOfLines={1} style={{ ...font.small, fontWeight: "600", color: colors.foreground, flexShrink: 1 }}>
-              {title}
-            </Text>
-            {card.type && resolvedRole ? (
-              <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted }}>
-                {card.type}
+          <View
+            style={{
+              width: 28,
+              height: 28,
+              borderRadius: radius.md,
+              alignItems: "center",
+              justifyContent: "center",
+              backgroundColor: tint(statusColor, 0.13),
+              flexShrink: 0,
+            }}
+          >
+            <Icon name="Bot" size={15} color={statusColor} />
+          </View>
+          <View style={{ flex: 1, minWidth: 0, gap: 4 }}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
+              <View
+                style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  gap: 6,
+                  flex: 1,
+                  minWidth: 0,
+                }}
+              >
+                <Text numberOfLines={1} style={{ ...font.small, fontWeight: "600", color: colors.foreground, flexShrink: 1 }}>
+                  {title}
+                </Text>
+                {isSwarm ? (
+                  <Badge colors={colors} label={t("subagents.swarmTag")} tone="neutral" style={{ flexShrink: 0 }} />
+                ) : typeLabel && resolvedRole ? (
+                  <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted, flexShrink: 2 }}>
+                    {typeLabel}
+                  </Text>
+                ) : null}
+              </View>
+              <Badge
+                colors={colors}
+                tone={statusTone}
+                icon={statusBadgeIcon(state, statusColor)}
+                label={t(`subagents.state.${state}`)}
+                style={{ flexShrink: 0 }}
+              />
+            </View>
+            {!expanded && card.task ? (
+              <Text numberOfLines={2} style={{ ...font.caption, color: colors.foregroundMuted }}>
+                {card.task}
               </Text>
             ) : null}
-            <View style={{ flex: 1 }} />
-            <StateLabel colors={colors} state={state} t={t} />
-          </View>
-          <Text numberOfLines={2} style={{ ...font.caption, color: colors.foregroundMuted }}>
-            {card.task}
-          </Text>
-          {activity ? (
-            <Text
-              numberOfLines={1}
-              style={
-                thinking
-                  ? { ...font.caption, color: colors.foregroundMuted, fontStyle: "italic" }
-                  : { ...font.caption, color: colors.foreground, fontFamily: mono }
-              }
-            >
-              {activity}
-            </Text>
-          ) : null}
-          <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, marginTop: 2 }}>
-            <Text numberOfLines={1} style={{ ...font.caption, ...tabular, color: colors.foregroundMuted, flex: 1 }}>
-              {summary ? metaLine(summary, t, locale, pricing.data) : ""}
-            </Text>
-            <View style={{ flexDirection: "row", alignItems: "center", gap: 2 }}>
-              <Text style={{ ...font.caption, fontWeight: "500", color: colors.accent }}>{t("subagents.open")}</Text>
-              <Icon name="ChevronRight" size={13} color={colors.accent} />
+            {activity ? (
+              <Text
+                numberOfLines={1}
+                style={
+                  thinking
+                    ? { ...font.caption, color: colors.foregroundMuted, fontStyle: "italic" }
+                    : { ...font.caption, color: colors.foreground, fontFamily: mono }
+                }
+              >
+                {activity}
+              </Text>
+            ) : null}
+            <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, marginTop: 2 }}>
+              <Text numberOfLines={1} style={{ ...font.caption, ...tabular, color: colors.foregroundMuted, flex: 1 }}>
+                {summary ? metaLine(summary, t, locale, pricing.data) : ""}
+              </Text>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 3 }}>
+                <Text style={{ ...font.caption, fontWeight: "500", color: colors.foregroundMuted }}>
+                  {expanded ? t("subagents.less") : t("subagents.more")}
+                </Text>
+                <Icon name={expanded ? "ChevronUp" : "ChevronDown"} size={13} color={colors.foregroundMuted} />
+              </View>
             </View>
           </View>
-        </View>
-      </Pressable>
+        </Pressable>
+
+        {expanded ? (
+          <View
+            style={{
+              borderTopWidth: 1,
+              borderTopColor: tint(colors.border, 0.7),
+              paddingHorizontal: space.md,
+              paddingVertical: space.sm + 2,
+              gap: space.sm + 2,
+            }}
+          >
+            {fullTask ? (
+              <View style={{ gap: 4 }}>
+                <Text style={{ ...font.caption, fontWeight: "600", color: colors.foregroundMuted }}>
+                  {t("subagents.task")}
+                </Text>
+                <Expandable colors={colors} height={108} background={colors.surface1} t={t}>
+                  <Text selectable style={{ ...font.caption, color: colors.foreground, lineHeight: 18 }}>
+                    {fullTask}
+                  </Text>
+                </Expandable>
+              </View>
+            ) : null}
+
+            {detailQuery.isLoading && !detail ? (
+              <Text style={{ ...font.caption, color: colors.foregroundMuted }}>{t("loading")}</Text>
+            ) : detailQuery.error && !detail ? (
+              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: space.sm }}>
+                <Text selectable style={{ ...font.caption, color: colors.statusDanger, flex: 1 }}>
+                  {errorMessage(detailQuery.error)}
+                </Text>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={t("retry")}
+                  onPress={(event) => {
+                    (event as { stopPropagation?: () => void })?.stopPropagation?.();
+                    void detailQuery.refetch();
+                  }}
+                  style={{ paddingHorizontal: space.xs + 2, paddingVertical: 2 }}
+                >
+                  <Text style={{ ...font.caption, fontWeight: "500", color: colors.accent }}>{t("retry")}</Text>
+                </Pressable>
+              </View>
+            ) : reportText ? (
+              <View style={{ gap: 4 }}>
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                  <Text style={{ ...font.caption, fontWeight: "600", color: colors.foregroundMuted }}>
+                    {t("subagents.report")}
+                  </Text>
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={t("subagents.copy")}
+                    onPress={(event) => {
+                      (event as { stopPropagation?: () => void })?.stopPropagation?.();
+                      void copyText(reportText).then(() => toast.show(t("subagents.copied"), { durationMs: 2500 }));
+                    }}
+                    style={(pressState) => ({
+                      flexDirection: "row",
+                      alignItems: "center",
+                      gap: 4,
+                      paddingHorizontal: 6,
+                      height: 22,
+                      borderRadius: radius.sm,
+                      backgroundColor: (pressState as { hovered?: boolean }).hovered || pressState.pressed
+                        ? tint(colors.foreground, 0.07)
+                        : "transparent",
+                    })}
+                  >
+                    <Icon name="Copy" size={12} color={colors.foregroundMuted} />
+                    <Text style={{ ...font.caption, fontWeight: "500", color: colors.foregroundMuted }}>
+                      {t("subagents.copy")}
+                    </Text>
+                  </Pressable>
+                </View>
+                <Expandable colors={colors} height={220} background={colors.surface1} t={t}>
+                  <Markdown>{reportText}</Markdown>
+                </Expandable>
+              </View>
+            ) : state === "running" || state === "starting" ? (
+              <Text style={{ ...font.caption, color: colors.foregroundMuted, fontStyle: "italic" }}>
+                {t("subagents.runningNoReport")}
+              </Text>
+            ) : null}
+
+            {workspaceId ? (
+              <View style={{ flexDirection: "row", justifyContent: "flex-end" }}>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={t("subagents.openInTab")}
+                  onPress={(event) => {
+                    (event as { stopPropagation?: () => void })?.stopPropagation?.();
+                    open(agentId, workspaceId, targetId);
+                  }}
+                  style={(pressState) => ({
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 4,
+                    paddingHorizontal: 8,
+                    height: 24,
+                    borderRadius: radius.sm,
+                    backgroundColor: (pressState as { hovered?: boolean }).hovered || pressState.pressed
+                      ? tint(colors.accent, 0.14)
+                      : tint(colors.accent, 0.08),
+                  })}
+                >
+                  <Icon name="PanelRightOpen" size={12} color={colors.accent} />
+                  <Text style={{ ...font.caption, fontWeight: "500", color: colors.accent }}>
+                    {t("subagents.openInTab")}
+                  </Text>
+                </Pressable>
+              </View>
+            ) : null}
+          </View>
+        ) : null}
+      </View>
     );
   }
 
-  // ---- Timeline: the row of a `manage_subagents` call ------------------------------------------
+  // ---- Timeline: the row of a `manage_subagents` / `swarm` control call ------------------------
 
-  function SubagentCheckRow({ agentId, item, theme }: PluginTimelineItemProps<SubagentCheck>) {
+  function SubagentCheckRow({ item, theme }: PluginTimelineItemProps<SubagentCheck>) {
     const { colors } = theme;
-    const { t } = useTranslation(messages);
-    const workspaceId = useAgent(agentId, (agent) => agent.workspaceId);
+    const { t } = useAntigravityTranslation();
     const check = item.data;
-    const killed = check.action === "kill" || check.action === "kill_all";
+    const killed = check.action === "kill" || check.action === "kill_all" || check.action === "swarm:kill";
+    const isSwarm = check.action.startsWith("swarm:");
     const title =
       check.action === "kill_all"
         ? check.states.length > 0
@@ -415,41 +646,60 @@ export function createSubagentViews(client: PluginClientContext) {
           ? t("subagents.check.kill", { count: check.states.length })
           : check.action === "list"
             ? t("subagents.check.list")
-            : t("subagents.check.other", { action: check.action });
+            : check.action === "swarm:status"
+              ? t("subagents.check.swarmStatus")
+              : check.action === "swarm:kill"
+                ? t("subagents.check.swarmKill", { count: Math.max(1, check.states.length) })
+                : check.action === "swarm:title"
+                  ? t("subagents.check.swarmTitle")
+                  : check.action === "swarm:model"
+                    ? t("subagents.check.swarmModel")
+                    : isSwarm
+                      ? t("subagents.check.swarmOther", { action: check.action.slice("swarm:".length) })
+                      : t("subagents.check.other", { action: check.action });
+    const iconName = killed
+      ? "OctagonX"
+      : check.action === "swarm:title"
+        ? "Tag"
+        : check.action === "swarm:model"
+          ? "Cpu"
+          : "ListChecks";
+    const showNames = killed || check.action === "swarm:model";
     const counts = new Map<string, number>();
-    if (!killed) for (const entry of check.states) counts.set(entry.state, (counts.get(entry.state) ?? 0) + 1);
+    if (!showNames) for (const entry of check.states) counts.set(entry.state, (counts.get(entry.state) ?? 0) + 1);
     const chips = [...counts].map(([state, count]) => {
       const known = (["running", "done", "stopped", "failed", "idle"] as const).find((value) => value === state);
       const label = known ? t(`subagents.state.${known}`) : state;
       return { raw: state, state: known ?? "idle", text: `${count} ${label}` };
     });
-    const names = killed
+    const names = showNames
       ? check.states
           .map((entry) => entry.role ?? (entry.id.startsWith("#") ? "" : entry.id.slice(0, 8)))
           .filter(Boolean)
           .join(" · ")
       : "";
+    const checkTitle = check.title?.trim() ?? "";
     return (
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel={title}
-        onPress={() => open(agentId, workspaceId)}
-        style={(pressState) => ({
+      <View
+        accessible
+        accessibilityLabel={checkTitle ? `${title} · ${checkTitle}` : title}
+        style={{
           flexDirection: "row",
           alignItems: "center",
-          // Same icon column and gap as Paseo's own tool rows, with the hover wash bleeding outside.
           gap: 9,
           paddingVertical: space.xs,
-          paddingHorizontal: 7,
-          marginHorizontal: -6,
-          borderRadius: radius.md,
-          backgroundColor: (pressState as { hovered?: boolean }).hovered ? tint(colors.foreground, 0.05) : "transparent",
-        })}
+          paddingHorizontal: 1,
+        }}
       >
-        <Icon name={killed ? "OctagonX" : "ListChecks"} size={12} color={colors.foregroundMuted} />
+        <Icon name={iconName} size={12} color={colors.foregroundMuted} />
         <Text numberOfLines={1} style={{ ...font.small, color: colors.foregroundMuted }}>
           {title}
         </Text>
+        {checkTitle ? (
+          <Text numberOfLines={1} style={{ ...font.small, color: colors.foreground, flexShrink: 1 }}>
+            {checkTitle}
+          </Text>
+        ) : null}
         {names ? (
           <Text numberOfLines={1} style={{ ...font.small, color: colors.foreground, flexShrink: 1 }}>
             {names}
@@ -464,35 +714,294 @@ export function createSubagentViews(client: PluginClientContext) {
             {chip.text}
           </Text>
         ))}
-      </Pressable>
+      </View>
     );
   }
 
-  // ---- Panel ----------------------------------------------------------------------------------
+  // ---- Popover: DSH-style frameless composer popover -------------------------------------------
 
-  function SubagentsPanel({ theme, layout, params, revision }: PluginAgentPanelProps) {
+  function makePopover(
+    agentId: string,
+    workspaceId: string | null | undefined,
+  ): ComponentType<PluginButtonContentProps> {
+    function SubagentsPopover({ theme, layout, close }: PluginButtonContentProps) {
+      const { t, locale } = useAntigravityTranslation();
+      const query = useSubagents(agentId);
+      const pricing = useUnifiedPricing();
+      const [selectedId, setSelectedId] = useState<string | null>(null);
+      const [settledOpen, setSettledOpen] = useState<boolean | undefined>(undefined);
+      const compact = layout.compact;
+      const subagents = query.data?.subagents ?? [];
+      const selected = selectedId ? subagents.find((subagent) => subagent.id === selectedId) : undefined;
+      const live = subagents.filter((subagent) => subagent.state === "running");
+      const settled = subagents.filter((subagent) => subagent.state !== "running");
+      const failedCount = subagents.filter((subagent) => subagent.state === "failed").length;
+      const doneCount = subagents.filter((subagent) => subagent.state === "done").length;
+      const headlineTitle = query.data?.swarmTitle?.trim() || t("subagents.title");
+      const expanded = settledOpen ?? live.length === 0;
+      const root = { ...popoverRootBox(), paddingBottom: 6 };
+
+      const handleOpenInTab = (subagentId?: string) => {
+        close();
+        open(agentId, workspaceId, subagentId);
+      };
+
+      if (selected) {
+        return (
+          <PopoverSubagentDetail
+            theme={theme}
+            compact={compact}
+            agentId={agentId}
+            summary={selected}
+            pricing={pricing.data}
+            onBack={() => setSelectedId(null)}
+            onOpenInTab={workspaceId ? () => handleOpenInTab(selected.id) : undefined}
+            onInsertReport={(text) => {
+              const ok = insertIntoComposer(agentId, text);
+              if (ok) close();
+              return ok;
+            }}
+          />
+        );
+      }
+
+      const renderRow = (subagent: SubagentSummary) => (
+        <PopoverSubagentRow
+          key={subagent.id}
+          subagent={subagent}
+          theme={theme}
+          compact={compact}
+          t={t}
+          locale={locale}
+          pricing={pricing.data}
+          onPress={() => setSelectedId(subagent.id)}
+        />
+      );
+
+      return (
+        <View style={root}>
+          <View
+            accessible
+            accessibilityRole="header"
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+              gap: 8,
+              paddingHorizontal: 12,
+              paddingTop: 10,
+              paddingBottom: 8,
+            }}
+          >
+            <Icon icon={{ svg: antigravityLogoSvg("popover") }} size={16} color={theme.colors.foregroundMuted} />
+            <Text
+              numberOfLines={1}
+              style={{
+                flexGrow: 1,
+                flexShrink: 1,
+                minWidth: 0,
+                fontSize: TITLE_FONT_SIZE,
+                fontWeight: "600",
+                color: theme.colors.foreground,
+              }}
+            >
+              {headlineTitle}
+            </Text>
+            {live.length > 0 || failedCount > 0 || doneCount > 0 ? (
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 4, flexShrink: 0 }}>
+                {live.length > 0 ? (
+                  <PopoverPill
+                    theme={theme}
+                    label={t("subagents.chipRunning", { count: live.length })}
+                    tone="running"
+                    compact
+                    leading={
+                      <View style={{ width: 12, height: 12, alignItems: "center", justifyContent: "center" }}>
+                        <StatusRingMark size={12} color={ringColorFor(theme.colors.surface0)} />
+                      </View>
+                    }
+                  />
+                ) : null}
+                {failedCount > 0 ? (
+                  <PopoverPill
+                    theme={theme}
+                    label={t("subagents.chipFailed", { count: failedCount })}
+                    tone="danger"
+                    compact
+                    leading={
+                      <View style={{ width: 12, height: 12, alignItems: "center", justifyContent: "center" }}>
+                        <View
+                          style={{
+                            width: 6,
+                            height: 6,
+                            borderRadius: 3,
+                            backgroundColor: theme.colors.statusDanger,
+                          }}
+                        />
+                      </View>
+                    }
+                  />
+                ) : null}
+                {doneCount > 0 ? (
+                  <PopoverPill
+                    theme={theme}
+                    label={t("subagents.chipDone", { count: doneCount })}
+                    tone="success"
+                    compact
+                    leading={
+                      <View style={{ width: 12, height: 12, alignItems: "center", justifyContent: "center" }}>
+                        <Icon name="CircleCheck" size={12} color={theme.colors.statusSuccess} />
+                      </View>
+                    }
+                  />
+                ) : null}
+              </View>
+            ) : null}
+          </View>
+
+          <PopoverHairline theme={theme} marginVertical={2} />
+
+          {query.isLoading && !query.data ? (
+            <View style={rowBox({ compact })}>
+              <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
+                {t("loading")}
+              </Text>
+            </View>
+          ) : query.error && !query.data ? (
+            <View style={[rowBox({ compact }), { justifyContent: "space-between", gap: 8 }]}>
+              <Text selectable style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.statusDanger, flex: 1 }}>
+                {errorMessage(query.error)}
+              </Text>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={t("retry")}
+                onPress={() => void query.refetch()}
+                style={{ paddingHorizontal: 6, paddingVertical: 2 }}
+              >
+                <Text style={{ fontSize: FACTS_FONT_SIZE, fontWeight: "500", color: theme.colors.accent }}>
+                  {t("retry")}
+                </Text>
+              </Pressable>
+            </View>
+          ) : subagents.length === 0 ? (
+            <View style={rowBox({ compact })}>
+              <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
+                {t("subagents.empty")}
+              </Text>
+            </View>
+          ) : (
+            <>
+              {live.length > 0 ? (
+                <View>
+                  <PopoverSectionHeader
+                    theme={theme}
+                    label={t("subagents.runningSection")}
+                    count={live.length}
+                    paddingTop={6}
+                  />
+                  {live.map(renderRow)}
+                </View>
+              ) : null}
+
+              {live.length > 0 && settled.length > 0 ? <PopoverHairline theme={theme} marginVertical={4} /> : null}
+
+              {settled.length > 0 ? (
+                <View>
+                  <SettledSectionHeader
+                    theme={theme}
+                    label={t("subagents.settledSection")}
+                    count={settled.length}
+                    expanded={expanded}
+                    compact={compact}
+                    onToggle={() => setSettledOpen(!expanded)}
+                  />
+                  {expanded ? settled.map(renderRow) : null}
+                </View>
+              ) : null}
+            </>
+          )}
+
+          <PopoverHairline theme={theme} marginVertical={4} />
+
+          <Pressable
+            onPress={() => handleOpenInTab()}
+            accessibilityRole="button"
+            accessibilityLabel={t("subagents.openPanel")}
+            style={({ hovered = false, pressed }: HoverState) => {
+              const fill = rowActiveFill(hovered, pressed);
+              return [rowBox({ compact }), fill === undefined ? undefined : { backgroundColor: theme.colors[fill] }];
+            }}
+          >
+            {({ hovered = false, pressed }: HoverState) => (
+              <>
+                <View style={{ width: MARK_BOX, height: MARK_BOX, alignItems: "center", justifyContent: "center" }}>
+                  <Icon
+                    name="PanelRightOpen"
+                    size={MARK_BOX}
+                    color={theme.colors[chevronColorToken(hovered, pressed)]}
+                  />
+                </View>
+                <Text
+                  numberOfLines={1}
+                  style={{
+                    ...rowTextColumn(),
+                    fontSize: TITLE_FONT_SIZE,
+                    fontWeight: "500",
+                    color: theme.colors.foreground,
+                  }}
+                >
+                  {t("subagents.openPanel")}
+                </Text>
+                <View style={{ width: CHEVRON_BOX, height: CHEVRON_BOX, alignItems: "center", justifyContent: "center" }}>
+                  <Icon
+                    name="ChevronRight"
+                    size={CHEVRON_BOX}
+                    color={theme.colors[chevronColorToken(hovered, pressed)]}
+                  />
+                </View>
+              </>
+            )}
+          </Pressable>
+        </View>
+      );
+    }
+
+    return SubagentsPopover;
+  }
+
+  // ---- Full-view screen (pushes onto Paseo's screen stack; never creates a Workspace tab) -----
+
+  function SubagentsScreen({ theme, layout, host, navigation, params }: PluginScreenProps) {
     const { colors } = theme;
-    const { t } = useTranslation(messages);
-    const agentId = params.agentId;
+    const { t } = useAntigravityTranslation();
+    const agentId = typeof params.agentId === "string" ? params.agentId : "";
+    const paramSubagentId = typeof params.subagentId === "string" && params.subagentId ? params.subagentId : null;
     const agent = useAgent(agentId, (snapshot) => ({ provider: snapshot.provider, title: snapshot.title }));
-    const antigravity = isAntigravityProvider(agent?.provider);
+    const antigravity = Boolean(agentId) && isAntigravityProvider(agent?.provider);
     const query = useSubagents(agentId, antigravity);
     const list = query.data?.subagents ?? [];
-    const [selected, setSelected] = useState<string | null>(null);
+    const swarmTitle = query.data?.swarmTitle?.trim() || null;
+    const [selected, setSelected] = useState<string | null>(() => {
+      if (!agentId) return null;
+      return requested.get(agentId) ?? paramSubagentId;
+    });
     const [filter, setFilter] = useState<ListFilter>("all");
     const [search, setSearch] = useState("");
+    const backToAgent =
+      agentId && typeof navigation?.openAgent === "function"
+        ? () => navigation.openAgent({ agentId, serverId: host.id })
+        : undefined;
 
     useEffect(() => {
-      const wanted = requested.get(agentId);
+      const wanted = agentId ? requested.get(agentId) : undefined;
       if (wanted) {
         requested.delete(agentId);
         setSelected(wanted);
       } else {
-        setSelected(null);
+        setSelected(paramSubagentId);
       }
       setFilter("all");
       setSearch("");
-    }, [agentId, revision]);
+    }, [agentId, paramSubagentId]);
 
     const filtered = useMemo(() => {
       const q = search.trim().toLowerCase();
@@ -503,10 +1012,11 @@ export function createSubagentViews(client: PluginClientContext) {
         return (
           (subagent.role ?? "").toLowerCase().includes(q) ||
           (subagent.type ?? "").toLowerCase().includes(q) ||
+          (subagentTypeLabel(subagent.type, t) ?? "").toLowerCase().includes(q) ||
           subagent.task.toLowerCase().includes(q)
         );
       });
-    }, [list, filter, search]);
+    }, [list, filter, search, t]);
 
     const current =
       filtered.find((subagent) => subagent.id === selected) ??
@@ -515,15 +1025,102 @@ export function createSubagentViews(client: PluginClientContext) {
     const running = list.filter((subagent) => subagent.state === "running").length;
     const failedCount = list.filter((subagent) => subagent.state === "failed").length;
 
-    if (!antigravity) return <Empty colors={colors} icon="Bot" text={t("subagents.notAntigravity")} />;
-    if (query.isLoading) return <Empty colors={colors} icon="LoaderCircle" text="" />;
-    if (!list.length) return <Empty colors={colors} icon="Bot" text={t("subagents.empty")} />;
+    const backFab = backToAgent ? (
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={t("subagents.backToAgent")}
+        onPress={backToAgent}
+        style={(pressState) => ({
+          position: "absolute",
+          right: space.lg,
+          bottom: layout.compact ? space.xl : space.lg,
+          flexDirection: "row",
+          alignItems: "center",
+          gap: 6,
+          height: 38,
+          paddingHorizontal: 14,
+          borderRadius: radius.pill,
+          borderWidth: 1,
+          borderColor: colors.border,
+          backgroundColor:
+            (pressState as { hovered?: boolean }).hovered || pressState.pressed
+              ? colors.surface2
+              : colors.surface1,
+          shadowColor: "#000",
+          shadowOpacity: 0.16,
+          shadowRadius: 8,
+          shadowOffset: { width: 0, height: 3 },
+          elevation: 4,
+        })}
+      >
+        <Icon name="MessageSquare" size={14} color={colors.accent} />
+        <Text numberOfLines={1} style={{ ...font.small, fontWeight: "600", color: colors.foreground }}>
+          {t("subagents.backToAgent")}
+        </Text>
+      </Pressable>
+    ) : null;
+
+    if (!antigravity) {
+      return (
+        <View style={{ flex: 1, backgroundColor: colors.surface0 }}>
+          <Empty colors={colors} icon="Bot" text={t("subagents.notAntigravity")} />
+          {backFab}
+        </View>
+      );
+    }
+    if (query.isLoading && !query.data) {
+      return (
+        <View style={{ flex: 1, backgroundColor: colors.surface0 }}>
+          <Empty colors={colors} icon="LoaderCircle" text="" />
+          {backFab}
+        </View>
+      );
+    }
+    if (query.error && !query.data) {
+      return (
+        <View style={{ flex: 1, backgroundColor: colors.surface0 }}>
+          <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: space.sm, padding: space.xl }}>
+            <Icon name="CircleAlert" size={22} color={colors.statusDanger} />
+            <Text selectable style={{ ...font.small, color: colors.statusDanger, textAlign: "center" }}>
+              {errorMessage(query.error)}
+            </Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={t("retry")}
+              onPress={() => void query.refetch()}
+              style={{
+                marginTop: space.xs,
+                paddingHorizontal: space.md,
+                paddingVertical: space.xs + 2,
+                borderRadius: radius.md,
+                borderWidth: 1,
+                borderColor: colors.border,
+                backgroundColor: colors.surface1,
+              }}
+            >
+              <Text style={{ ...font.small, fontWeight: "500", color: colors.accent }}>{t("retry")}</Text>
+            </Pressable>
+          </View>
+          {backFab}
+        </View>
+      );
+    }
+    if (!list.length) {
+      return (
+        <View style={{ flex: 1, backgroundColor: colors.surface0 }}>
+          <Empty colors={colors} icon="Bot" text={t("subagents.empty")} />
+          {backFab}
+        </View>
+      );
+    }
 
     const header = (
       <View style={{ gap: space.sm, paddingHorizontal: space.md, paddingTop: space.md, paddingBottom: space.sm }}>
         <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm, paddingHorizontal: space.xs }}>
-          <Text style={{ ...font.heading, color: colors.foreground }}>{t("subagents.title")}</Text>
-          <Text style={{ ...font.small, ...tabular, color: colors.foregroundMuted }}>
+          <Text numberOfLines={1} style={{ ...font.heading, color: colors.foreground, flexShrink: 1 }}>
+            {swarmTitle ?? t("subagents.title")}
+          </Text>
+          <Text style={{ ...font.small, ...tabular, color: colors.foregroundMuted, flexShrink: 0 }}>
             {running ? t("subagents.summary", { total: list.length, running }) : t("subagents.summaryIdle", { total: list.length })}
           </Text>
         </View>
@@ -571,7 +1168,7 @@ export function createSubagentViews(client: PluginClientContext) {
     );
 
     const rows = (
-      <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingHorizontal: space.sm, paddingBottom: space.lg, gap: 2 }}>
+      <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingHorizontal: space.sm, paddingBottom: 72, gap: 2 }}>
         {filtered.length === 0 ? (
           <View style={{ padding: space.lg, alignItems: "center" }}>
             <Text style={{ ...font.caption, color: colors.foregroundMuted }}>{t("subagents.noMatches")}</Text>
@@ -612,6 +1209,7 @@ export function createSubagentViews(client: PluginClientContext) {
               compact
               onInsertReport={(text) => insertIntoComposer(agentId, text)}
             />
+            {backFab}
           </View>
         );
       }
@@ -619,6 +1217,7 @@ export function createSubagentViews(client: PluginClientContext) {
         <View style={{ flex: 1, backgroundColor: colors.surface0 }}>
           {header}
           {rows}
+          {backFab}
         </View>
       );
     }
@@ -643,11 +1242,210 @@ export function createSubagentViews(client: PluginClientContext) {
             <Empty colors={colors} icon="MousePointerClick" text={t("subagents.pick")} />
           )}
         </View>
+        {backFab}
       </View>
     );
   }
 
-  return { SubagentCardRow, SubagentCheckRow, SubagentsPanel, open };
+  return { SubagentCardRow, SubagentCheckRow, SubagentsPanel: SubagentsScreen, SubagentsScreen, open, makePopover };
+}
+
+function PopoverSubagentMark({ state, theme }: { state: SubagentState; theme: PopoverTheme }) {
+  const box = { width: MARK_BOX, height: MARK_BOX, alignItems: "center", justifyContent: "center" } as const;
+  if (state === "running") {
+    return (
+      <View style={box}>
+        <StatusRingMark size={MARK_BOX} color={ringColorFor(theme.colors.surface0)} />
+      </View>
+    );
+  }
+  if (state === "done") {
+    return (
+      <View style={box}>
+        <Icon name="CircleCheck" size={13} color={theme.colors.statusSuccess} />
+      </View>
+    );
+  }
+  if (state === "failed") {
+    return (
+      <View style={box}>
+        <Icon name="CircleAlert" size={13} color={theme.colors.statusDanger} />
+      </View>
+    );
+  }
+  const dotColor = state === "idle" ? theme.colors.statusWarning : theme.colors.foregroundMuted;
+  return (
+    <View style={box}>
+      <View
+        style={{
+          width: MARK_DOT_SIZE,
+          height: MARK_DOT_SIZE,
+          borderRadius: MARK_DOT_SIZE / 2,
+          backgroundColor: dotColor,
+        }}
+      />
+    </View>
+  );
+}
+
+function PopoverSubagentRow({
+  subagent,
+  theme,
+  compact,
+  t,
+  locale,
+  pricing,
+  onPress,
+}: {
+  subagent: SubagentSummary;
+  theme: PopoverTheme;
+  compact: boolean;
+  t: Translate;
+  locale: string;
+  pricing: PricingState | undefined;
+  onPress: () => void;
+}) {
+  const isRunning = subagent.state === "running";
+  const isSwarm = subagent.origin === "swarm";
+  const typeLabel = subagentTypeLabel(subagent.type, t);
+  const title = subagent.role ?? typeLabel ?? subagent.id.slice(0, 8);
+  const activity = activityLine(subagent, t);
+  const thinking = isRunning && subagent.phase === "thinking";
+  const fact = isRunning && activity ? activity : metaLine(subagent, t, locale, pricing);
+  const isToolActivity = isRunning && Boolean(activity) && !thinking;
+
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`${title} · ${t(`subagents.state.${subagent.state}`)}`}
+      style={({ hovered = false, pressed }: HoverState) => {
+        const fill = rowActiveFill(hovered, pressed);
+        return [rowBox({ compact }), fill === undefined ? undefined : { backgroundColor: theme.colors[fill] }];
+      }}
+    >
+      {({ hovered = false, pressed }: HoverState) => (
+        <>
+          <PopoverSubagentMark state={subagent.state} theme={theme} />
+          <View style={rowTextColumn()}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6, minWidth: 0 }}>
+              <Text
+                numberOfLines={1}
+                style={{
+                  fontSize: TITLE_FONT_SIZE,
+                  lineHeight: 20,
+                  fontWeight: isRunning ? "500" : "400",
+                  color: theme.colors.foreground,
+                  flexShrink: 1,
+                }}
+              >
+                {title}
+              </Text>
+              {isSwarm ? (
+                <PopoverPill theme={theme} label={t("subagents.swarmTag")} tone="neutral" compact />
+              ) : typeLabel && subagent.role ? (
+                <Text
+                  numberOfLines={1}
+                  style={{
+                    fontSize: 11,
+                    lineHeight: 16,
+                    color: theme.colors.foregroundMuted,
+                    flexShrink: 2,
+                  }}
+                >
+                  {typeLabel}
+                </Text>
+              ) : null}
+            </View>
+            <Text
+              numberOfLines={1}
+              style={{
+                fontSize: FACTS_FONT_SIZE,
+                lineHeight: 16,
+                color: theme.colors.foregroundMuted,
+                ...tabular,
+                ...(thinking ? { fontStyle: "italic" as const } : isToolActivity ? { fontFamily: mono } : null),
+              }}
+            >
+              {fact}
+            </Text>
+          </View>
+          <View style={{ width: CHEVRON_BOX, height: CHEVRON_BOX, alignItems: "center", justifyContent: "center" }}>
+            <Icon
+              name="ChevronRight"
+              size={CHEVRON_BOX}
+              color={theme.colors[chevronColorToken(hovered, pressed)]}
+            />
+          </View>
+        </>
+      )}
+    </Pressable>
+  );
+}
+
+function SettledSectionHeader({
+  theme,
+  label,
+  count,
+  expanded,
+  compact,
+  onToggle,
+}: {
+  theme: PopoverTheme;
+  label: string;
+  count: number;
+  expanded: boolean;
+  compact: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <Pressable
+      onPress={onToggle}
+      accessibilityRole="button"
+      accessibilityLabel={`${label}, ${String(count)}`}
+      accessibilityState={{ expanded }}
+      {...(Platform.OS === "web" ? { "aria-expanded": expanded } : null)}
+      style={({ hovered = false, pressed }: HoverState) => {
+        const fill = rowActiveFill(hovered, pressed);
+        return [rowBox({ compact }), fill === undefined ? undefined : { backgroundColor: theme.colors[fill] }];
+      }}
+    >
+      {({ hovered = false, pressed }: HoverState) => (
+        <>
+          <Text numberOfLines={1} style={{ ...rowTextColumn(), fontSize: TITLE_FONT_SIZE, color: theme.colors.foreground }}>
+            {label}
+          </Text>
+          <Text
+            numberOfLines={1}
+            style={{
+              ...tabular,
+              flexShrink: 2,
+              minWidth: 0,
+              fontSize: FACTS_FONT_SIZE,
+              color: theme.colors.foregroundMuted,
+            }}
+          >
+            {String(count)}
+          </Text>
+          <View
+            style={{
+              width: CHEVRON_BOX,
+              height: CHEVRON_BOX,
+              alignItems: "center",
+              justifyContent: "center",
+              transform: chevronRotation(expanded),
+            }}
+          >
+            <Icon
+              name="ChevronRight"
+              size={CHEVRON_BOX}
+              color={theme.colors[chevronColorToken(hovered, pressed)]}
+            />
+          </View>
+        </>
+      )}
+    </Pressable>
+  );
 }
 
 function Empty({ colors, icon, text }: { colors: Colors; icon: string; text: string }) {
@@ -674,10 +1472,13 @@ function ListRow({
   onPress(): void;
   t: Translate;
 }) {
-  const { locale } = useTranslation(messages);
+  const { locale } = useAntigravityTranslation();
   const pricing = useUnifiedPricing();
   const color = toneColor(colors, STATE_TONE[subagent.state]);
   const activity = activityLine(subagent, t);
+  const isSwarm = subagent.origin === "swarm";
+  const typeLabel = subagentTypeLabel(subagent.type, t);
+  const parentTypeLabel = parent ? subagentTypeLabel(parent.type, t) : null;
   return (
     <Pressable
       accessibilityRole="button"
@@ -698,22 +1499,28 @@ function ListRow({
       })}
     >
       <View style={{ paddingTop: 3 }}>
-        <Icon name={STATE_ICON[subagent.state]} size={14} color={color} />
+        {subagent.state === "running" ? (
+          <StatusRingMark size={14} ring={12} color={ringColorFor(colors.surface0)} />
+        ) : (
+          <Icon name={STATE_ICON[subagent.state]} size={14} color={color} />
+        )}
       </View>
       <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: space.xs }}>
           <Text numberOfLines={1} style={{ ...font.small, fontWeight: "600", color: colors.foreground, flexShrink: 1 }}>
-            {subagent.role ?? subagent.type ?? subagent.id.slice(0, 8)}
+            {subagent.role ?? typeLabel ?? subagent.id.slice(0, 8)}
           </Text>
-          {subagent.type && subagent.role ? (
+          {isSwarm ? (
+            <Badge colors={colors} label={t("subagents.swarmTag")} tone="neutral" style={{ flexShrink: 0 }} />
+          ) : typeLabel && subagent.role ? (
             <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted }}>
-              {subagent.type}
+              {typeLabel}
             </Text>
           ) : null}
         </View>
         {parent ? (
           <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted }}>
-            {t("subagents.nested", { role: parent.role ?? parent.type ?? parent.id.slice(0, 8) })}
+            {t("subagents.nested", { role: parent.role ?? parentTypeLabel ?? parent.id.slice(0, 8) })}
           </Text>
         ) : null}
         {activity ? (
@@ -806,7 +1613,7 @@ function Detail({
   compact: boolean;
   onInsertReport(text: string): boolean;
 }) {
-  const { t, locale } = useTranslation(messages);
+  const { t, locale } = useAntigravityTranslation();
   const toast = useToast();
   const read = useRpc(subagentDetailRpc);
   const pricing = useUnifiedPricing();
@@ -876,20 +1683,31 @@ function Detail({
     .filter(Boolean)
     .join(" · ");
 
+  const typeLabel = subagentTypeLabel(summary.type, t);
+
   return (
-    <ScrollView ref={scrollRef} style={{ flex: 1 }} contentContainerStyle={{ padding: pad, gap: space.xl }}>
+    <ScrollView ref={scrollRef} style={{ flex: 1 }} contentContainerStyle={{ padding: pad, paddingBottom: pad + 56, gap: space.xl }}>
       <View style={{ gap: space.sm }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, flexWrap: "wrap" }}>
-          <Text style={{ ...font.title, color: colors.foreground }}>{summary.role ?? summary.type ?? summary.id.slice(0, 8)}</Text>
-          {summary.type && summary.role ? <Badge colors={colors} label={summary.type} /> : null}
-          <Badge colors={colors} label={t(`subagents.state.${summary.state}`)} tone={STATE_TONE[summary.state]} dot />
+          <Text style={{ ...font.title, color: colors.foreground }}>{summary.role ?? typeLabel ?? summary.id.slice(0, 8)}</Text>
+          {summary.origin === "swarm" ? (
+            <Badge colors={colors} label={t("subagents.swarmTag")} tone="neutral" />
+          ) : typeLabel && summary.role ? (
+            <Badge colors={colors} label={typeLabel} />
+          ) : null}
+          <Badge
+            colors={colors}
+            label={t(`subagents.state.${summary.state}`)}
+            tone={STATE_TONE[summary.state]}
+            icon={statusBadgeIcon(summary.state, toneColor(colors, STATE_TONE[summary.state]))}
+          />
           <View style={{ flex: 1 }} />
           {entries.length > 0 ? (
             <Pressable
               accessibilityRole="button"
               accessibilityLabel={t("subagents.copyTranscript")}
               onPress={() => {
-                const md = transcriptToMarkdown(summary, entries, detail?.report ?? null);
+                const md = transcriptToMarkdown(summary, entries, detail?.report ?? null, t);
                 void copyText(md).then(() => toast.show(t("subagents.transcriptCopied"), { durationMs: 2500 }));
               }}
               style={{ flexDirection: "row", alignItems: "center", gap: 4, padding: space.xs }}
@@ -902,6 +1720,35 @@ function Detail({
         <Text style={{ ...font.small, ...tabular, color: colors.foregroundMuted }}>{facts}</Text>
         <TokenBar colors={colors} summary={summary} t={t} />
       </View>
+
+      {query.error && !detail ? (
+        <View
+          style={{
+            flexDirection: "row",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: space.sm,
+            padding: space.md,
+            borderRadius: radius.md,
+            backgroundColor: tint(colors.statusDanger, 0.1),
+          }}
+        >
+          <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, flex: 1 }}>
+            <Icon name="CircleAlert" size={15} color={colors.statusDanger} />
+            <Text selectable style={{ ...font.small, color: colors.statusDanger, flex: 1 }}>
+              {errorMessage(query.error)}
+            </Text>
+          </View>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={t("retry")}
+            onPress={() => void query.refetch()}
+            style={{ paddingHorizontal: space.sm, paddingVertical: space.xs }}
+          >
+            <Text style={{ ...font.small, fontWeight: "500", color: colors.accent }}>{t("retry")}</Text>
+          </Pressable>
+        </View>
+      ) : null}
 
       {task?.text ? (
         <Section colors={colors} title={t("subagents.task")}>
@@ -1252,7 +2099,7 @@ function ToolRow({ colors, tool, t }: { colors: Colors; tool: TranscriptEntry["t
       >
         <Icon name={tool.failed ? "CircleAlert" : icon} size={13} color={color} />
         <Text numberOfLines={1} style={{ ...font.caption, fontFamily: mono, color: colors.foreground }}>
-          {tool.name}
+          {toolLabel(tool.name)}
         </Text>
         <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted, flex: 1 }}>
           {tool.summary}
@@ -1273,6 +2120,378 @@ function ToolRow({ colors, tool, t }: { colors: Colors; tool: TranscriptEntry["t
             {tool.output}
           </Text>
         </View>
+      ) : null}
+    </View>
+  );
+}
+
+function popoverStatePillTone(state: SubagentState): PopoverPillTone {
+  switch (state) {
+    case "running":
+      return "running";
+    case "done":
+      return "success";
+    case "failed":
+      return "danger";
+    case "idle":
+      return "warning";
+    case "stopped":
+      return "neutral";
+  }
+}
+
+/**
+ * In-place subagent detail view rendered directly inside the composer popover
+ * (matching DSH `team-popover.tsx`'s `TaskDetail`), so inspecting a subagent
+ * never opens a new Paseo tab unless the user explicitly taps "Open in tab".
+ */
+function PopoverSubagentDetail({
+  theme,
+  compact,
+  agentId,
+  summary,
+  pricing,
+  onBack,
+  onOpenInTab,
+  onInsertReport,
+}: {
+  theme: PopoverTheme;
+  compact: boolean;
+  agentId: string;
+  summary: SubagentSummary;
+  pricing?: PricingState;
+  onBack: () => void;
+  onOpenInTab?: () => void;
+  onInsertReport: (text: string) => boolean;
+}) {
+  const { colors } = theme;
+  const { t, locale } = useAntigravityTranslation();
+  const toast = useToast();
+  const read = useRpc(subagentDetailRpc);
+  const [openArtifact, setOpenArtifact] = useState<string | null>(null);
+
+  const query = useQuery({
+    queryKey: ["antigravity-accounts", "subagent", agentId, summary.id],
+    queryFn: () => read({ agentId, subagentId: summary.id }),
+    staleTime: 1000,
+    refetchInterval: summary.state === "running" ? 3000 : false,
+  });
+  const detail = query.data;
+  const entries = detail?.entries ?? [];
+  const artifacts = detail?.artifacts ?? [];
+  const taskText = entries.find((entry) => entry.kind === "task")?.text || summary.task;
+  const rawActivity = entries.filter((entry) => entry.kind !== "task");
+  const recentActivity = rawActivity.slice(-20);
+  const reportText = detail?.report?.trim() ?? "";
+
+  const end =
+    summary.reportedAt && summary.updatedAt
+      ? Date.parse(summary.reportedAt) >= Date.parse(summary.updatedAt)
+        ? summary.reportedAt
+        : summary.updatedAt
+      : (summary.reportedAt ?? summary.updatedAt);
+  const took = since(summary.startedAt, end, locale);
+  const est = estimateSubagentCost(summary, pricing);
+  const facts = [
+    summary.model,
+    t("subagents.steps", { count: summary.steps }),
+    t("subagents.calls", { count: summary.tools }),
+    took,
+    est !== null ? `~${money(est.cost, est.currency, locale)}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const typeLabel = subagentTypeLabel(summary.type, t);
+  const title = summary.role ?? typeLabel ?? summary.id.slice(0, 8);
+  const pillTone = popoverStatePillTone(summary.state);
+  const pillLeading =
+    summary.state === "running" ? (
+      <View style={{ width: 12, height: 12, alignItems: "center", justifyContent: "center" }}>
+        <StatusRingMark size={12} ring={10} color={ringColorFor(theme.colors.surface0)} />
+      </View>
+    ) : (
+      <View style={{ width: 12, height: 12, alignItems: "center", justifyContent: "center" }}>
+        <Icon name={STATE_ICON[summary.state]} size={11} color={toneColor(colors, STATE_TONE[summary.state])} />
+      </View>
+    );
+
+  return (
+    <View style={{ ...popoverRootBox(), paddingBottom: 12 }}>
+      <View
+        style={{
+          flexDirection: "row",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 8,
+          paddingHorizontal: 4,
+          paddingTop: 4,
+          paddingBottom: 2,
+        }}
+      >
+        <Pressable
+          onPress={onBack}
+          accessibilityRole="button"
+          accessibilityLabel={t("subagents.back")}
+          style={({ hovered = false, pressed }: HoverState) => {
+            const fill = rowActiveFill(hovered, pressed);
+            return [
+              {
+                flexDirection: "row",
+                alignItems: "center",
+                gap: 4,
+                minHeight: compact ? 36 : 28,
+                paddingLeft: 4,
+                paddingRight: 10,
+                paddingVertical: compact ? 6 : 4,
+                borderRadius: 6,
+              },
+              fill === undefined ? undefined : { backgroundColor: theme.colors[fill] },
+            ];
+          }}
+        >
+          {({ hovered = false, pressed }: HoverState) => (
+            <>
+              <Icon name="ChevronLeft" size={16} color={theme.colors[chevronColorToken(hovered, pressed)]} />
+              <Text
+                numberOfLines={1}
+                style={{ fontSize: 13, fontWeight: "500", color: theme.colors[chevronColorToken(hovered, pressed)] }}
+              >
+                {t("subagents.back")}
+              </Text>
+            </>
+          )}
+        </Pressable>
+
+        {onOpenInTab ? (
+          <Pressable
+            onPress={onOpenInTab}
+            accessibilityRole="button"
+            accessibilityLabel={t("subagents.openInTab")}
+            style={({ hovered = false, pressed }: HoverState) => {
+              const fill = rowActiveFill(hovered, pressed);
+              return [
+                {
+                  flexDirection: "row",
+                  alignItems: "center",
+                  gap: 4,
+                  minHeight: compact ? 36 : 28,
+                  paddingHorizontal: 8,
+                  paddingVertical: compact ? 6 : 4,
+                  borderRadius: 6,
+                },
+                fill === undefined ? undefined : { backgroundColor: theme.colors[fill] },
+              ];
+            }}
+          >
+            <Icon name="PanelRightOpen" size={13} color={colors.accent} />
+            <Text numberOfLines={1} style={{ fontSize: 12, fontWeight: "500", color: colors.accent }}>
+              {t("subagents.openInTab")}
+            </Text>
+          </Pressable>
+        ) : null}
+      </View>
+
+      <View style={{ paddingHorizontal: 12, paddingTop: 6, gap: 8 }}>
+        <View style={{ flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 6 }}>
+          <Text
+            selectable
+            style={{
+              fontSize: POPOVER_DETAIL_TITLE_SIZE,
+              lineHeight: POPOVER_DETAIL_TITLE_LINE,
+              fontWeight: "600",
+              color: colors.foreground,
+              flexShrink: 1,
+            }}
+          >
+            {title}
+          </Text>
+          {summary.origin === "swarm" ? (
+            <PopoverPill theme={theme} label={t("subagents.swarmTag")} tone="neutral" compact />
+          ) : typeLabel && summary.role ? (
+            <PopoverPill theme={theme} label={typeLabel} tone="neutral" compact />
+          ) : null}
+          <PopoverPill
+            theme={theme}
+            label={t(`subagents.state.${summary.state}`)}
+            tone={pillTone}
+            leading={pillLeading}
+            compact
+          />
+        </View>
+        {facts ? (
+          <Text style={{ fontSize: FACTS_FONT_SIZE, lineHeight: 16, ...tabular, color: colors.foregroundMuted }}>
+            {facts}
+          </Text>
+        ) : null}
+        <TokenBar colors={colors} summary={summary} t={t} />
+      </View>
+
+      {taskText ? (
+        <>
+          <PopoverHairline theme={theme} inset={12} marginVertical={10} />
+          <View style={{ paddingHorizontal: 12, gap: 6 }}>
+            <Text style={{ fontSize: 11.5, lineHeight: 16, fontWeight: "600", color: colors.foregroundMuted }}>
+              {t("subagents.task")}
+            </Text>
+            <Expandable colors={colors} height={96} background={colors.surface0} t={t}>
+              <Text selectable style={{ ...font.small, color: colors.foreground }}>
+                {taskText}
+              </Text>
+            </Expandable>
+          </View>
+        </>
+      ) : null}
+
+      {query.isLoading && !detail ? (
+        <>
+          <PopoverHairline theme={theme} inset={12} marginVertical={10} />
+          <View style={{ paddingHorizontal: 12 }}>
+            <Text style={{ fontSize: FACTS_FONT_SIZE, color: colors.foregroundMuted }}>{t("loading")}</Text>
+          </View>
+        </>
+      ) : query.error && !detail ? (
+        <>
+          <PopoverHairline theme={theme} inset={12} marginVertical={10} />
+          <View style={{ paddingHorizontal: 12, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <Text selectable style={{ fontSize: FACTS_FONT_SIZE, color: colors.statusDanger, flex: 1 }}>
+              {errorMessage(query.error)}
+            </Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={t("retry")}
+              onPress={() => void query.refetch()}
+              style={{ paddingHorizontal: 6, paddingVertical: 2 }}
+            >
+              <Text style={{ fontSize: FACTS_FONT_SIZE, fontWeight: "500", color: colors.accent }}>{t("retry")}</Text>
+            </Pressable>
+          </View>
+        </>
+      ) : reportText ? (
+        <>
+          <PopoverHairline theme={theme} inset={12} marginVertical={10} />
+          <View style={{ paddingHorizontal: 12, gap: 6 }}>
+            <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+              <Text style={{ fontSize: 11.5, lineHeight: 16, fontWeight: "600", color: colors.foregroundMuted }}>
+                {t("subagents.report")}
+              </Text>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={t("subagents.insertReport")}
+                  onPress={() => {
+                    const ok = onInsertReport(reportText);
+                    toast.show(ok ? t("subagents.insertedReport") : t("subagents.composerUnavailable"), { durationMs: 2500 });
+                  }}
+                  style={{ flexDirection: "row", alignItems: "center", gap: 4, paddingVertical: 2 }}
+                >
+                  <Icon name="CornerDownLeft" size={13} color={colors.accent} />
+                  <Text style={{ ...font.caption, fontWeight: "500", color: colors.accent }}>
+                    {t("subagents.insertReport")}
+                  </Text>
+                </Pressable>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={t("subagents.copy")}
+                  onPress={() => {
+                    void copyText(reportText).then(() => toast.show(t("subagents.copied"), { durationMs: 2500 }));
+                  }}
+                  style={{ padding: 2 }}
+                >
+                  <Icon name="Copy" size={13} color={colors.foregroundMuted} />
+                </Pressable>
+              </View>
+            </View>
+            <Expandable colors={colors} height={240} background={colors.surface0} t={t}>
+              <Markdown>{reportText}</Markdown>
+            </Expandable>
+          </View>
+        </>
+      ) : summary.state === "running" ? (
+        <>
+          <PopoverHairline theme={theme} inset={12} marginVertical={10} />
+          <View style={{ paddingHorizontal: 12 }}>
+            <Text style={{ ...font.caption, color: colors.foregroundMuted, fontStyle: "italic" }}>
+              {t("subagents.runningNoReport")}
+            </Text>
+          </View>
+        </>
+      ) : null}
+
+      {artifacts.length > 0 ? (
+        <>
+          <PopoverHairline theme={theme} inset={12} marginVertical={10} />
+          <View style={{ paddingHorizontal: 12, gap: 6 }}>
+            <Text style={{ fontSize: 11.5, lineHeight: 16, fontWeight: "600", color: colors.foregroundMuted }}>
+              {`${t("subagents.artifacts")} (${artifacts.length})`}
+            </Text>
+            {artifacts.map((artifact) => {
+              const isOpen = openArtifact === artifact.path;
+              return (
+                <View key={artifact.path} style={{ gap: space.xs }}>
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityState={{ expanded: isOpen }}
+                    onPress={() => setOpenArtifact(isOpen ? null : artifact.path)}
+                    style={({ hovered = false, pressed }: HoverState) => {
+                      const fill = rowActiveFill(hovered, pressed);
+                      return [
+                        {
+                          flexDirection: "row",
+                          alignItems: "center",
+                          gap: 6,
+                          paddingVertical: 4,
+                          paddingHorizontal: 6,
+                          marginHorizontal: -6,
+                          borderRadius: 6,
+                        },
+                        fill === undefined ? undefined : { backgroundColor: theme.colors[fill] },
+                      ];
+                    }}
+                  >
+                    <Icon
+                      name={artifact.isMarkdown ? "FileText" : "File"}
+                      size={13}
+                      color={isOpen ? colors.accent : colors.foregroundMuted}
+                    />
+                    <Text numberOfLines={1} style={{ ...font.caption, fontFamily: mono, color: colors.foreground, flex: 1 }}>
+                      {artifact.path}
+                    </Text>
+                    <Text style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}>
+                      {formatBytes(artifact.size)}
+                    </Text>
+                    <Icon name={isOpen ? "ChevronDown" : "ChevronRight"} size={13} color={colors.foregroundMuted} />
+                  </Pressable>
+                  {isOpen ? (
+                    <ArtifactPreview colors={colors} agentId={agentId} subagentId={summary.id} artifact={artifact} t={t} />
+                  ) : null}
+                </View>
+              );
+            })}
+          </View>
+        </>
+      ) : null}
+
+      {recentActivity.length > 0 ? (
+        <>
+          <PopoverHairline theme={theme} inset={12} marginVertical={10} />
+          <View style={{ paddingHorizontal: 12, gap: 8 }}>
+            <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+              <Text style={{ fontSize: 11.5, lineHeight: 16, fontWeight: "600", color: colors.foregroundMuted }}>
+                {t("subagents.activity")}
+              </Text>
+              {rawActivity.length > recentActivity.length ? (
+                <Text style={{ ...font.caption, color: colors.foregroundMuted }}>
+                  {t("subagents.truncated", { count: recentActivity.length })}
+                </Text>
+              ) : null}
+            </View>
+            <View style={{ gap: space.sm }}>
+              {recentActivity.map((entry) => (
+                <EntryRow key={entry.index} colors={colors} entry={entry} t={t} locale={locale} />
+              ))}
+            </View>
+          </View>
+        </>
       ) : null}
     </View>
   );

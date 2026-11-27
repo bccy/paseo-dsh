@@ -50,7 +50,7 @@ function readKinds(source) {
         if (name === './messages') return { errorMessage: String, messages: { message: (k) => ({ key: k }) } };
         if (name === './questions') return { AskQuestionRow: () => null };
         if (name === './sidebar') return { QuotaSidebarItem: () => null };
-        if (name === './subagents') return { SUBAGENT_PANEL_ID: 'subagents', createSubagentViews: () => ({ open: noop, SubagentCardRow: () => null, SubagentCheckRow: () => null, SubagentsPanel: () => null }) };
+        if (name === './subagents') return { SUBAGENT_PANEL_ID: 'subagents', SUBAGENT_SCREEN_ID: 'antigravity-subagents', createSubagentViews: () => ({ open: noop, makePopover: () => () => null, SubagentCardRow: () => null, SubagentCheckRow: () => null, SubagentsPanel: () => null, SubagentsScreen: () => null }) };
         if (name === './timeline') return { FallbackNote: () => null };
         if (name === './transform') {
           const txFile = path.join(build, 'client/antigravity/transform.js');

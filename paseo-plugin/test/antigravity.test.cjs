@@ -32,6 +32,7 @@ const {
   shouldRegisterAntigravityOpenHookSync,
 } = require("../server/antigravity/paths.ts");
 const { ContextReader, conversationIdFrom } = require("../server/antigravity/context.ts");
+const { SubagentReader } = require("../server/antigravity/subagents.ts");
 const { registerAntigravityServer } = require("../server/antigravity/index.ts");
 const { detectDshPresence, isDshBinaryResolvable } = require("../index.server.ts");
 const { createAntigravityTimelineTransforms } = require("../client/antigravity/transform.ts");
@@ -1144,5 +1145,2134 @@ test("client and shared modules never declare a top-level `key` identifier (pres
       topLevelKey,
       `Top-level \`key\` in ${path.relative(pluginRoot, file)} causes esbuild to rename __copyProps's \`key\` to \`key2\`, breaking Paseo's Hermes eager interop rewrite`,
     );
+  }
+});
+
+// ============================================================================
+// 8. Antigravity `/swarm` & subagent discovery, state transitions, board reports, counts, and timeline transforms
+// ============================================================================
+
+function writeJsonl(filePath, rows) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+}
+
+function makeFakeContextReader(mapping) {
+  return {
+    async conversationOf(_paseo, agentId) {
+      return mapping[agentId] ?? null;
+    },
+  };
+}
+
+test("SubagentReader discovers swarm workers + subagents from members.json, subagents/*.json, board.jsonl, and transcript.jsonl with accurate states and sorting", async (t) => {
+  const cliDir = makeTempDir(t, "paseo-ag-swarm-");
+  const parentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const workingId = "11111111-1111-4111-8111-111111111111";
+  const waitingDoneId = "22222222-2222-4222-8222-222222222222";
+  const waitingIdleId = "33333333-3333-4333-8333-333333333333";
+  const killedAfterDoneId = "44444444-4444-4444-8444-444444444444";
+  const killedMidWorkId = "55555555-5555-4555-8555-555555555555";
+  const failedWorkerId = "66666666-6666-4666-8666-666666666666";
+  const registrySubagentId = "77777777-7777-4777-8777-777777777777";
+  const nestedChildId = "88888888-8888-4888-8888-888888888888";
+  const foreignTranscriptChildId = "99999999-9999-4999-8999-999999999999";
+  const transcriptOnlySwarmId = "abababab-abab-4aba-8aba-abababababab";
+
+  const now = Date.now();
+  const iso = (offsetMs) => new Date(now + offsetMs).toISOString();
+  const parentBrain = path.join(cliDir, "brain", parentId);
+
+  // Parent transcript: swarm add (single + sharded) + swarm kill (prefix match) + foreign invoke_subagent
+  writeJsonl(path.join(parentBrain, ".system_generated", "logs", "transcript.jsonl"), [
+    {
+      step_index: 0,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: iso(-60_000),
+      tool_calls: [
+        {
+          name: "swarm",
+          args: { action: '"add"', name: '"backend"', brief: '"Implement backend API"' },
+        },
+        {
+          name: "swarm",
+          args: { action: '"add"', name: '"shard"', brief: '"Shard work"' },
+        },
+        {
+          name: "invoke_subagent",
+          args: { Role: '"foreign"', TypeName: '"explorer"', Prompt: '"Should be rejected"' },
+        },
+      ],
+    },
+    {
+      step_index: 1,
+      type: "GENERIC",
+      status: "DONE",
+      created_at: iso(-59_000),
+      content: JSON.stringify({
+        status: "added",
+        name: "backend",
+        model: "gemini-4-neon-high",
+        conversation_id: workingId,
+      }),
+    },
+    {
+      step_index: 2,
+      type: "GENERIC",
+      status: "DONE",
+      created_at: iso(-58_000),
+      content: JSON.stringify({
+        status: "added",
+        workers: [
+          { name: "shard-1", conversation_id: killedMidWorkId, model: "gemini-4-neon-high" },
+          { name: "shard-2", conversation_id: transcriptOnlySwarmId, model: "gemini-4-neon-high" },
+        ],
+      }),
+    },
+    {
+      step_index: 3,
+      type: "GENERIC",
+      status: "DONE",
+      created_at: iso(-57_000),
+      content: `Created the following subagent: {"conversationId":"${foreignTranscriptChildId}"}`,
+    },
+    {
+      step_index: 4,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: iso(-10_000),
+      tool_calls: [
+        { name: "swarm", args: { action: '"kill"', name: '"shard"' } },
+      ],
+    },
+    {
+      step_index: 5,
+      type: "GENERIC",
+      status: "DONE",
+      created_at: iso(-9_500),
+      content: '{"status":"killed","name":"shard"}',
+    },
+  ]);
+
+  // Parent `.system_generated/swarm/members.json`
+  writeJson(path.join(parentBrain, ".system_generated", "swarm", "members.json"), {
+    title: "Refactor Subagents & Swarm",
+    members: {
+      coordinator: {
+        conversation_id: parentId,
+        role: "coordinator",
+        wake_mode: "mentions",
+        killed: false,
+        model: "gemini-4-neon-high",
+      },
+      backend: {
+        conversation_id: workingId,
+        role: "worker",
+        wake_mode: "working",
+        killed: false,
+        applied_model: "gemini-4-neon-high",
+      },
+      "ui-done": {
+        conversation_id: waitingDoneId,
+        role: "worker",
+        wake_mode: "waiting",
+        killed: false,
+        model: "gemini-4-carbon-high",
+      },
+      verifier: {
+        conversation_id: waitingIdleId,
+        role: "worker",
+        wake_mode: "mentions",
+        killed: false,
+        model: "gemini-4-neon-high",
+      },
+      "killed-done": {
+        conversation_id: killedAfterDoneId,
+        role: "worker",
+        wake_mode: "waiting",
+        killed: true,
+        phase: "KILLED",
+        model: "gemini-4-neon-high",
+      },
+      "shard-1": {
+        conversation_id: killedMidWorkId,
+        role: "worker",
+        wake_mode: "working",
+        killed: true,
+        desired_state: "KILLED",
+        model: "gemini-4-neon-high",
+      },
+      broken: {
+        conversation_id: failedWorkerId,
+        role: "worker",
+        wake_mode: "working",
+        killed: false,
+        model: "gemini-4-neon-high",
+      },
+    },
+  });
+
+  // Parent `.system_generated/subagents/*.json` (includes a regular subagent + a swarm worker)
+  writeJson(path.join(parentBrain, ".system_generated", "subagents", `${registrySubagentId}.json`), {
+    conversationId: registrySubagentId,
+    subagentDescriptor: { typeName: "explorer", role: "Repo Auditor" },
+    state: "SUBAGENT_STATE_ALIVE",
+  });
+  writeJson(path.join(parentBrain, ".system_generated", "subagents", `${workingId}.json`), {
+    conversationId: workingId,
+    subagentDescriptor: { typeName: "worker", role: "Swarm Worker (backend)" },
+    state: "SUBAGENT_STATE_ALIVE",
+  });
+
+  // Parent `.system_generated/swarm/board.jsonl`
+  writeJsonl(path.join(parentBrain, ".system_generated", "swarm", "board.jsonl"), [
+    { seq: 1, agent: "coordinator", text: "@backend Own server + contracts", timestamp: iso(-55_000) },
+    { seq: 2, agent: "coordinator", text: "@ui-done Build popover UI", timestamp: iso(-54_000) },
+    { seq: 3, agent: "coordinator", text: "@killed-done Ship quick fix", timestamp: iso(-53_000) },
+    { seq: 4, agent: "ui-done", text: "Interim update on popover", timestamp: iso(-40_000) },
+    { seq: 5, agent: "ui-done", text: "@coordinator [done] Popover ready and tested", timestamp: iso(-20_000) },
+    { seq: 6, agent: "killed-done", text: "@coordinator [done] Quick fix landed", timestamp: iso(-25_000) },
+  ]);
+
+  // 1. workingId: step 0 sender=system, step 1 sender=parentId, actively calling read_file
+  writeJsonl(path.join(cliDir, "brain", workingId, ".system_generated", "logs", "transcript.jsonl"), [
+    {
+      step_index: 0,
+      type: "SYSTEM_MESSAGE",
+      status: "DONE",
+      created_at: iso(-55_000),
+      content: "<SYSTEM_MESSAGE>[Message] sender=system content=[swarm] new board message #1</SYSTEM_MESSAGE>",
+    },
+    {
+      step_index: 1,
+      type: "SYSTEM_MESSAGE",
+      status: "DONE",
+      created_at: iso(-54_900),
+      content: `<SYSTEM_MESSAGE>[Message] sender=${parentId} content=Own server + contracts</SYSTEM_MESSAGE>`,
+    },
+    {
+      step_index: 2,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: iso(-5_000),
+      model: "gemini-4-neon-high",
+      input_tokens: 1200,
+      output_tokens: 300,
+      tool_calls: [{ name: "read_file", args: { Path: '"/repo/subagents.ts"' } }],
+    },
+    {
+      step_index: 3,
+      type: "GENERIC",
+      status: "RUNNING",
+      created_at: iso(-4_000),
+      content: "reading...",
+    },
+  ]);
+
+  // Nested subagent spawned by workingId
+  writeJson(path.join(cliDir, "brain", workingId, ".system_generated", "subagents", `${nestedChildId}.json`), {
+    conversationId: nestedChildId,
+    subagentDescriptor: { typeName: "helper", role: "Schema Check" },
+    state: "SUBAGENT_STATE_ALIVE",
+  });
+  writeJsonl(path.join(cliDir, "brain", nestedChildId, ".system_generated", "logs", "transcript.jsonl"), [
+    {
+      step_index: 0,
+      type: "SYSTEM_MESSAGE",
+      status: "DONE",
+      created_at: iso(-4_500),
+      content: `<SYSTEM_MESSAGE>[Message] sender=${workingId} content=Verify schema</SYSTEM_MESSAGE>`,
+    },
+    {
+      step_index: 1,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: iso(-3_000),
+      content: "Looks good",
+    },
+  ]);
+
+  // 2. waitingDoneId: parked on swarm_wait after posting @coordinator [done]
+  writeJsonl(path.join(cliDir, "brain", waitingDoneId, ".system_generated", "logs", "transcript.jsonl"), [
+    {
+      step_index: 0,
+      type: "SYSTEM_MESSAGE",
+      status: "DONE",
+      created_at: iso(-54_000),
+      content: "<SYSTEM_MESSAGE>[Message] sender=system content=[swarm] new board message #2</SYSTEM_MESSAGE>",
+    },
+    {
+      step_index: 1,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: iso(-21_000),
+      tool_calls: [
+        { name: "post_message", args: { text: '"@coordinator [done] Popover ready and tested"' } },
+        { name: "swarm_wait", args: { since: "5" } },
+      ],
+    },
+    { step_index: 2, type: "GENERIC", status: "DONE", created_at: iso(-20_500), content: '{"seq":5}' },
+    { step_index: 3, type: "GENERIC", status: "DONE", created_at: iso(-20_000), content: "waiting" },
+  ]);
+
+  // 3. waitingIdleId: parked on swarm_wait without any board report yet -> idle
+  writeJsonl(path.join(cliDir, "brain", waitingIdleId, ".system_generated", "logs", "transcript.jsonl"), [
+    {
+      step_index: 0,
+      type: "SYSTEM_MESSAGE",
+      status: "DONE",
+      created_at: iso(-50_000),
+      content: "<SYSTEM_MESSAGE>[Message] sender=system content=[swarm] new board message #4</SYSTEM_MESSAGE>",
+    },
+    {
+      step_index: 1,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: iso(-49_000),
+      tool_calls: [{ name: "swarm_wait", args: { since: "4" } }],
+    },
+    { step_index: 2, type: "GENERIC", status: "DONE", created_at: iso(-48_000), content: "waiting" },
+  ]);
+
+  // 4. killedAfterDoneId: reached finalAnswer + board report, then killed -> stays "done"
+  writeJsonl(path.join(cliDir, "brain", killedAfterDoneId, ".system_generated", "logs", "transcript.jsonl"), [
+    {
+      step_index: 0,
+      type: "SYSTEM_MESSAGE",
+      status: "DONE",
+      created_at: iso(-53_000),
+      content: `<SYSTEM_MESSAGE>[Message] sender=${parentId} content=Ship quick fix</SYSTEM_MESSAGE>`,
+    },
+    {
+      step_index: 1,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: iso(-24_000),
+      content: "All done.",
+    },
+  ]);
+
+  // 5. killedMidWorkId: killed while mid-tool without report -> "stopped"
+  writeJsonl(path.join(cliDir, "brain", killedMidWorkId, ".system_generated", "logs", "transcript.jsonl"), [
+    {
+      step_index: 0,
+      type: "SYSTEM_MESSAGE",
+      status: "DONE",
+      created_at: iso(-52_000),
+      content: `<SYSTEM_MESSAGE>[Message] sender=${parentId} content=Shard work 1</SYSTEM_MESSAGE>`,
+    },
+    {
+      step_index: 1,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: iso(-30_000),
+      tool_calls: [{ name: "run_command", args: { CommandLine: '"npm test"' } }],
+    },
+  ]);
+
+  // 6. transcriptOnlySwarmId (shard-2): NOT in members.json, only in transcript.jsonl;
+  //    step 0 is sender=system, step 1 is sender=parentId -> accepted by sentBy() AND killed by `swarm kill shard`!
+  writeJsonl(path.join(cliDir, "brain", transcriptOnlySwarmId, ".system_generated", "logs", "transcript.jsonl"), [
+    {
+      step_index: 0,
+      type: "SYSTEM_MESSAGE",
+      status: "DONE",
+      created_at: iso(-51_000),
+      content: "<SYSTEM_MESSAGE>[Message] sender=system content=[swarm] new board message #1</SYSTEM_MESSAGE>",
+    },
+    {
+      step_index: 1,
+      type: "SYSTEM_MESSAGE",
+      status: "DONE",
+      created_at: iso(-50_900),
+      content: `<SYSTEM_MESSAGE>[Message] sender=${parentId} content=Shard work 2</SYSTEM_MESSAGE>`,
+    },
+    {
+      step_index: 2,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: iso(-35_000),
+      tool_calls: [{ name: "read_file", args: { Path: '"/repo/a.ts"' } }],
+    },
+  ]);
+
+  // 7. failedWorkerId: model step ERROR -> "failed"
+  writeJsonl(path.join(cliDir, "brain", failedWorkerId, ".system_generated", "logs", "transcript.jsonl"), [
+    {
+      step_index: 0,
+      type: "SYSTEM_MESSAGE",
+      status: "DONE",
+      created_at: iso(-45_000),
+      content: `<SYSTEM_MESSAGE>[Message] sender=${parentId} content=Run failing step</SYSTEM_MESSAGE>`,
+    },
+    {
+      step_index: 1,
+      type: "PLANNER_RESPONSE",
+      status: "ERROR",
+      created_at: iso(-15_000),
+      content: "Quota exhausted",
+    },
+  ]);
+
+  // 8. registrySubagentId: regular subagent from subagents/*.json with inbox report -> "done"
+  writeJsonl(path.join(cliDir, "brain", registrySubagentId, ".system_generated", "logs", "transcript.jsonl"), [
+    {
+      step_index: 0,
+      type: "SYSTEM_MESSAGE",
+      status: "DONE",
+      created_at: iso(-40_000),
+      content: "<SYSTEM_MESSAGE>[Message] sender=other-wrapper content=Audit repository</SYSTEM_MESSAGE>",
+    },
+    {
+      step_index: 1,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: iso(-12_000),
+      content: "Audit complete.",
+    },
+  ]);
+  writeJson(path.join(parentBrain, ".system_generated", "messages", "msg-1.json"), {
+    sender: registrySubagentId,
+    timestamp: iso(-11_500),
+    content: "Repository audit passed.",
+  });
+
+  // 9. foreignTranscriptChildId: NOT in members.json or subagents/*.json, and sentBy is another conversation -> rejected
+  writeJsonl(path.join(cliDir, "brain", foreignTranscriptChildId, ".system_generated", "logs", "transcript.jsonl"), [
+    {
+      step_index: 0,
+      type: "SYSTEM_MESSAGE",
+      status: "DONE",
+      created_at: iso(-50_000),
+      content: "<SYSTEM_MESSAGE>[Message] sender=ffffffff-ffff-4fff-8fff-ffffffffffff content=Foreign</SYSTEM_MESSAGE>",
+    },
+  ]);
+
+  const reader = new SubagentReader(
+    makeFakeContextReader({
+      "agent-1": { conversationId: parentId, closed: false, model: "gemini-4-neon-high" },
+    }),
+    cliDir,
+  );
+
+  const list = await reader.list({}, "agent-1");
+  // Validate against shared Zod contract
+  agContracts.subagentListSchema.parse(list);
+  assert.equal(list.conversationId, parentId);
+  assert.equal(list.swarmTitle, "Refactor Subagents & Swarm");
+
+  const byId = new Map(list.subagents.map((s) => [s.id, s]));
+  assert.equal(byId.has(foreignTranscriptChildId), false, "untrusted foreign child must be filtered out");
+  assert.equal(byId.has(parentId), false, "coordinator must not appear as its own child");
+
+  // Verify states, origins, roles, tasks, and reports
+  const backend = byId.get(workingId);
+  assert.ok(backend);
+  assert.equal(backend.origin, "swarm");
+  assert.equal(backend.role, "backend");
+  assert.equal(backend.state, "running");
+  assert.equal(backend.phase, "tool");
+  assert.equal(backend.task, "Own server + contracts");
+
+  const uiDone = byId.get(waitingDoneId);
+  assert.ok(uiDone);
+  assert.equal(uiDone.origin, "swarm");
+  assert.equal(uiDone.state, "done");
+  assert.equal(uiDone.task, "Build popover UI");
+  assert.ok(uiDone.reportedAt, "board report timestamp should populate reportedAt");
+
+  const verifier = byId.get(waitingIdleId);
+  assert.ok(verifier);
+  assert.equal(verifier.origin, "swarm");
+  assert.equal(verifier.state, "idle");
+
+  const killedDone = byId.get(killedAfterDoneId);
+  assert.ok(killedDone);
+  assert.equal(killedDone.origin, "swarm");
+  assert.equal(killedDone.state, "done", "worker killed after finalAnswer + report must remain done");
+
+  const killedMid = byId.get(killedMidWorkId);
+  assert.ok(killedMid);
+  assert.equal(killedMid.origin, "swarm");
+  assert.equal(killedMid.state, "stopped", "worker killed mid-work must be stopped");
+
+  const shard2 = byId.get(transcriptOnlySwarmId);
+  assert.ok(shard2, "transcript-only swarm worker with step-0 sender=system + step-1 sender=parentId must pass sentBy");
+  assert.equal(shard2.origin, "swarm");
+  assert.equal(shard2.role, "shard-2");
+  assert.equal(shard2.state, "stopped", "sharded worker targeted by `swarm kill shard` must be stopped");
+
+  const broken = byId.get(failedWorkerId);
+  assert.ok(broken);
+  assert.equal(broken.state, "failed");
+
+  const auditor = byId.get(registrySubagentId);
+  assert.ok(auditor);
+  assert.equal(auditor.origin, "subagent");
+  assert.equal(auditor.role, "Repo Auditor");
+  assert.equal(auditor.state, "done");
+
+  // Sorting: running worker first, its nested child immediately after it, then non-running reverse-chronological
+  assert.equal(list.subagents[0].id, workingId);
+  assert.equal(list.subagents[1].id, nestedChildId);
+  assert.equal(list.subagents[1].depth, 2);
+  const topLevelNonRunning = list.subagents.filter((s) => s.depth === 1 && s.state !== "running");
+  for (let i = 1; i < topLevelNonRunning.length; i += 1) {
+    const prevTs = Date.parse(topLevelNonRunning[i - 1].updatedAt ?? topLevelNonRunning[i - 1].startedAt);
+    const currTs = Date.parse(topLevelNonRunning[i].updatedAt ?? topLevelNonRunning[i].startedAt);
+    assert.ok(prevTs >= currTs, "non-running top-level subagents must be sorted reverse-chronologically");
+  }
+
+  // Detail includes board report for swarm worker (preferring @coordinator / [done] post over interim post)
+  const uiDetail = await reader.detail({}, "agent-1", waitingDoneId);
+  agContracts.subagentDetailSchema.parse(uiDetail);
+  assert.equal(uiDetail.report, "@coordinator [done] Popover ready and tested");
+
+  // Counts include total, running, and failed
+  const counts = await reader.counts({}, ["agent-1"]);
+  agContracts.subagentCountsRpc.output.parse({ counts });
+  assert.deepEqual(counts["agent-1"], {
+    total: 9,
+    running: 1,
+    failed: 1,
+  });
+
+  // Backward-compatibility check: counts schema defaults missing `failed` to 0
+  const parsedLegacyCounts = agContracts.subagentCountsRpc.output.parse({
+    counts: { legacy: { total: 2, running: 1 } },
+  });
+  assert.deepEqual(parsedLegacyCounts.counts.legacy, { total: 2, running: 1, failed: 0 });
+
+  // forget() clears caches cleanly
+  reader.forget("agent-1");
+});
+
+test("SubagentReader extracts clean roster name from `Swarm Worker (<name>)` in subagents/*.json and marks SUBAGENT_STATE_KILLED", async (t) => {
+  const cliDir = makeTempDir(t, "paseo-ag-reg-");
+  const parentId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const workerId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  const parentBrain = path.join(cliDir, "brain", parentId);
+
+  writeJson(path.join(parentBrain, ".system_generated", "subagents", `${workerId}.json`), {
+    conversationId: workerId,
+    subagentDescriptor: { typeName: "worker", role: "Swarm Worker (i18n-sync)" },
+    state: "SUBAGENT_STATE_KILLED",
+  });
+  writeJsonl(path.join(cliDir, "brain", workerId, ".system_generated", "logs", "transcript.jsonl"), [
+    {
+      step_index: 0,
+      type: "SYSTEM_MESSAGE",
+      status: "DONE",
+      created_at: new Date().toISOString(),
+      content: "<SYSTEM_MESSAGE>[Message] sender=system content=[swarm] new board message #2</SYSTEM_MESSAGE>",
+    },
+    {
+      step_index: 1,
+      type: "SYSTEM_MESSAGE",
+      status: "DONE",
+      created_at: new Date().toISOString(),
+      content: `<SYSTEM_MESSAGE>[Message] sender=${parentId} content=Sync all Antigravity i18n strings</SYSTEM_MESSAGE>`,
+    },
+  ]);
+
+  const reader = new SubagentReader(
+    makeFakeContextReader({
+      "agent-reg": { conversationId: parentId, closed: false, model: null },
+    }),
+    cliDir,
+  );
+  const list = await reader.list({}, "agent-reg");
+  assert.equal(list.subagents.length, 1);
+  assert.equal(list.subagents[0].origin, "swarm");
+  assert.equal(list.subagents[0].role, "i18n-sync");
+  assert.equal(list.subagents[0].state, "stopped");
+  assert.equal(list.subagents[0].task, "Sync all Antigravity i18n strings");
+});
+
+test("transformToolCall transforms swarm add, kill, status, title, and model while letting models fall through", () => {
+  const transforms = createAntigravityTimelineTransforms();
+  const w1 = "11111111-1111-4111-8111-111111111111";
+  const w2 = "22222222-2222-4222-8222-222222222222";
+
+  // 1. swarm add (single completed)
+  const addSingle = transforms.transformToolCall({
+    type: "tool_call",
+    callId: "sw-1",
+    name: "swarm",
+    status: "completed",
+    detail: {
+      type: "unknown",
+      input: { action: "add", name: "swarm-backend", brief: "Upgrade subagent reader" },
+      output: JSON.stringify({
+        status: "added",
+        name: "swarm-backend",
+        conversation_id: w1,
+      }),
+    },
+  });
+  assert.equal(addSingle?.items.length, 1);
+  assert.equal(addSingle.items[0].kind, agContracts.SUBAGENT_TIMELINE_KIND);
+  agContracts.subagentCardSchema.parse(addSingle.items[0].data);
+  assert.deepEqual(addSingle.items[0].data, {
+    id: w1,
+    role: "swarm-backend",
+    type: "swarm",
+    origin: "swarm",
+    task: "Upgrade subagent reader",
+    status: "completed",
+  });
+
+  // 2. swarm add (still running, no output yet -> single placeholder card)
+  const addRunning = transforms.transformToolCall({
+    type: "tool_call",
+    callId: "sw-2",
+    name: "swarm",
+    status: "running",
+    detail: {
+      type: "unknown",
+      input: { action: "add", name: "verifier", brief: "Run verification suite" },
+      output: null,
+    },
+  });
+  assert.equal(addRunning?.items.length, 1);
+  assert.equal(addRunning.items[0].data.id, "");
+  assert.equal(addRunning.items[0].data.role, "verifier");
+  assert.equal(addRunning.items[0].data.origin, "swarm");
+
+  // 3. swarm add (sharded multi-worker output)
+  const addSharded = transforms.transformToolCall({
+    type: "tool_call",
+    callId: "sw-3",
+    name: "swarm",
+    status: "completed",
+    detail: {
+      type: "unknown",
+      input: { action: "add", name: "audit", brief: "Audit module", tasks: ["auth", "billing"] },
+      output: JSON.stringify({
+        workers: [
+          { name: "audit-1", conversation_id: w1 },
+          { name: "audit-2", conversation_id: w2 },
+        ],
+      }),
+    },
+  });
+  assert.equal(addSharded?.items.length, 2);
+  assert.equal(addSharded.items[0].data.id, w1);
+  assert.equal(addSharded.items[0].data.role, "audit-1");
+  assert.equal(addSharded.items[0].data.origin, "swarm");
+  assert.equal(addSharded.items[0].data.task, "Audit module — auth");
+  assert.equal(addSharded.items[1].data.id, w2);
+  assert.equal(addSharded.items[1].data.role, "audit-2");
+  assert.equal(addSharded.items[1].data.task, "Audit module — billing");
+
+  // 4. swarm status (excludes coordinator, normalizes working->running, waiting->idle, killed->stopped)
+  const statusRes = transforms.transformToolCall({
+    type: "tool_call",
+    callId: "sw-4",
+    name: "swarm",
+    status: "completed",
+    detail: {
+      type: "unknown",
+      input: { action: "status" },
+      output: JSON.stringify({
+        title: "Release Prep",
+        members: [
+          { name: "coordinator", role: "coordinator", state: "waiting", conversation_id: "00000000-0000-4000-8000-000000000000" },
+          { name: "backend", conversation_id: w1, state: "working" },
+          { name: "verifier", conversation_id: w2, state: "waiting" },
+          { name: "old-worker", state: "killed" },
+        ],
+      }),
+    },
+  });
+  assert.equal(statusRes?.items.length, 1);
+  assert.equal(statusRes.items[0].kind, agContracts.SUBAGENT_LIST_TIMELINE_KIND);
+  agContracts.subagentCheckSchema.parse(statusRes.items[0].data);
+  assert.equal(statusRes.items[0].data.action, "swarm:status");
+  assert.equal(statusRes.items[0].data.title, "Release Prep");
+  assert.deepEqual(statusRes.items[0].data.states, [
+    { id: w1, role: "backend", state: "running" },
+    { id: w2, role: "verifier", state: "idle" },
+    { id: "old-worker", role: "old-worker", state: "stopped" },
+  ]);
+
+  // 5. swarm kill
+  const killRes = transforms.transformToolCall({
+    type: "tool_call",
+    callId: "sw-5",
+    name: "swarm",
+    status: "completed",
+    detail: {
+      type: "unknown",
+      input: { action: "kill", name: "backend" },
+      output: JSON.stringify({ status: "killed", name: "backend" }),
+    },
+  });
+  assert.equal(killRes?.items[0].kind, agContracts.SUBAGENT_LIST_TIMELINE_KIND);
+  assert.equal(killRes.items[0].data.action, "swarm:kill");
+  assert.deepEqual(killRes.items[0].data.states, [{ id: "backend", role: "backend", state: "stopped" }]);
+
+  // 6. swarm title
+  const titleRes = transforms.transformToolCall({
+    type: "tool_call",
+    callId: "sw-6",
+    name: "swarm",
+    status: "completed",
+    detail: {
+      type: "unknown",
+      input: { action: "title", title: "Align Antigravity subagents" },
+      output: JSON.stringify({ status: "titled", title: "Align Antigravity subagents" }),
+    },
+  });
+  assert.equal(titleRes?.items[0].kind, agContracts.SUBAGENT_LIST_TIMELINE_KIND);
+  assert.equal(titleRes.items[0].data.action, "swarm:title");
+  assert.equal(titleRes.items[0].data.title, "Align Antigravity subagents");
+
+  // 7. swarm model
+  const modelRes = transforms.transformToolCall({
+    type: "tool_call",
+    callId: "sw-7",
+    name: "swarm",
+    status: "completed",
+    detail: {
+      type: "unknown",
+      input: { action: "model", name: "backend", model: "gemini-4-carbon-high" },
+      output: JSON.stringify({ status: "switched", name: "backend", model: "gemini-4-carbon-high" }),
+    },
+  });
+  assert.equal(modelRes?.items[0].kind, agContracts.SUBAGENT_LIST_TIMELINE_KIND);
+  assert.equal(modelRes.items[0].data.action, "swarm:model");
+  assert.equal(modelRes.items[0].data.title, "backend · gemini-4-carbon-high");
+
+  // 8. swarm models falls through cleanly
+  const modelsRes = transforms.transformToolCall({
+    type: "tool_call",
+    callId: "sw-8",
+    name: "swarm",
+    status: "completed",
+    detail: {
+      type: "unknown",
+      input: { action: "models" },
+      output: '{"models":[]}',
+    },
+  });
+  assert.equal(modelsRes, undefined);
+});
+
+// ============================================================================
+// 9. Antigravity i18n sync, subagent pill stability, and live locale teardown
+// ============================================================================
+
+function loadClientModulesWithMocks(loader) {
+  const originalLoad = Module._load;
+  Module._load = function patchedLoad(id, parent, isMain) {
+    if (id === "react-native") {
+      return {
+        ScrollView: () => null,
+        Text: () => null,
+        View: () => null,
+        Pressable: () => null,
+        TextInput: () => null,
+        ActivityIndicator: () => null,
+        StyleSheet: { create: (styles) => styles },
+        Platform: { OS: "ios", select: (obj) => obj.default ?? obj.ios },
+        useWindowDimensions: () => ({ width: 1024, height: 768 }),
+      };
+    }
+    if (id === "@getpaseo/plugin/client/ui") {
+      return new Proxy({}, { get: () => () => null });
+    }
+    if (id === "@getpaseo/plugin/client") {
+      return {
+        defineTranslations: (spec) => ({
+          ...spec,
+          message: (key) => ({ key }),
+        }),
+        defineMessages: (spec) => ({
+          ...spec,
+          message: (key) => ({ key }),
+        }),
+        useTranslation: () => ({ t: (k) => k }),
+        usePluginClient: () => ({}),
+        usePluginRpc: () => ({ data: undefined }),
+        useRpc: () => async () => ({}),
+        useAgent: () => ({ agent: null }),
+      };
+    }
+    if (id === "@tanstack/react-query") {
+      return {
+        useQuery: () => ({ data: undefined }),
+        useMutation: () => ({ mutate: () => {} }),
+        useQueryClient: () => ({ invalidateQueries: () => {} }),
+      };
+    }
+    return originalLoad.call(this, id, parent, isMain);
+  };
+  try {
+    return loader();
+  } finally {
+    Module._load = originalLoad;
+  }
+}
+
+test("translateAntigravity syncs with setLanguageOverride, pluralizes _zero/_one/_other, interpolates {{name}}, falls back to en, and zh-CN avoids 子代理", (t) => {
+  const { localeMod, messagesMod } = loadClientModulesWithMocks(() => ({
+    localeMod: require("../client/locale.ts"),
+    messagesMod: require("../client/antigravity/messages.ts"),
+  }));
+  const { setLanguageOverride } = localeMod;
+  const { translateAntigravity } = messagesMod;
+
+  t.after(() => setLanguageOverride("auto"));
+
+  // zh-CN override
+  setLanguageOverride("zh-CN");
+  assert.equal(translateAntigravity("subagents.pill"), "子智能体");
+  assert.equal(translateAntigravity("subagents.type.research"), "只读调研");
+  assert.equal(translateAntigravity("subagents.type.self"), "通用");
+  assert.equal(translateAntigravity("subagents.type.image-generator"), "图像生成");
+  assert.equal(translateAntigravity("agents", { count: 0 }), "没有智能体");
+  assert.equal(translateAntigravity("agents", { count: 1 }), "1 个智能体");
+  assert.equal(translateAntigravity("agents", { count: 3 }), "3 个智能体");
+  assert.equal(translateAntigravity("subagents.workspaceBadgeA11y", { count: 1 }), "子智能体：1 个运行中");
+  assert.equal(translateAntigravity("subagents.workspaceBadgeA11y", { count: 4 }), "子智能体：4 个运行中");
+  assert.equal(translateAntigravity("subagents.check.swarmKill", { count: 1 }), "停止了 1 个蜂群成员");
+  assert.equal(translateAntigravity("subagents.check.swarmKill", { count: 2 }), "停止了 2 个蜂群成员");
+  assert.equal(translateAntigravity("subagents.steps", { count: 1 }), "1 步");
+  assert.equal(translateAntigravity("subagents.steps", { count: 5 }), "5 步");
+  assert.equal(translateAntigravity("switched", { label: "工作" }), "已切换到「工作」");
+
+  // en override
+  setLanguageOverride("en");
+  assert.equal(translateAntigravity("subagents.pill"), "Subagents");
+  assert.equal(translateAntigravity("agents", { count: 0 }), "No agents");
+  assert.equal(translateAntigravity("agents", { count: 1 }), "1 agent");
+  assert.equal(translateAntigravity("agents", { count: 3 }), "3 agents");
+  assert.equal(translateAntigravity("subagents.workspaceBadgeA11y", { count: 1 }), "Subagents: 1 running");
+  assert.equal(translateAntigravity("subagents.workspaceBadgeA11y", { count: 4 }), "Subagents: 4 running");
+  assert.equal(translateAntigravity("subagents.check.swarmKill", { count: 1 }), "Stopped 1 swarm worker");
+  assert.equal(translateAntigravity("subagents.check.swarmKill", { count: 2 }), "Stopped 2 swarm workers");
+  assert.equal(translateAntigravity("subagents.steps", { count: 1 }), "1 step");
+  assert.equal(translateAntigravity("subagents.steps", { count: 5 }), "5 steps");
+  assert.equal(translateAntigravity("switched", { label: "Work" }), "Switched to “Work”");
+
+  // Explicit localeOverride parameter + missing param placeholder preservation + missing key fallback
+  assert.equal(translateAntigravity("subagents.pill", undefined, "zh-CN"), "子智能体");
+  assert.equal(translateAntigravity("subagents.nested", {}), "Started by {{role}}");
+  assert.equal(translateAntigravity("nonexistent.nested.key"), "nonexistent.nested.key");
+
+  // zh-CN locale file must have zero occurrences of legacy "子代理"
+  const zhFile = path.resolve(__dirname, "..", "client", "antigravity", "locales", "zh-CN.ts");
+  const zhContent = fs.readFileSync(zhFile, "utf8");
+  assert.equal(zhContent.includes("子代理"), false, "locales/zh-CN.ts must use 子智能体 instead of 子代理");
+
+  // Placeholder parity: Paseo's real defineTranslations throws at load time if any
+  // zh-CN key's {{placeholder}} set differs from en.
+  const enTree = require("../client/antigravity/locales/en.ts").default;
+  const zhTree = require("../client/antigravity/locales/zh-CN.ts").default;
+  const flatten = (obj, prefix = "", out = {}) => {
+    for (const [k, v] of Object.entries(obj)) {
+      const full = prefix ? `${prefix}.${k}` : k;
+      if (v && typeof v === "object") flatten(v, full, out);
+      else if (typeof v === "string") out[full] = v;
+    }
+    return out;
+  };
+  const placeholdersOf = (str) =>
+    [...new Set([...str.matchAll(/\{\{\s*([^{}\s]+)\s*\}\}/g)].map((m) => m[1]))].sort();
+  const enFlat = flatten(enTree);
+  const zhFlat = flatten(zhTree);
+  for (const [k, zhVal] of Object.entries(zhFlat)) {
+    assert.ok(k in enFlat, `zh-CN key missing in en: ${k}`);
+    assert.deepEqual(
+      placeholdersOf(zhVal),
+      placeholdersOf(enFlat[k]),
+      `Translation placeholders differ in zh-CN: ${k}`,
+    );
+  }
+});
+
+test("contributeAntigravityClient & observeAgents keep stable CornerRingIcon identities, skip redundant pill.update, refresh live titles on locale switch, and leak zero listeners on dispose", async (t) => {
+  const { localeMod, agClientMod } = loadClientModulesWithMocks(() => ({
+    localeMod: require("../client/locale.ts"),
+    agClientMod: require("../client/antigravity/index.ts"),
+  }));
+  const { setLanguageOverride } = localeMod;
+  const { contributeAntigravityClient } = agClientMod;
+
+  t.after(() => setLanguageOverride("auto"));
+  setLanguageOverride("zh-CN");
+
+  let currentCounts = { total: 3, running: 2, failed: 0 };
+  const agentRow = {
+    id: "ag-1",
+    workspaceId: "ws-1",
+    provider: "antigravity",
+    model: "gemini-4-neon-high",
+    title: "Main",
+    status: "running",
+    metadata: {},
+  };
+
+  const pills = [];
+  const panels = [];
+  const badges = [];
+  const commands = [];
+  const footers = [];
+  const slashes = [];
+  const noop = () => {};
+
+  function trackRegistration(list, spec) {
+    const record = { spec, removed: false };
+    list.push(record);
+    return () => {
+      record.removed = true;
+    };
+  }
+
+  const fakeClient = {
+    addSidebarFooterItem: (spec) => trackRegistration(footers, spec),
+    addWorkspaceRowBadgeItem: (spec) => trackRegistration(badges, spec),
+    addCommandCenterItem: (spec) => trackRegistration(commands, spec),
+    addScreen: (spec) => trackRegistration(panels, spec),
+    addAgentPanel: (spec) => trackRegistration(panels, spec),
+    addSlashCommand: (spec) => trackRegistration(slashes, spec),
+    addComposerItem: () => noop,
+    addTimelineRenderer: () => noop,
+    addTimelineTransformer: () => noop,
+    openScreen: noop,
+    openAgentPanel: noop,
+    addComposerPill(spec) {
+      const entry = {
+        spec,
+        current: { ...spec.button },
+        updates: [],
+        removed: false,
+      };
+      pills.push(entry);
+      return {
+        update(patch) {
+          entry.updates.push(patch);
+          entry.current = { ...entry.current, ...patch };
+        },
+        remove() {
+          entry.removed = true;
+        },
+      };
+    },
+    async rpc(def) {
+      if (def.name === "subagents.counts") {
+        return { counts: { "ag-1": { ...currentCounts } } };
+      }
+      if (def.name === "accounts.list") {
+        return {
+          accounts: [],
+          defaultAccountId: "default",
+          agyPath: null,
+          agyVersion: null,
+          problems: [],
+          fallback: { enabled: false, retries: 0, strategy: "order" },
+          revision: 1,
+        };
+      }
+      if (def.name === "orchestrator.get") {
+        return { planner: null, executor: null, overrides: {}, planners: [], executors: [], error: null };
+      }
+      return {};
+    },
+    subscribe: () => ({ ready: Promise.resolve(), close: noop, unsubscribe: noop }),
+    paseo: {
+      agents: {
+        async list() {
+          return {
+            entries: [{ agent: agentRow }],
+            subscription: {
+              subscribe(handlers) {
+                handlers.snapshot({ entries: [{ agent: agentRow }] });
+                return noop;
+              },
+              release: noop,
+            },
+          };
+        },
+      },
+    },
+  };
+
+  const handle = contributeAntigravityClient(fakeClient, { consoleScreenId: "dsh-console" });
+  try {
+    // Allow initial async agents.list() snapshot to deliver the agent
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Poll 1: running state
+    await handle.observation.refreshSubagents();
+    const subagentPill = pills.find((p) => p.spec.id === "subagents");
+    assert.ok(subagentPill, "subagents composer pill should be registered");
+    assert.equal(subagentPill.current.label, "子智能体");
+    assert.equal(subagentPill.current.title, "子智能体");
+    assert.equal(subagentPill.spec.button.behavior.kind, "popover");
+    assert.equal(typeof subagentPill.spec.button.behavior.Content, "function");
+    const runningIcon = subagentPill.current.icon;
+    assert.equal(typeof runningIcon, "function");
+    assert.equal(subagentPill.updates.length, 0);
+
+    // Poll 2: unchanged visual state (still running, count changes from 2 to 1) -> zero pill.update calls
+    currentCounts = { total: 4, running: 1, failed: 0 };
+    await handle.observation.refreshSubagents();
+    assert.equal(subagentPill.updates.length, 0, "pill.update must not be called when iconState/label/title are unchanged");
+
+    // Poll 3: failed state -> updates once with distinct failed icon
+    currentCounts = { total: 4, running: 0, failed: 1 };
+    await handle.observation.refreshSubagents();
+    assert.equal(subagentPill.updates.length, 1);
+    const failedIcon = subagentPill.current.icon;
+    assert.equal(typeof failedIcon, "function");
+    assert.notEqual(failedIcon, runningIcon);
+
+    // Poll 4: unchanged failed visual state -> zero extra pill.update calls
+    currentCounts = { total: 4, running: 0, failed: 2 };
+    await handle.observation.refreshSubagents();
+    assert.equal(subagentPill.updates.length, 1);
+
+    // Poll 5: idle state -> updates once with distinct idle icon
+    currentCounts = { total: 4, running: 0, failed: 0 };
+    await handle.observation.refreshSubagents();
+    assert.equal(subagentPill.updates.length, 2);
+    const idleIcon = subagentPill.current.icon;
+    assert.equal(typeof idleIcon, "function");
+    assert.notEqual(idleIcon, runningIcon);
+    assert.notEqual(idleIcon, failedIcon);
+
+    // Poll 6: back to running -> reuses exact same stable runningIcon identity
+    currentCounts = { total: 4, running: 1, failed: 0 };
+    await handle.observation.refreshSubagents();
+    assert.equal(subagentPill.updates.length, 3);
+    assert.equal(subagentPill.current.icon, runningIcon, "CornerRingIcon component identity must stay stable");
+
+    // Initial zh-CN live titles
+    assert.equal(panels.at(-1).spec.title, "子智能体");
+    assert.equal(badges.at(-1).spec.title, "子智能体");
+    assert.equal(commands.at(-1).spec.title, "刷新所有 Antigravity 额度");
+
+    // Switch locale to en -> pill and live titles update cleanly, removing old registrations
+    setLanguageOverride("en");
+    assert.equal(subagentPill.updates.length, 4);
+    assert.equal(subagentPill.current.label, "Subagents");
+    assert.equal(subagentPill.current.title, "Subagents");
+    assert.equal(subagentPill.current.icon, runningIcon);
+
+    assert.equal(panels.length, 2);
+    assert.equal(panels[0].removed, true);
+    assert.equal(panels[1].spec.title, "Subagents");
+    assert.equal(panels[1].removed, false);
+
+    assert.equal(badges.length, 2);
+    assert.equal(badges[0].removed, true);
+    assert.equal(badges[1].spec.title, "Subagents");
+    assert.equal(badges[1].removed, false);
+
+    assert.equal(commands.length, 2);
+    assert.equal(commands[0].removed, true);
+    assert.equal(commands[1].spec.title, "Refresh Antigravity quotas");
+    assert.equal(commands[1].removed, false);
+  } finally {
+    handle.dispose();
+  }
+
+  // Every registration must be cleaned up on dispose()
+  assert.ok(panels.every((r) => r.removed), "all agent panels must be removed on dispose");
+  assert.ok(badges.every((r) => r.removed), "all workspace badges must be removed on dispose");
+  assert.ok(commands.every((r) => r.removed), "all command center items must be removed on dispose");
+  assert.ok(footers.every((r) => r.removed), "all sidebar footers must be removed on dispose");
+  assert.ok(slashes.every((r) => r.removed), "all slash commands must be removed on dispose");
+  assert.ok(pills.every((p) => p.removed), "all composer pills must be removed on dispose");
+
+  // Toggling locale after dispose() must trigger zero callbacks (no leaked locale listeners)
+  const countsAfterDispose = {
+    panels: panels.length,
+    badges: badges.length,
+    commands: commands.length,
+    footers: footers.length,
+    slashes: slashes.length,
+    pillUpdates: pills.reduce((sum, p) => sum + p.updates.length, 0),
+  };
+  setLanguageOverride("zh-CN");
+  setLanguageOverride("en");
+  assert.deepEqual(
+    {
+      panels: panels.length,
+      badges: badges.length,
+      commands: commands.length,
+      footers: footers.length,
+      slashes: slashes.length,
+      pillUpdates: pills.reduce((sum, p) => sum + p.updates.length, 0),
+    },
+    countsAfterDispose,
+    "disposed client handle must leak zero subscribeLocale listeners",
+  );
+});
+
+test("Antigravity built-in tool names and mcp_paseo_* prefixes localize cleanly in zh-CN and en", () => {
+  const { setLocale } = require("../client/locale.ts");
+  const { toolLabel, toolIcon, toolCallData } = require("../client/tool-call-data.ts");
+
+  const cases = [
+    ["run_command", "运行命令", "Run command", { type: "shell", command: "ls" }, "SquareTerminal"],
+    ["read_file", "读取", "Read", { type: "read", filePath: "/a.ts" }, "Eye"],
+    ["edit_file", "编辑", "Edit", { type: "edit", filePath: "/a.ts" }, "Pencil"],
+    ["write_file", "写入", "Write", { type: "write", filePath: "/a.ts" }, "Pencil"],
+    ["grep_search", "搜索文件内容", "Grep", { type: "search" }, "Search"],
+    ["find_by_name", "查找文件", "Find files", { type: "search" }, "Search"],
+    ["list_dir", "列出目录", "List directory", { type: "unknown" }, "FolderOpen"],
+    ["search_web", "网页搜索", "Search", { type: "search" }, "Globe"],
+    ["read_url_content", "网页获取", "Fetch", { type: "fetch" }, "Eye"],
+    ["manage_task", "管理后台任务", "Manage task", { type: "unknown" }, "Timer"],
+    ["schedule", "定时任务", "Schedule", { type: "unknown" }, "CalendarClock"],
+    ["update_steps", "更新步骤清单", "Update steps", { type: "unknown" }, "ListChecks"],
+    ["ask_question", "提问", "Ask question", { type: "unknown" }, "MessageCircleQuestion"],
+    ["invoke_subagent", "调用子智能体", "Invoke subagent", { type: "unknown" }, "Bot"],
+    ["swarm", "管理蜂群", "Manage swarm", { type: "unknown" }, "Users"],
+    ["post_message", "发布蜂群消息", "Post board message", { type: "unknown" }, "Send"],
+    ["read_board", "读取蜂群公告板", "Read board", { type: "unknown" }, "ClipboardList"],
+    ["swarm_wait", "等待蜂群消息", "Wait for swarm", { type: "unknown" }, "Hourglass"],
+    ["list_resources", "列出 MCP 资源", "List MCP resources", { type: "unknown" }, "Server"],
+    ["read_resource", "读取 MCP 资源", "Read MCP resource", { type: "unknown" }, "FileText"],
+    ["paseo.get_agent_activity", "查看 agent 活动", "Read agent activity", { type: "unknown" }, "Activity"],
+    ["mcp_paseo_list_agents", "列出 agent", "List agents", { type: "unknown" }, "Bot"],
+    ["agy-fast_fast.batch_search", "批量搜索", "Batch search", { type: "unknown" }, "Search"],
+    ["mcp_agy-fast_fast_apply_edits", "批量编辑", "Apply edits", { type: "unknown" }, "Pencil"],
+    ["fast.read_slices", "分段读取", "Read slices", { type: "unknown" }, "Eye"],
+    ["mcp__agy-fast_fast__quick_outline", "代码大纲", "Quick outline", { type: "unknown" }, "FileCode"],
+    ["run_checks", "并行检查", "Run checks", { type: "unknown" }, "SquareTerminal"],
+  ];
+
+  try {
+    for (const [name, zh, en, detail, expectedIcon] of cases) {
+      setLocale("zh-CN");
+      assert.equal(toolLabel(name, detail), zh, `${name} zh-CN label`);
+      assert.equal(toolIcon(name, detail), expectedIcon, `${name} icon`);
+      assert.equal(
+        toolCallData({ name, status: "completed", detail }, "complete").label,
+        zh,
+        `${name} toolCallData zh-CN`,
+      );
+      setLocale("en");
+      assert.equal(toolLabel(name, detail), en, `${name} en label`);
+    }
+  } finally {
+    setLocale(undefined);
+  }
+});
+
+test("SubagentReader.toolSummaries maps exact and truncated run_command CommandLine to toolSummary", async (t) => {
+  const cliDir = makeTempDir(t, "paseo-ag-summaries-");
+  const parentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const logFile = path.join(cliDir, "brain", parentId, ".system_generated", "logs", "transcript.jsonl");
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  const rows = [
+    {
+      step_index: 1,
+      source: "MODEL",
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      tool_calls: [
+        {
+          name: "run_command",
+          args: {
+            CommandLine: JSON.stringify("paseo plugin reload dsh-paseo && paseo plugin ls"),
+            toolSummary: JSON.stringify("重载并检查插件状态"),
+          },
+        },
+        {
+          name: "run_command",
+          args: {
+            // Simulate agy truncating a long CommandLine mid-JSON string
+            CommandLine: '"node -e \'const longCommand = true; console.log(longCommand);\'',
+            toolSummary: JSON.stringify("运行长脚本检查"),
+          },
+        },
+      ],
+    },
+  ];
+  fs.writeFileSync(logFile, `${rows.map((r) => JSON.stringify(r)).join("\n")}\n`);
+
+  const context = {
+    conversationId: async (_paseo, agentId) => (agentId === "agent-1" ? parentId : null),
+  };
+  const reader = new SubagentReader(context, cliDir);
+  const summaries = await reader.toolSummaries({}, "agent-1");
+
+  assert.equal(
+    agContracts.matchAntigravityCommandSummary(summaries, "paseo plugin reload dsh-paseo && paseo plugin ls"),
+    "重载并检查插件状态",
+  );
+  assert.equal(
+    agContracts.matchAntigravityCommandSummary(
+      summaries,
+      "node -e 'const longCommand = true; console.log(longCommand);' && echo done",
+    ),
+    "运行长脚本检查",
+  );
+  assert.equal(agContracts.matchAntigravityCommandSummary(summaries, "echo unknown"), "");
+
+  // Non-Antigravity agent returns empty map cleanly
+  const empty = await reader.toolSummaries({}, "non-ag");
+  assert.deepEqual(empty, { byCommand: {}, prefixes: [] });
+});
+
+test("ThinkingTranslator detects English prose, chunks paragraphs, caches to disk, and rejects quota warnings", async (t) => {
+  const { needsChineseTranslation, splitTranslationChunks, isPreviewReadyForTranslation } = require("../shared/translate-text.ts");
+  const { ThinkingTranslator } = require("../server/translate.ts");
+
+  assert.equal(needsChineseTranslation("Feature request asks for a return button in the full view."), true);
+  assert.equal(needsChineseTranslation("正在检查 `InlineThinking` 和 `/workspace/project/paseo-dsh` 的渲染逻辑。"), false);
+  assert.equal(needsChineseTranslation("ok"), false);
+
+  // Streaming prefetch readiness
+  assert.equal(isPreviewReadyForTranslation("Checking", "Checking", "streaming"), false);
+  assert.equal(isPreviewReadyForTranslation("Checking files\nSecond line", "Checking files", "streaming"), true);
+  assert.equal(
+    isPreviewReadyForTranslation("Inspecting navigation props cleanly.", "Inspecting navigation props cleanly.", "streaming"),
+    true,
+  );
+  assert.equal(isPreviewReadyForTranslation("Short", "Short", "complete"), true);
+
+  const longEnglish = [
+    "First paragraph explains the architecture in detail.",
+    `${"Sentence explaining one step of the plan. ".repeat(14).trim()}`,
+  ].join("\n\n");
+  const plan = splitTranslationChunks(longEnglish, 200);
+  assert.ok(plan.pieces.length >= 3, "long paragraph must be split into <= 200-char chunks");
+  assert.ok(plan.pieces.every((p) => p.length <= 200), "every chunk respects maxLen");
+
+  const dir = makeTempDir(t, "paseo-translate-cache-");
+  const cacheFile = path.join(dir, "cache.json");
+  let fetchCalls = 0;
+  let quotaMode = false;
+  const mockFetch = async (url) => {
+    fetchCalls += 1;
+    const q = new URL(String(url)).searchParams.get("q") || "";
+    if (quotaMode) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          responseStatus: 200,
+          responseData: { translatedText: "MYMEMORY WARNING: YOU USED ALL AVAILABLE FREE TRANSLATIONS" },
+        }),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        responseStatus: 200,
+        responseData: { translatedText: `译:${q}` },
+      }),
+    };
+  };
+
+  const translator1 = new ThinkingTranslator({
+    cacheFile,
+    fetchImpl: mockFetch,
+    dshHomeDir: null,
+    allowPublicFallback: true,
+  });
+  t.after(() => translator1.dispose());
+
+  // Chinese text is skipped without hitting fetch
+  const skipped = await translator1.translate("已经是一段中文思考内容，无需翻译。", "zh-CN");
+  assert.equal(skipped.provider, "skip");
+  assert.equal(fetchCalls, 0);
+
+  // English text translates and preserves paragraphs
+  const sample = "First thought paragraph.\n\nSecond thought paragraph.";
+  const first = await translator1.translate(sample, "zh-CN");
+  assert.equal(first.cached, false);
+  assert.equal(first.provider, "mymemory");
+  assert.equal(first.translated, "译:First thought paragraph.\n\n译:Second thought paragraph.");
+  assert.equal(fetchCalls, 2);
+
+  // Second call hits in-memory cache
+  const second = await translator1.translate(sample, "zh-CN");
+  assert.equal(second.cached, true);
+  assert.equal(second.translated, first.translated);
+  assert.equal(fetchCalls, 2);
+
+  // Flush to disk and verify a fresh instance loads the persisted cache
+  await translator1.flushCache();
+  const translator2 = new ThinkingTranslator({
+    cacheFile,
+    fetchImpl: mockFetch,
+    dshHomeDir: null,
+    allowPublicFallback: true,
+  });
+  t.after(() => translator2.dispose());
+  const persisted = await translator2.translate(sample, "zh-CN");
+  assert.equal(persisted.cached, true);
+  assert.equal(persisted.translated, first.translated);
+  assert.equal(fetchCalls, 2);
+
+  // MyMemory quota warning must reject and never poison cache
+  quotaMode = true;
+  await assert.rejects(() => translator2.translate("Another English thought that hits quota limit.", "zh-CN"));
+});
+
+test("ThinkingTranslator prefers dynamically discovered DSH openai-completions fast model and falls back to MyMemory", async (t) => {
+  const { ThinkingTranslator, resolveDshTranslationEndpoint } = require("../server/translate.ts");
+  const dshDir = makeTempDir(t, "paseo-dsh-translate-");
+  const patchFile = path.join(dshDir, "profiles", "paseo", "cordis.patch.yml");
+  fs.mkdirSync(path.dirname(patchFile), { recursive: true });
+  fs.writeFileSync(
+    patchFile,
+    [
+      "- id: llm-pi-ai",
+      "  config:",
+      "    providers:",
+      "      other:",
+      "        api: openai-responses",
+      "        apiKeyEnv: TEST_KEY",
+      "        baseURL: https://example.invalid/v1",
+      "        models:",
+      "          - id: slow-responses-model",
+      "      primary:",
+      "        api: openai-completions",
+      "        apiKeyEnv: TEST_TRANSLATE_KEY",
+      "        baseURL: https://example.test/v1/",
+      "        models:",
+      "          - id: agy-acp/skip-me",
+      "          - id: example-pro",
+      "          - id: example-flash",
+    ].join("\n"),
+  );
+  fs.writeFileSync(path.join(dshDir, ".credentials.yaml"), 'TEST_TRANSLATE_KEY: "dummy-secret-token"\n');
+
+  const endpoint = await resolveDshTranslationEndpoint(dshDir, "paseo");
+  assert.deepEqual(endpoint, {
+    baseURL: "https://example.test/v1",
+    apiKey: "dummy-secret-token",
+    model: "example-flash",
+  });
+
+  const cacheFile = path.join(dshDir, "cache.json");
+  let failDsh = false;
+  const seenUrls = [];
+  const mockFetch = async (url, init) => {
+    const href = String(url);
+    seenUrls.push(href);
+    if (href.startsWith("https://example.test/v1/chat/completions")) {
+      if (failDsh) return { ok: false, status: 503, json: async () => ({}) };
+      const body = JSON.parse(init.body);
+      assert.equal(body.model, "example-flash");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          choices: [{ message: { content: "DSH 译文：检查导航属性并接入返回按钮。" } }],
+        }),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        responseStatus: 200,
+        responseData: { translatedText: "MyMemory 回退译文" },
+      }),
+    };
+  };
+
+  const translator = new ThinkingTranslator({
+    cacheFile,
+    fetchImpl: mockFetch,
+    dshHomeDir: dshDir,
+    profile: "paseo",
+    allowPublicFallback: true,
+  });
+  t.after(() => translator.dispose());
+
+  const dshRes = await translator.translate("Inspecting navigation props to add a return button.", "zh-CN");
+  assert.equal(dshRes.provider, "dsh");
+  assert.equal(dshRes.cached, false);
+  assert.equal(dshRes.translated, "DSH 译文：检查导航属性并接入返回按钮。");
+
+  // When DSH fails transiently, automatically falls back to MyMemory
+  failDsh = true;
+  const fallbackRes = await translator.translate("Another English paragraph when primary is down.", "zh-CN");
+  assert.equal(fallbackRes.provider, "mymemory");
+  assert.equal(fallbackRes.translated, "MyMemory 回退译文");
+});
+
+test("resolveRealHome rejects profile-isolated HOME paths so account switching never creates symlink loops", () => {
+  const { isProfileHomePath, resolveRealHome } = require("../server/antigravity/paths.ts");
+  const profileHomePath = "/home/alice/.paseo/plugin-data/dsh-paseo/antigravity/profiles/a3bdf6066/home";
+  const legacyProfileHomePath = "/home/alice/.paseo/plugin-data/antigravity-accounts/profiles/afbd62f31/home";
+
+  assert.equal(isProfileHomePath(profileHomePath), true);
+  assert.equal(isProfileHomePath(`${profileHomePath}/.gemini/config`), true);
+  assert.equal(isProfileHomePath(legacyProfileHomePath), true);
+  assert.equal(isProfileHomePath("/home/alice"), false);
+  assert.equal(isProfileHomePath("/home/alice/.gemini/config"), false);
+
+  // Uses passwd home when env HOME is a profile home
+  assert.equal(resolveRealHome(profileHomePath, "/home/alice"), "/home/alice");
+  // Falls back to stripping `.paseo/...` when passwd home is unavailable
+  assert.equal(resolveRealHome(profileHomePath, ""), "/home/alice");
+  assert.equal(resolveRealHome(legacyProfileHomePath, ""), "/home/alice");
+  // Keeps normal user HOME untouched
+  assert.equal(resolveRealHome("/home/alice", "/home/other"), "/home/alice");
+});
+
+test("OrchestratorSettings.supportsModel matches base model ids against effort-suffixed agy catalog entries", () => {
+  const { OrchestratorSettings } = require("../server/antigravity/orchestrator.ts");
+  const settings = new OrchestratorSettings({});
+  settings.catalogs.set("a1111111", {
+    fetchedAt: Date.now(),
+    identity: "user@example.com",
+    models: [
+      { id: "gemini-4-neon-low", label: "Gemini 4 Neon (Low)" },
+      { id: "gemini-4-neon-medium", label: "Gemini 4 Neon (Medium)" },
+      { id: "gemini-4-neon-high", label: "Gemini 4 Neon (High)" },
+      { id: "gemini-pro-orchestrator-neon", label: "Orchestrator (Neon)" },
+    ],
+  });
+
+  // Base model id (what Paseo stores in agent.model) matches effort-suffixed agy catalog entries
+  assert.equal(settings.supportsModel("a1111111", "gemini-4-neon"), true);
+  assert.equal(settings.supportsModel("a1111111", "antigravity/gemini-4-neon"), true);
+  // Exact effort variant still requires exact availability
+  assert.equal(settings.supportsModel("a1111111", "gemini-4-neon-high"), true);
+  assert.equal(settings.supportsModel("a1111111", "gemini-4-neon-xhigh"), false);
+  // Orchestrator and missing models behave strictly
+  assert.equal(settings.supportsModel("a1111111", "gemini-pro-orchestrator-neon"), true);
+  assert.equal(settings.supportsModel("a1111111", "claude-opus-5-5"), false);
+  // Uncached account stays unknown (null) so it is never falsely blocked
+  assert.equal(settings.supportsModel("a2222222", "gemini-4-neon"), null);
+});
+
+test("FallbackController detects agy soft quota completions, parses reset delay, avoids false positives, and switches accounts", async () => {
+  const {
+    EXHAUSTED_THRESHOLD,
+    FallbackController,
+    exhausted,
+    extractAgySoftFailureLine,
+    extractSoftTurnFailure,
+    parseResetDelayMs,
+    resetOfExhausted,
+  } = require("../server/antigravity/fallback.ts");
+  const { PendingSwitches } = require("../server/antigravity/hooks.ts");
+  const { OrchestratorSettings } = require("../server/antigravity/orchestrator.ts");
+
+  assert.equal(EXHAUSTED_THRESHOLD, 0.01);
+  assert.equal(parseResetDelayMs("⚠ Individual quota reached. Resets in 11m21s."), (11 * 60 + 21) * 1000);
+  assert.equal(parseResetDelayMs("Resets in 1h1m24s."), (3600 + 60 + 24) * 1000);
+  assert.equal(parseResetDelayMs("No reset info"), null);
+
+  // Near-zero bucket (0.64%) counts as exhausted and provides reset timestamp
+  const nearZeroGroups = [
+    {
+      name: "Gemini Models",
+      buckets: [
+        {
+          id: "gemini-5h",
+          name: "Five Hour Limit Remaining",
+          window: "5h",
+          remainingFraction: 0.00638,
+          resetTime: "2026-11-27T08:04:52Z",
+          disabled: false,
+        },
+      ],
+    },
+  ];
+  assert.equal(exhausted(nearZeroGroups, "gemini"), true);
+  assert.equal(resetOfExhausted(nearZeroGroups, "gemini"), Date.parse("2026-11-27T08:04:52Z"));
+
+  // Soft-failure extraction: real agy messages match; prose/code/quotes never false-trigger
+  const realQuotaMsg = "⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 11m21s.";
+  assert.equal(extractAgySoftFailureLine(realQuotaMsg), realQuotaMsg);
+  assert.equal(extractAgySoftFailureLine(`正在检查日志...\n\n${realQuotaMsg}`), realQuotaMsg);
+  assert.equal(extractAgySoftFailureLine(`日志里看到 \`${realQuotaMsg}\``), null);
+  assert.equal(extractAgySoftFailureLine(`> ${realQuotaMsg}`), null);
+  assert.equal(extractAgySoftFailureLine(`- ${realQuotaMsg}`), null);
+  assert.equal(extractAgySoftFailureLine(`\`\`\`\n${realQuotaMsg}\n\`\`\``), null);
+  assert.equal(extractAgySoftFailureLine(`${realQuotaMsg}\n\n这是因为 agy acp 正常结束了回合。`), null);
+
+  // Older turn warning must be ignored when a newer turn completed cleanly
+  assert.equal(
+    extractSoftTurnFailure(
+      [
+        { turnId: "t1", item: { type: "user_message", text: "first" } },
+        { turnId: "t1", item: { type: "assistant_message", text: realQuotaMsg } },
+        { turnId: "t2", item: { type: "user_message", text: "second" } },
+        { turnId: "t2", item: { type: "assistant_message", text: "一切正常。" } },
+      ],
+      "t2",
+    ),
+    null,
+  );
+
+  // Already-noted turn must never re-trigger
+  assert.equal(
+    extractSoftTurnFailure(
+      [
+        { turnId: "t1", item: { type: "user_message", text: "hi" } },
+        { turnId: "t1", item: { type: "assistant_message", text: realQuotaMsg } },
+        { turnId: "t1", item: { type: "plugin", kind: agContracts.FALLBACK_TIMELINE_KIND } },
+      ],
+      "t1",
+    ),
+    null,
+  );
+
+  // End-to-end FallbackController on a `completed` turn with `⚠ Individual quota reached...`
+  const metadata = {};
+  const timelineNotes = [];
+  let reloaded = 0;
+  const sentPrompts = [];
+
+  const fakeService = {
+    init: async () => {},
+    setCooldownProvider: () => {},
+    onStatusUpdated: () => () => {},
+    notifyChange: () => {},
+    fallbackSettings: () => ({ enabled: true, retries: 2, strategy: "reset" }),
+    labelOf: (id) => (id === "default" ? "Ultra" : "mon"),
+    requireAccount: (id) => (id === "default" ? null : { id: "a3bdf6066", label: "mon", unsafeDetail: null }),
+    quotaFor: async () => ({ status: "signed-in" }),
+    refreshOne: async () => {},
+    knownQuota: (id) =>
+      id === "default"
+        ? [{ name: "Gemini Models", buckets: [{ id: "gemini-5h", name: "5h", window: "5h", remainingFraction: 0.05, resetTime: null, disabled: false }] }]
+        : [{ name: "Gemini Models", buckets: [{ id: "gemini-5h", name: "5h", window: "5h", remainingFraction: 0.8, resetTime: "2026-11-27T08:29:03Z", disabled: false }] }],
+    state: async () => ({
+      defaultAccountId: "default",
+      accounts: [
+        { id: "default", label: "Ultra", kind: "system", status: "signed-in", usable: true, fallbackEnabled: false },
+        { id: "a3bdf6066", label: "mon", kind: "profile", status: "signed-in", usable: true, fallbackEnabled: true },
+      ],
+    }),
+  };
+
+  const models = new OrchestratorSettings(fakeService);
+  models.catalogs.set("a3bdf6066", {
+    fetchedAt: Date.now(),
+    identity: "mon@example.com",
+    models: [{ id: "gemini-4-neon-high", label: "Gemini 4 Neon (High)" }],
+  });
+
+  const controller = new FallbackController(fakeService, new PendingSwitches(), models);
+  const { server, hooks } = createFakeServer();
+  const unregister = controller.register(server);
+  try {
+    const turnAfter = hooks.find((h) => h.name === "agent.turn.after");
+    assert.ok(turnAfter, "FallbackController must register agent.turn.after");
+
+    const fakeAgentRef = {
+      refresh: async () => ({
+        agent: {
+          id: "agent-1",
+          provider: "antigravity",
+          model: "gemini-4-neon",
+          status: "idle",
+          archivedAt: null,
+          metadata: { ...metadata },
+        },
+      }),
+      setMetadata: async (patch) => {
+        Object.assign(metadata, patch);
+      },
+      reload: async () => {
+        reloaded += 1;
+      },
+      send: async (text) => {
+        sentPrompts.push(text);
+      },
+      timeline: {
+        refetch: async () => ({
+          agent: {
+            id: "agent-1",
+            provider: "antigravity",
+            model: "gemini-4-neon",
+            metadata: { ...metadata },
+          },
+          entries: [
+            { turnId: "turn-1", item: { type: "user_message", text: "帮我查一下" } },
+            { turnId: "turn-1", item: { type: "assistant_message", text: realQuotaMsg } },
+          ],
+        }),
+        append: async (item) => {
+          timelineNotes.push(item);
+        },
+      },
+    };
+    const fakePaseo = { agents: { ref: () => fakeAgentRef } };
+
+    const before = Date.now();
+    await turnAfter.handler(
+      {
+        agent: { id: "agent-1", provider: "antigravity", metadata: {} },
+        turnId: "turn-1",
+        outcome: { kind: "completed" },
+      },
+      { paseo: fakePaseo, signal: new AbortController().signal },
+    );
+
+    assert.equal(metadata[agContracts.ACCOUNT_METADATA_KEY], "a3bdf6066", "must switch account to backup profile");
+    assert.equal(reloaded, 1, "must reload agent onto new account");
+    assert.deepEqual(sentPrompts, ["Continue."], "must auto-continue on the new account");
+    assert.equal(timelineNotes.length, 1);
+    assert.equal(timelineNotes[0].kind, agContracts.FALLBACK_TIMELINE_KIND);
+    assert.equal(timelineNotes[0].data.event, "switch");
+    assert.equal(timelineNotes[0].data.reason, "quota");
+    assert.equal(timelineNotes[0].data.from, "Ultra");
+    assert.equal(timelineNotes[0].data.to, "mon");
+
+    // Cooldown must use the parsed ~11m21s delay rather than the default 30m fallback
+    const cooldowns = controller.cooldownsOf("default");
+    assert.equal(cooldowns.length, 1);
+    const delayMs = Date.parse(cooldowns[0].until) - before;
+    assert.ok(delayMs >= 11 * 60_000 && delayMs <= 12 * 60_000, `expected ~11m21s cooldown, got ${delayMs}ms`);
+  } finally {
+    unregister();
+    controller.dispose();
+  }
+});
+
+// ============================================================================
+// 10. Regression coverage for audit P0/P1 fixes (migration, fallback, swarm, signin, client transforms & tool-summaries)
+// ============================================================================
+
+test("migrateLegacyDataDir recovers partial migration when profiles/ exists but accounts.json is missing", async (t) => {
+  const root = makeTempDir(t, "paseo-partial-mig-");
+  const legacyDir = path.join(root, "antigravity-accounts");
+  const targetDir = path.join(root, "dsh-paseo", "antigravity");
+
+  writeJson(path.join(legacyDir, "accounts.json"), {
+    version: 1,
+    defaultAccountId: "a1234567",
+    accounts: [{ id: "a1234567", label: "Recovered" }],
+  });
+  writeJson(path.join(legacyDir, "status.json"), { a1234567: { status: "signed-in" } });
+  fs.mkdirSync(path.join(legacyDir, "profiles", "a1234567"), { recursive: true });
+  fs.writeFileSync(path.join(legacyDir, "profiles", "a1234567", "legacy.txt"), "legacy");
+
+  // Simulate partial target state: profiles/ already exists with existing data, but accounts.json is missing.
+  fs.mkdirSync(path.join(targetDir, "profiles", "a1234567"), { recursive: true });
+  fs.writeFileSync(path.join(targetDir, "profiles", "a1234567", "existing.txt"), "keep-me");
+
+  const res = await migrateLegacyDataDir({ legacyDir, targetDir });
+  assert.equal(res.migrated, true);
+  assert.deepEqual([...res.copiedEntries].sort(), ["accounts.json", "status.json"]);
+  assert.equal(fs.readFileSync(path.join(targetDir, "profiles", "a1234567", "existing.txt"), "utf8"), "keep-me");
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(targetDir, "accounts.json"), "utf8")).accounts[0].label,
+    "Recovered",
+  );
+});
+
+test("FallbackController.pickNext does not skip ids[0] when current account was removed, and resetOfExhausted ignores expired timestamps", async () => {
+  const { FallbackController, resetOfExhausted } = require("../server/antigravity/fallback.ts");
+  const { PendingSwitches } = require("../server/antigravity/hooks.ts");
+
+  const now = Date.parse("2026-11-27T10:00:00Z");
+  const groupsWithExpiredAndFuture = [
+    {
+      name: "Gemini Models",
+      buckets: [
+        {
+          id: "b-expired",
+          name: "Expired",
+          window: "5h",
+          remainingFraction: 0.0,
+          resetTime: "2026-11-27T09:55:00Z",
+          disabled: false,
+        },
+        {
+          id: "b-future",
+          name: "Future",
+          window: "5h",
+          remainingFraction: 0.005,
+          resetTime: "2026-11-27T10:30:00Z",
+          disabled: false,
+        },
+      ],
+    },
+  ];
+  assert.equal(
+    resetOfExhausted(groupsWithExpiredAndFuture, "gemini", now),
+    Date.parse("2026-11-27T10:30:00Z"),
+    "expired resetTime must be ignored in favor of future resetTime",
+  );
+  const onlyExpired = [
+    {
+      name: "Gemini Models",
+      buckets: [
+        {
+          id: "b-expired",
+          name: "Expired",
+          window: "5h",
+          remainingFraction: 0.0,
+          resetTime: "2026-11-27T09:55:00Z",
+          disabled: false,
+        },
+      ],
+    },
+  ];
+  assert.equal(resetOfExhausted(onlyExpired, "gemini", now), null, "only expired timestamps must return null");
+
+  const fakeService = {
+    setCooldownProvider: () => {},
+    onStatusUpdated: () => () => {},
+    notifyChange: () => {},
+    fallbackSettings: () => ({ enabled: true, retries: 1, strategy: "order" }),
+    knownQuota: () => [{ name: "Gemini Models", buckets: [{ id: "g", name: "5h", window: "5h", remainingFraction: 0.9, resetTime: null, disabled: false }] }],
+    state: async () => ({
+      defaultAccountId: "default",
+      accounts: [
+        { id: "default", label: "First", kind: "system", status: "signed-in", usable: true, fallbackEnabled: true },
+        { id: "a2222222", label: "Second", kind: "profile", status: "signed-in", usable: true, fallbackEnabled: true },
+      ],
+    }),
+  };
+  const controller = new FallbackController(fakeService, new PendingSwitches());
+  try {
+    // Current account is no longer in `state.accounts` -> must start at index 0 (`default`), not skip it!
+    const picked = await controller.pickNext("a9999999", new Set(["a9999999"]), "gemini-4-neon", "order");
+    assert.equal(picked, "default");
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("SubagentReader keeps recreated swarm worker alive when members.json explicitly marks killed: false despite historical swarm kill by same name", async (t) => {
+  const cliDir = makeTempDir(t, "paseo-ag-recreate-");
+  const parentId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  const oldWorkerId = "10101010-1010-4010-8010-101010101010";
+  const newWorkerId = "20202020-2020-4020-8020-202020202020";
+  const parentBrain = path.join(cliDir, "brain", parentId);
+  const now = Date.now();
+  const iso = (offsetMs) => new Date(now + offsetMs).toISOString();
+
+  writeJsonl(path.join(parentBrain, ".system_generated", "logs", "transcript.jsonl"), [
+    {
+      step_index: 0,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: iso(-60_000),
+      tool_calls: [{ name: "swarm", args: { action: '"add"', name: '"worker"', brief: '"Old task"' } }],
+    },
+    {
+      step_index: 1,
+      type: "GENERIC",
+      status: "DONE",
+      created_at: iso(-59_000),
+      content: JSON.stringify({ status: "added", name: "worker", conversation_id: oldWorkerId }),
+    },
+    {
+      step_index: 2,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: iso(-40_000),
+      tool_calls: [{ name: "swarm", args: { action: '"kill"', name: '"worker"' } }],
+    },
+    {
+      step_index: 3,
+      type: "GENERIC",
+      status: "DONE",
+      created_at: iso(-39_500),
+      content: '{"status":"killed","name":"worker"}',
+    },
+    {
+      step_index: 4,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: iso(-10_000),
+      tool_calls: [{ name: "swarm", args: { action: '"add"', name: '"worker"', brief: '"Fresh task"' } }],
+    },
+    {
+      step_index: 5,
+      type: "GENERIC",
+      status: "DONE",
+      created_at: iso(-9_500),
+      content: JSON.stringify({ status: "added", name: "worker", conversation_id: newWorkerId }),
+    },
+  ]);
+
+  writeJson(path.join(parentBrain, ".system_generated", "swarm", "members.json"), {
+    title: "Recreated Worker Test",
+    members: {
+      coordinator: { conversation_id: parentId, role: "coordinator", killed: false },
+      worker: { conversation_id: newWorkerId, role: "worker", wake_mode: "working", killed: false },
+    },
+  });
+
+  writeJsonl(path.join(cliDir, "brain", oldWorkerId, ".system_generated", "logs", "transcript.jsonl"), [
+    {
+      step_index: 0,
+      type: "SYSTEM_MESSAGE",
+      status: "DONE",
+      created_at: iso(-59_000),
+      content: `<SYSTEM_MESSAGE>[Message] sender=${parentId} content=Old task</SYSTEM_MESSAGE>`,
+    },
+    {
+      step_index: 1,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: iso(-50_000),
+      tool_calls: [{ name: "read_file", args: { Path: '"/repo/old.ts"' } }],
+    },
+  ]);
+  writeJsonl(path.join(cliDir, "brain", newWorkerId, ".system_generated", "logs", "transcript.jsonl"), [
+    {
+      step_index: 0,
+      type: "SYSTEM_MESSAGE",
+      status: "DONE",
+      created_at: iso(-9_000),
+      content: `<SYSTEM_MESSAGE>[Message] sender=${parentId} content=Fresh task</SYSTEM_MESSAGE>`,
+    },
+    {
+      step_index: 1,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: iso(-2_000),
+      tool_calls: [{ name: "read_file", args: { Path: '"/repo/new.ts"' } }],
+    },
+    {
+      step_index: 2,
+      type: "GENERIC",
+      status: "RUNNING",
+      created_at: iso(-1_000),
+      content: "running",
+    },
+  ]);
+
+  const reader = new SubagentReader(
+    makeFakeContextReader({ "agent-recreate": { conversationId: parentId, closed: false, model: null } }),
+    cliDir,
+  );
+  const list = await reader.list({}, "agent-recreate");
+  const byId = new Map(list.subagents.map((s) => [s.id, s]));
+  assert.equal(byId.get(oldWorkerId)?.state, "stopped", "old killed worker stays stopped");
+  assert.equal(byId.get(newWorkerId)?.state, "running", "recreated worker with members.json killed:false must stay running");
+});
+
+test("SignInManager redacts OAuth codes containing +/=% and access_token key-values from failure messages", async (t) => {
+  const prevPaseoHome = process.env.PASEO_HOME;
+  const root = makeTempDir(t, "paseo-signin-redact-");
+  process.env.PASEO_HOME = path.join(root, "paseo-home");
+  t.after(() => {
+    if (prevPaseoHome === undefined) delete process.env.PASEO_HOME;
+    else process.env.PASEO_HOME = prevPaseoHome;
+  });
+
+  const { SignInManager } = require("../server/antigravity/signin.ts");
+  const { profileHome } = require("../server/antigravity/paths.ts");
+  const accountId = "a1b2c3d4";
+  fs.mkdirSync(profileHome(accountId), { recursive: true });
+
+  const oauthCode = "4/0AeanS0+AbCdEfGhIjKlMnOpQrStUvWxYz%2F12345==";
+  const fakeAgy = makeExecutable(
+    path.join(root, "fake-agy.js"),
+    `#!${process.execPath}
+process.stdout.write("Open https://accounts.google.com/o/oauth2/auth?state=st-123\\n");
+process.stdin.once("data", (chunk) => {
+  const pasted = chunk.toString("utf8").trim();
+  process.stderr.write("exchange failed for " + pasted + " access_token=ya29.SecretValue+With/Chars==\\n");
+  process.exit(1);
+});
+`,
+  );
+
+  const mgr = new SignInManager();
+  t.after(() => mgr.cancelAll());
+  const started = await mgr.start(fakeAgy, accountId);
+  await assert.rejects(
+    () => mgr.submit(started.loginId, oauthCode),
+    (err) => {
+      assert.ok(err instanceof Error);
+      assert.equal(err.message.includes("AeanS0"), false, `raw OAuth code leaked in error: ${err.message}`);
+      assert.equal(err.message.includes("ya29.SecretValue"), false, `access_token leaked in error: ${err.message}`);
+      assert.match(err.message, /<redacted>/);
+      return true;
+    },
+  );
+});
+
+test("transformToolCall manage_subagents supports ACP { output: string } wrapper objects for both list and kill", () => {
+  const transforms = createAntigravityTimelineTransforms();
+  const childUuid = "12345678-1234-4123-8123-123456789abc";
+
+  const wrappedList = transforms.transformToolCall({
+    type: "tool_call",
+    callId: "wrap-list",
+    name: "manage_subagents",
+    status: "completed",
+    detail: {
+      type: "unknown",
+      input: { Action: "list" },
+      output: {
+        output: `You have 1 active subagent(s): [{"conversationId":"${childUuid}","role":"verifier","state":"running"}]`,
+      },
+    },
+  });
+  assert.equal(wrappedList?.items[0].kind, agContracts.SUBAGENT_LIST_TIMELINE_KIND);
+  assert.deepEqual(wrappedList.items[0].data.states, [
+    { id: childUuid, role: "verifier", state: "running" },
+  ]);
+
+  const wrappedKill = transforms.transformToolCall({
+    type: "tool_call",
+    callId: "wrap-kill",
+    name: "manage_subagents",
+    status: "completed",
+    detail: {
+      type: "unknown",
+      input: { Action: "kill", ConversationIds: [childUuid] },
+      output: { output: "Killed 1 subagent(s).\nKilled roles: verifier" },
+    },
+  });
+  assert.equal(wrappedKill?.items[0].kind, agContracts.SUBAGENT_LIST_TIMELINE_KIND);
+  assert.deepEqual(wrappedKill.items[0].data.states, [
+    { id: childUuid, role: "verifier", state: "stopped" },
+  ]);
+});
+
+test("tool-summaries client cache throttles fetches within STALE_MS and evicts idle entries even when oldest entry has active listeners", async (t) => {
+  // Minimal isolated React hook harness for `useAntigravityCommandSummary`.
+  function createReactStub() {
+    let activeInst = null;
+    const stub = {
+      useState(init) {
+        const inst = activeInst;
+        const idx = inst.cursor++;
+        if (!(idx in inst.states)) {
+          inst.states[idx] = typeof init === "function" ? init() : init;
+        }
+        const setState = (next) => {
+          inst.states[idx] = typeof next === "function" ? next(inst.states[idx]) : next;
+        };
+        return [inst.states[idx], setState];
+      },
+      useRef(init) {
+        const inst = activeInst;
+        const idx = inst.cursor++;
+        if (!(idx in inst.refs)) inst.refs[idx] = { current: init };
+        return inst.refs[idx];
+      },
+      useEffect(fn, deps) {
+        const inst = activeInst;
+        const idx = inst.cursor++;
+        const prev = inst.effects[idx];
+        const changed =
+          !prev || !deps || !prev.deps || deps.length !== prev.deps.length || deps.some((d, i) => !Object.is(d, prev.deps[i]));
+        if (changed) {
+          inst.pendingEffects.push({ idx, fn, deps, prevCleanup: prev?.cleanup });
+        }
+      },
+    };
+    function mount(renderFn) {
+      const inst = { cursor: 0, states: [], refs: [], effects: [], pendingEffects: [], lastResult: undefined };
+      const render = () => {
+        inst.cursor = 0;
+        inst.pendingEffects = [];
+        activeInst = inst;
+        try {
+          inst.lastResult = renderFn();
+        } finally {
+          activeInst = null;
+        }
+        for (const eff of inst.pendingEffects) {
+          eff.prevCleanup?.();
+          const cleanup = eff.fn();
+          inst.effects[eff.idx] = { deps: eff.deps, cleanup: typeof cleanup === "function" ? cleanup : undefined };
+        }
+        return inst.lastResult;
+      };
+      const unmount = () => {
+        for (const eff of inst.effects) eff?.cleanup?.();
+        inst.effects = [];
+      };
+      render();
+      return { render, unmount };
+    }
+    return { stub, mount };
+  }
+
+  const { stub, mount } = createReactStub();
+  const originalLoad = Module._load;
+  const modPath = require.resolve("../client/antigravity/tool-summaries.ts");
+  delete require.cache[modPath];
+  Module._load = function patchedLoad(id, parent, isMain) {
+    if (id === "react") return stub;
+    return originalLoad.call(this, id, parent, isMain);
+  };
+  let mod;
+  try {
+    mod = require(modPath);
+  } finally {
+    Module._load = originalLoad;
+  }
+  t.after(() => {
+    delete require.cache[modPath];
+  });
+
+  const calls = new Map();
+  const unregister = mod.registerAntigravityToolSummariesReader(async (agentId) => {
+    calls.set(agentId, (calls.get(agentId) ?? 0) + 1);
+    return {
+      byCommand: { [`cmd-${agentId}`]: `摘要-${agentId}` },
+      prefixes: [],
+    };
+  });
+  t.after(() => unregister());
+
+  // 1. Throttling: two rows for the same agent within STALE_MS trigger only one RPC fetch.
+  const rowA = mount(() => mod.useAntigravityCommandSummary("ag-sticky", "cmd-ag-sticky", "completed", "r1", true));
+  const rowB = mount(() => mod.useAntigravityCommandSummary("ag-sticky", "other-cmd", "completed", "r2", true));
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(calls.get("ag-sticky"), 1, "same-agent rows within STALE_MS must share a single fetch");
+  assert.equal(rowA.render(), "摘要-ag-sticky");
+  rowB.unmount();
+
+  // 2. LRU eviction: keep `ag-sticky` mounted (active listener) at the head, then mount/unmount 45 other agents.
+  //    Idle older agents (e.g. `ag-idle-0`) must be evicted instead of being blocked by active `ag-sticky`.
+  for (let i = 0; i < 45; i += 1) {
+    const id = `ag-idle-${i}`;
+    const h = mount(() => mod.useAntigravityCommandSummary(id, `cmd-${id}`, "completed", `r-${i}`, true));
+    await Promise.resolve();
+    h.unmount();
+  }
+  await new Promise((r) => setTimeout(r, 15));
+  // `ag-sticky` is still cached (active listener kept it); `ag-idle-0` was evicted so remounting returns "" before re-fetch.
+  assert.equal(rowA.render(), "摘要-ag-sticky");
+  const probeEvicted = mount(() => mod.useAntigravityCommandSummary("ag-idle-0", "cmd-ag-idle-0", "completed", "probe", true));
+  assert.equal(probeEvicted.render(), "", "evicted idle entry must not remain cached when oldest entry had active listeners");
+  probeEvicted.unmount();
+  rowA.unmount();
+});
+
+test("after-turn deferred switch prevents FallbackController from blaming the newly switched account when agent.turn.after handlers run serially", async () => {
+  const { FallbackController } = require("../server/antigravity/fallback.ts");
+  const { PendingSwitches, registerHooks } = require("../server/antigravity/hooks.ts");
+
+  const metadata = { [agContracts.ACCOUNT_METADATA_KEY]: "default" };
+  let reloaded = 0;
+  const sentPrompts = [];
+  const timelineNotes = [];
+  const storeMap = new Map([
+    ["a2222222", { id: "a2222222", label: "Account B", unsafeDetail: null }],
+    ["a3333333", { id: "a3333333", label: "Account C", unsafeDetail: null }],
+  ]);
+
+  const fakeService = {
+    store: { get: (id) => storeMap.get(id) },
+    init: async () => {},
+    setCooldownProvider: () => {},
+    onStatusUpdated: () => () => {},
+    notifyChange: () => {},
+    fallbackSettings: () => ({ enabled: true, retries: 1, strategy: "order" }),
+    labelOf: (id) => (id === "default" ? "Account A" : storeMap.get(id)?.label ?? id),
+    requireAccount: (id) => (id === "default" ? null : storeMap.get(id) ?? null),
+    quotaFor: async () => ({ status: "signed-in" }),
+    refreshOne: async () => {},
+    knownQuota: () => [
+      {
+        name: "Gemini Models",
+        buckets: [{ id: "g", name: "5h", window: "5h", remainingFraction: 0.9, resetTime: null, disabled: false }],
+      },
+    ],
+    state: async () => ({
+      defaultAccountId: "default",
+      accounts: [
+        { id: "default", label: "Account A", kind: "system", status: "signed-in", usable: true, fallbackEnabled: true },
+        { id: "a2222222", label: "Account B", kind: "profile", status: "signed-in", usable: true, fallbackEnabled: true },
+        { id: "a3333333", label: "Account C", kind: "profile", status: "signed-in", usable: true, fallbackEnabled: true },
+      ],
+    }),
+  };
+
+  const pending = new PendingSwitches();
+  const controller = new FallbackController(fakeService, pending);
+  const { server, hooks } = createFakeServer();
+  // Match real registration order in `server/antigravity/index.ts`: hooks first, then fallback.
+  const hookRemovers = registerHooks(server, fakeService, pending, controller, { registerOpenBefore: false });
+  const unregisterFallback = controller.register(server);
+
+  const fakeAgentRef = {
+    refresh: async () => ({
+      agent: {
+        id: "agent-serial",
+        provider: "antigravity",
+        model: "gemini-4-neon",
+        status: "idle",
+        archivedAt: null,
+        metadata: { ...metadata },
+      },
+    }),
+    setMetadata: async (patch) => {
+      Object.assign(metadata, patch);
+    },
+    reload: async () => {
+      reloaded += 1;
+    },
+    send: async (text) => {
+      sentPrompts.push(text);
+    },
+    timeline: {
+      refetch: async () => ({ agent: { id: "agent-serial", provider: "antigravity", model: "gemini-4-neon", metadata: { ...metadata } }, entries: [] }),
+      append: async (item) => {
+        timelineNotes.push(item);
+      },
+    },
+  };
+  const fakePaseo = { agents: { ref: () => fakeAgentRef } };
+
+  try {
+    // Schedule an after-turn switch from Account A (`default`) -> Account B (`a2222222`).
+    pending.set("agent-serial", "a2222222");
+
+    // Paseo dispatches all `agent.turn.after` handlers serially for the failed turn on Account A.
+    const turnAfterHooks = hooks.filter((h) => h.name === "agent.turn.after");
+    assert.ok(turnAfterHooks.length >= 3);
+    const failedEvent = {
+      agent: { id: "agent-serial", provider: "antigravity", metadata: { ...metadata } },
+      turnId: "turn-fail-1",
+      outcome: { kind: "failed", error: { message: "429 resource_exhausted" } },
+    };
+    for (const hook of turnAfterHooks) {
+      await hook.handler(failedEvent, { paseo: fakePaseo, signal: new AbortController().signal });
+    }
+
+    assert.equal(metadata[agContracts.ACCOUNT_METADATA_KEY], "a2222222", "must stay on newly switched Account B without bouncing to C");
+    assert.equal(reloaded, 1, "must reload exactly once for the deferred switch");
+    assert.deepEqual(sentPrompts, [], "must not auto-send Continue. after a deferred manual switch");
+    assert.deepEqual(controller.cooldownsOf("a2222222"), [], "healthy Account B must not receive cooldown for Account A's failure");
+    assert.equal(timelineNotes.length, 0, "must not record a fallback switch event for the deferred manual switch");
+
+    // Starting the next turn clears deferred-turn suppression so genuine failures on Account B still trigger fallback to C.
+    const turnBeforeHooks = hooks.filter((h) => h.name === "agent.turn.before");
+    for (const hook of turnBeforeHooks) {
+      await hook.handler(
+        { agent: { id: "agent-serial", provider: "antigravity", metadata: { ...metadata } } },
+        { paseo: fakePaseo, signal: new AbortController().signal },
+      );
+    }
+    const nextFailEvent = {
+      agent: { id: "agent-serial", provider: "antigravity", metadata: { ...metadata } },
+      turnId: "turn-fail-2",
+      outcome: { kind: "failed", error: { message: "429 resource_exhausted" } },
+    };
+    for (const hook of turnAfterHooks) {
+      await hook.handler(nextFailEvent, { paseo: fakePaseo, signal: new AbortController().signal });
+    }
+    assert.equal(metadata[agContracts.ACCOUNT_METADATA_KEY], "a3333333", "subsequent genuine failure on B must fall back to C");
+    assert.equal(controller.cooldownsOf("a2222222").length, 1);
+    assert.deepEqual(sentPrompts, ["Continue."]);
+  } finally {
+    unregisterFallback();
+    for (const remove of hookRemovers) remove();
+    controller.dispose();
   }
 });

@@ -11,7 +11,7 @@ import {
   type SavedFiles,
 } from "../../shared/antigravity/contracts";
 import { agyVersion, probeAccount, readAccountEmail, readPlan, type AccountPlan } from "./agy";
-import { dataDir, displayPath, profileHome, resolveAgy } from "./paths";
+import { dataDir, displayPath, migrateLegacyDataDir, profileHome, resolveAgy } from "./paths";
 import {
   deleteSignIn,
   ensureProfile,
@@ -63,6 +63,7 @@ export class AccountService {
   private readonly runtime = new Map<string, RuntimeStatus>();
   private readonly probing = new Map<string, { epoch: number; task: Promise<void> }>();
   private readonly epochs = new Map<string, number>();
+  private readonly removing = new Set<string>();
   private readonly listeners = new Set<(revision: number) => void>();
   private readonly statusListeners = new Set<(event: StatusUpdateEvent) => void>();
   private cooldownProvider: (accountId: string) => AccountCooldown[] = () => [];
@@ -80,6 +81,9 @@ export class AccountService {
   /** Loads the account list and the last known statuses, so a restart shows quota at once. */
   init(): Promise<void> {
     this.initialized ??= (async () => {
+      await migrateLegacyDataDir().catch((error: unknown) => {
+        console.error("dsh-paseo/antigravity: legacy data directory migration failed", error);
+      });
       await this.store.load();
       try {
         const raw = JSON.parse(await fs.readFile(statusFile(), "utf8")) as Record<string, RuntimeStatus>;
@@ -105,6 +109,7 @@ export class AccountService {
   }
 
   private exists(accountId: string): boolean {
+    if (this.removing.has(accountId)) return false;
     return accountId === SYSTEM_ACCOUNT_ID || Boolean(this.store.get(accountId));
   }
 
@@ -225,10 +230,15 @@ export class AccountService {
 
   /** Ensures a profile account's HOME and settings.json (with any per-account Orchestrator override). */
   async ensureAccountProfile(accountId: string): Promise<string | null> {
-    if (accountId === SYSTEM_ACCOUNT_ID) return null;
+    if (accountId === SYSTEM_ACCOUNT_ID || this.removing.has(accountId)) return null;
     const account = this.store.get(accountId);
     if (!account) return null;
-    return ensureProfile(accountId, account.orchestrator);
+    let proceeded = false;
+    const home = await ensureProfile(accountId, account.orchestrator, () => {
+      proceeded = this.exists(accountId);
+      return proceeded;
+    });
+    return proceeded ? home : null;
   }
 
   /** Re-syncs settings.json into every existing profile (e.g. after global Orchestrator settings change). */
@@ -236,7 +246,7 @@ export class AccountService {
     const accounts = this.store.snapshot().accounts;
     await Promise.all(
       accounts.map((account) =>
-        ensureProfile(account.id, account.orchestrator).catch((error: unknown) => {
+        ensureProfile(account.id, account.orchestrator, () => this.exists(account.id)).catch((error: unknown) => {
           console.error(`dsh-paseo/antigravity: could not sync settings for ${account.id}`, error);
         }),
       ),
@@ -245,9 +255,12 @@ export class AccountService {
 
   /** Re-checks sign-in and quota for one account. Concurrent calls of the same epoch share one probe. */
   refreshOne(accountId: string, options?: { forcePlan?: boolean }): Promise<void> {
-    const epoch = this.epochOf(accountId);
+    if (!this.exists(accountId)) return Promise.resolve();
+    const currentEpoch = this.epochOf(accountId);
     const running = this.probing.get(accountId);
-    if (running && running.epoch === epoch && !options?.forcePlan) return running.task;
+    if (running && running.epoch === currentEpoch && !options?.forcePlan) return running.task;
+    // Bump the epoch when forcing a fresh probe so an older in-flight probe cannot overwrite newer plan/quota.
+    const epoch = options?.forcePlan ? this.bumpEpoch(accountId) : currentEpoch;
     const task = (async () => {
       if (!this.exists(accountId)) return;
       const agy = await this.agy();
@@ -341,7 +354,7 @@ export class AccountService {
       })
       .finally(() => {
         if (this.probing.get(accountId)?.task === task) this.probing.delete(accountId);
-        if (this.exists(accountId)) this.changed();
+        if (this.exists(accountId) && this.epochOf(accountId) === epoch) this.changed();
       });
     this.probing.set(accountId, { epoch, task });
     return task;
@@ -570,18 +583,23 @@ export class AccountService {
   /** Removes a profile account. Returns where its saved files went, or null when it had none. */
   async remove(accountId: string): Promise<SavedFiles | null> {
     const account = this.requireProfileAccount(accountId);
-    this.bumpEpoch(accountId);
-    this.probing.delete(accountId);
-    this.signIns.cancelForAccount(accountId);
-    const preserved = await removeProfile(accountId, account.label);
-    await this.store.update((data) => {
-      data.accounts = data.accounts.filter((entry) => entry.id !== accountId);
-      data.order = data.order.filter((id) => id !== accountId);
-      if (data.defaultAccountId === accountId) data.defaultAccountId = SYSTEM_ACCOUNT_ID;
-    });
-    this.runtime.delete(accountId);
-    this.changed();
-    return preserved ? { items: preserved.items, folder: displayPath(preserved.folder) } : null;
+    this.removing.add(accountId);
+    try {
+      this.bumpEpoch(accountId);
+      this.probing.delete(accountId);
+      this.signIns.cancelForAccount(accountId);
+      const preserved = await removeProfile(accountId, account.label);
+      await this.store.update((data) => {
+        data.accounts = data.accounts.filter((entry) => entry.id !== accountId);
+        data.order = data.order.filter((id) => id !== accountId);
+        if (data.defaultAccountId === accountId) data.defaultAccountId = SYSTEM_ACCOUNT_ID;
+      });
+      this.runtime.delete(accountId);
+      this.changed();
+      return preserved ? { items: preserved.items, folder: displayPath(preserved.folder) } : null;
+    } finally {
+      this.removing.delete(accountId);
+    }
   }
 
   async signOut(accountId: string): Promise<void> {

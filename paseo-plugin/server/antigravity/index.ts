@@ -24,6 +24,7 @@ import {
   subagentDetailRpc,
   submitSignInRpc,
   switchAgentAccountRpc,
+  toolSummariesRpc,
   watchAccountsSubscription,
 } from "../../shared/antigravity/contracts";
 import { AccountService } from "./accounts";
@@ -34,7 +35,6 @@ import { OrchestratorSettings } from "./orchestrator";
 import {
   detectAntigravityPresence,
   legacyPricingFile,
-  migrateLegacyDataDir,
   shouldRegisterAntigravityOpenHookSync,
   type AntigravityPresence,
 } from "./paths";
@@ -76,12 +76,9 @@ export function registerAntigravityServer(
   const detectPresence = opts.detectPresence ?? (() => detectAntigravityPresence());
   const registerOpenBefore = opts.registerOpenBefore ?? shouldRegisterAntigravityOpenHookSync();
 
-  // Run one-time legacy data dir migration before reading accounts.json or status.json.
-  const ready = migrateLegacyDataDir()
-    .catch((error: unknown) => {
-      console.error("dsh-paseo/antigravity: legacy data directory migration failed", error);
-    })
-    .then(() => service.init());
+  // AccountService.init() runs one-time legacy data dir migration before loading accounts.json/status.json,
+  // ensuring hooks, fallback, orchestrator, usage source, and RPCs all share the same ordered init promise.
+  const ready = service.init();
 
   let disposed = false;
   let warmup: NodeJS.Timeout | null = null;
@@ -281,6 +278,11 @@ export function registerAntigravityServer(
     server.handle(subagentArtifactRpc, async ({ agentId, subagentId, path: artifactPath }, ctx) => {
       onContext?.(ctx);
       return subagents.artifact(ctx.paseo, agentId, subagentId, artifactPath);
+    });
+
+    server.handle(toolSummariesRpc, async ({ agentId }, ctx) => {
+      onContext?.(ctx);
+      return subagents.toolSummaries(ctx.paseo, agentId);
     });
 
     server.handle(getOrchestratorRpc, async ({ refresh }, ctx) => {

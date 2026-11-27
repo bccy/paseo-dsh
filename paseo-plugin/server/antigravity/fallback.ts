@@ -27,12 +27,122 @@ const AUTH = /authenticat|sign.?in|log.?in|unauthori[sz]ed|\b401\b|\b403\b|permi
 const TRANSIENT =
   /\b5\d\d\b|unavailable|deadline|timed? ?out|timeout|econn|etimedout|socket|network|overloaded|capacity|internal|temporar|did not initialize|exited/i;
 
+/**
+ * Remaining fraction at or below which a quota bucket is treated as unusable.
+ * Matches `reconcileStatus()`'s `> 0.01` recovery threshold so an account at e.g. 0.6%
+ * (which immediately rejects real prompts with HTTP 429) is not routed new work or stuck
+ * between exhausted and recovered.
+ */
+export const EXHAUSTED_THRESHOLD = 0.01;
+
+/**
+ * `agy acp` reports quota/auth rejections (e.g. HTTP 429) as a warning line inside a normal
+ * `assistant_message` and resolves `session/prompt` with `stopReason: "end_turn"`.
+ * Match only a standalone `⚠` warning line from `agy` so normal prose discussing quotas never trips it.
+ */
+const AGY_SOFT_FAILURE_LINE =
+  /^\s*⚠\uFE0F?\s*(?:(?:individual\s+|model\s+)?quota\s+(?:reached|exceeded|exhausted)|you\s+(?:have\s+)?reached\s+(?:your|the)\s+(?:usage|quota|rate)\s+limit|rate\s+limit\s+(?:reached|exceeded)|resource[_\s]+exhausted|too\s+many\s+requests|you\s+are\s+not\s+logged\s+into\s+antigravity|authentication\s+(?:failed|required)|please\s+sign\s+in\s+to\s+antigravity)\b/i;
+
+const RESET_IN_RE = /\bresets?\s+in\s+(?:(\d+)\s*d)?\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?/i;
+
 export function classify(message: string, code?: string): FailureKind {
   const text = `${code ?? ""} ${message}`;
   if (QUOTA.test(text)) return "quota";
   if (AUTH.test(text)) return "auth";
   if (TRANSIENT.test(text)) return "transient";
   return "error";
+}
+
+/** Parses `Resets in 1h1m24s` / `Resets in 11m21s` into milliseconds, or null if absent. */
+export function parseResetDelayMs(message: string): number | null {
+  const match = RESET_IN_RE.exec(message);
+  if (!match) return null;
+  const days = match[1] ? Number(match[1]) : 0;
+  const hours = match[2] ? Number(match[2]) : 0;
+  const minutes = match[3] ? Number(match[3]) : 0;
+  const seconds = match[4] ? Number(match[4]) : 0;
+  const totalSec = days * 86400 + hours * 3600 + minutes * 60 + seconds;
+  return totalSec > 0 ? totalSec * 1000 : null;
+}
+
+/**
+ * Extracts a trailing `agy` soft-failure warning line (e.g. `⚠ Individual quota reached...`)
+ * from an assistant/notification message, ignoring lines inside fenced code blocks.
+ */
+export function extractAgySoftFailureLine(text: string): string | null {
+  let inFence = false;
+  let lastNonEmpty: { line: string; inFence: boolean } | null = null;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (/^(?:```|~~~)/.test(trimmed)) {
+      inFence = !inFence;
+      lastNonEmpty = { line: trimmed, inFence: true };
+      continue;
+    }
+    if (trimmed.length > 0) {
+      lastNonEmpty = { line: rawLine, inFence };
+    }
+  }
+  if (!lastNonEmpty || lastNonEmpty.inFence) return null;
+  return AGY_SOFT_FAILURE_LINE.test(lastNonEmpty.line) ? lastNonEmpty.line.trim() : null;
+}
+
+export interface TimelineEntryLike {
+  turnId?: string;
+  item?: {
+    type?: string;
+    kind?: string;
+    text?: unknown;
+    message?: unknown;
+  };
+}
+
+/**
+ * Inspects the tail timeline entries of a `"completed"` Antigravity turn to detect soft
+ * quota/auth rejections emitted by `agy acp` as normal messages instead of JSON-RPC errors.
+ */
+export function extractSoftTurnFailure(
+  entries: readonly TimelineEntryLike[] | null | undefined,
+  turnId?: string | null,
+): { message: string } | null {
+  if (!entries?.length) return null;
+  let scope = entries;
+  if (turnId && entries.some((entry) => entry.turnId === turnId)) {
+    scope = entries.filter((entry) => entry.turnId === turnId);
+  } else {
+    for (let i = entries.length - 1; i >= 0; i -= 1) {
+      if (entries[i]?.item?.type === "user_message") {
+        scope = entries.slice(i + 1);
+        break;
+      }
+    }
+  }
+  if (!scope.length) return null;
+  // Already recorded a fallback event in this turn: never re-trigger.
+  if (scope.some((entry) => entry.item?.type === "plugin" && entry.item.kind === FALLBACK_TIMELINE_KIND)) {
+    return null;
+  }
+  for (let i = scope.length - 1; i >= 0; i -= 1) {
+    const item = scope[i]?.item;
+    if (!item || !item.type) continue;
+    if (item.type === "plugin" || item.type === "todo" || item.type === "compaction" || item.type === "reasoning") {
+      continue;
+    }
+    if (item.type === "error") {
+      const msg = typeof item.message === "string" ? item.message.trim() : typeof item.text === "string" ? item.text.trim() : "";
+      if (!msg) return null;
+      const kind = classify(msg);
+      return kind === "quota" || kind === "auth" ? { message: msg } : null;
+    }
+    if (item.type === "assistant_message" || item.type === "notification") {
+      const body = typeof item.text === "string" ? item.text : typeof item.message === "string" ? item.message : "";
+      const warning = extractAgySoftFailureLine(body);
+      return warning ? { message: warning } : null;
+    }
+    // Any other terminal item (e.g. a completed tool call without trailing warning) is not a soft failure.
+    return null;
+  }
+  return null;
 }
 
 interface Chain {
@@ -73,17 +183,20 @@ export function groupForPool(
   return groups.find((group) => /gemini/i.test(group.name) && !/argon/i.test(group.name)) ?? groups[0] ?? null;
 }
 
-/** Earliest reset among exhausted buckets in the target pool, else null. */
+/** Earliest reset among exhausted buckets in the target pool, else null. When `now` is given, ignores already-elapsed timestamps. */
 export function resetOfExhausted(
   groups: readonly QuotaGroup[] | null,
   pool: "gemini" | "third-party",
+  now?: number,
 ): number | null {
   const group = groupForPool(groups, pool);
   let earliest: number | null = null;
   for (const bucket of group?.buckets ?? []) {
-    if (bucket.disabled || bucket.remainingFraction === null || bucket.remainingFraction > 0.001) continue;
+    if (bucket.disabled || bucket.remainingFraction === null || bucket.remainingFraction > EXHAUSTED_THRESHOLD) continue;
     const at = bucket.resetTime ? Date.parse(bucket.resetTime) : NaN;
-    if (Number.isFinite(at) && (earliest === null || at < earliest)) earliest = at;
+    if (!Number.isFinite(at)) continue;
+    if (now !== undefined && at <= now) continue;
+    if (earliest === null || at < earliest) earliest = at;
   }
   return earliest;
 }
@@ -95,7 +208,7 @@ export function exhausted(
 ): boolean {
   const group = groupForPool(groups, pool);
   return (group?.buckets ?? []).some(
-    (bucket) => !bucket.disabled && bucket.remainingFraction !== null && bucket.remainingFraction <= 0.001,
+    (bucket) => !bucket.disabled && bucket.remainingFraction !== null && bucket.remainingFraction <= EXHAUSTED_THRESHOLD,
   );
 }
 
@@ -128,6 +241,7 @@ export class FallbackController {
   /** Per-agent pending retry timer, canceled when a new turn starts or completes. */
   private readonly retryTimers = new Map<string, NodeJS.Timeout>();
   private readonly redirectTimers = new Set<NodeJS.Timeout>();
+  private readonly handling = new Set<string>();
   private noteSeq = 0;
 
   constructor(
@@ -204,7 +318,7 @@ export class FallbackController {
       changed = true;
     }
     for (const pool of ["gemini", "third-party"] as const) {
-      if (entry[pool]?.reason === "quota" && !exhausted(quota, pool) && poolRemainingScore(quota, pool) > 0.01) {
+      if (entry[pool]?.reason === "quota" && !exhausted(quota, pool) && poolRemainingScore(quota, pool) > EXHAUSTED_THRESHOLD) {
         delete entry[pool];
         changed = true;
       }
@@ -233,42 +347,80 @@ export class FallbackController {
         options?.onContext?.(ctx);
         if (!isAntigravityProvider(agent.provider)) return;
         this.cancelRetry(agent.id);
+        this.pending.clearDeferredTurn(agent.id);
       }),
       server.addHook("agent.archive.after", async ({ agent }, ctx) => {
         options?.onContext?.(ctx);
         this.cancelRetry(agent.id);
+        this.pending.clearDeferredTurn(agent.id);
         this.chains.delete(agent.id);
       }),
-      server.addHook("agent.turn.after", async ({ agent, outcome }, ctx) => {
+      server.addHook("agent.turn.after", async ({ agent, turnId, outcome }, ctx) => {
         options?.onContext?.(ctx);
         const { paseo } = ctx;
         if (!isAntigravityProvider(agent.provider)) return;
         this.cancelRetry(agent.id);
-        if (outcome.kind !== "failed") {
-          // A finished or canceled turn ends the chain; the user decides what happens next.
+        if (this.pending.hasPendingOrActive(agent.id) || this.pending.wasDeferredForTurn(agent.id, turnId)) {
+          // A manual after-turn account switch is pending, running, or already claimed this turn:
+          // yield to it instead of cooling the newly switched account or racing it.
+          this.chains.delete(agent.id);
+          return;
+        }
+        if (outcome.kind === "canceled") {
+          // A canceled turn ends the chain; the user decides what happens next.
           this.chains.delete(agent.id);
           return;
         }
         await this.service.init();
         const settings = this.service.fallbackSettings();
-        if (!settings.enabled) return;
+        if (!settings.enabled) {
+          if (outcome.kind !== "failed") this.chains.delete(agent.id);
+          return;
+        }
+        if (this.handling.has(agent.id)) return;
+        this.handling.add(agent.id);
         try {
-          const snapshot = await paseo.agents
-            .ref(agent.id)
-            .refresh()
-            .catch(() => null);
-          const model = snapshot?.agent.model ?? null;
+          let failureError: { message: string; code?: string } | null = null;
+          let model: string | null = null;
+          let currentAccount = accountIdFromMetadata(agent.metadata);
+          if (outcome.kind === "failed") {
+            failureError = outcome.error;
+          } else {
+            // `agy acp` emits quota/auth warnings as normal assistant messages and resolves
+            // `session/prompt` cleanly (`outcome.kind === "completed"`). Inspect the latest turn tail.
+            const page = await paseo.agents
+              .ref(agent.id)
+              .timeline.refetch({ direction: "tail", limit: 6 })
+              .catch(() => null);
+            model = page?.agent?.model ?? null;
+            if (page?.agent?.metadata) currentAccount = accountIdFromMetadata(page.agent.metadata);
+            failureError = extractSoftTurnFailure(page?.entries, turnId ?? null);
+            if (!failureError) {
+              this.chains.delete(agent.id);
+              return;
+            }
+          }
+          if (model === null) {
+            const snapshot = await paseo.agents
+              .ref(agent.id)
+              .refresh()
+              .catch(() => null);
+            model = snapshot?.agent.model ?? null;
+            if (snapshot?.agent.metadata) currentAccount = accountIdFromMetadata(snapshot.agent.metadata);
+          }
           await this.handleFailure(
             paseo,
             agent.id,
-            accountIdFromMetadata(agent.metadata),
+            currentAccount,
             model,
-            outcome.error,
+            failureError,
             settings.retries,
             settings.strategy,
           );
         } catch (error) {
           console.error(`dsh-paseo/antigravity: fallback for ${agent.id} failed`, error);
+        } finally {
+          this.handling.delete(agent.id);
         }
       }),
     ];
@@ -304,13 +456,16 @@ export class FallbackController {
       return;
     }
 
+    const now = Date.now();
     const cooldownPool: QuotaPool = reason === "auth" ? "all" : pool;
+    const resetDelayMs = reason === "quota" ? parseResetDelayMs(error.message) : null;
     const until =
       reason === "quota"
-        ? (resetOfExhausted(this.service.knownQuota(current), pool) ?? Date.now() + 30 * 60_000)
+        ? (resetOfExhausted(this.service.knownQuota(current), pool, now) ??
+          (resetDelayMs !== null ? now + resetDelayMs : now + 30 * 60_000))
         : reason === "auth"
-          ? Date.now() + 6 * 3_600_000
-          : Date.now() + 10 * 60_000;
+          ? now + 6 * 3_600_000
+          : now + 10 * 60_000;
     this.setCooldown(current, cooldownPool, until, reason);
 
     // Keep trying candidates when one fails to open (e.g. an account that lacks the agent's model).
@@ -331,7 +486,12 @@ export class FallbackController {
       }
       chain.tried.add(next);
       try {
-        await switchAgentAccount(paseo, this.service, this.pending, { agentId, accountId: next, when: "now" });
+        await switchAgentAccount(paseo, this.service, this.pending, {
+          agentId,
+          accountId: next,
+          when: "now",
+          manual: true,
+        });
       } catch (switchError) {
         console.warn(
           `dsh-paseo/antigravity: fallback candidate ${next} could not take ${agentId}:`,
@@ -367,12 +527,17 @@ export class FallbackController {
     const pool = quotaPoolForModel(model);
     const state = await this.service.state();
     const ids = state.accounts.map((account) => account.id);
-    const start = Math.max(0, ids.indexOf(current));
+    const currentIndex = ids.indexOf(current);
     const ordered: AccountSummary[] = [];
-    for (let step = 1; step < ids.length; step += 1) {
-      const id = ids[(start + step) % ids.length]!;
-      const account = state.accounts.find((entry) => entry.id === id);
-      if (account) ordered.push(account);
+    if (currentIndex < 0) {
+      // Removed current account: evaluate all configured accounts from the top of priority order.
+      ordered.push(...state.accounts);
+    } else {
+      for (let step = 1; step < ids.length; step += 1) {
+        const id = ids[(currentIndex + step) % ids.length]!;
+        const account = state.accounts.find((entry) => entry.id === id);
+        if (account) ordered.push(account);
+      }
     }
 
     const candidates: Array<{ id: string; orderIndex: number; score: number; soonestReset: number }> = [];

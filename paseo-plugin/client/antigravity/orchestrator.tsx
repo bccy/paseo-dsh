@@ -1,7 +1,7 @@
-import { useRpc, useTranslation } from "@getpaseo/plugin/client";
+import { useRpc } from "@getpaseo/plugin/client";
 import { Modal, SettingsRow, SettingsSelect, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Text, View } from "react-native";
 import {
   getOrchestratorRpc,
@@ -11,7 +11,7 @@ import {
   type OrchestratorState,
 } from "../../shared/antigravity/contracts";
 import { displayLabel, joinList } from "./labels";
-import { errorMessage, messages } from "./messages";
+import { errorMessage, useAntigravityTranslation } from "./messages";
 import { font, space, type Colors } from "./theme";
 import { Button, Callout, Muted } from "./ui";
 
@@ -102,7 +102,7 @@ export function OrchestratorRows({
   accounts: readonly AccountSummary[];
   onChange(state: OrchestratorState): void;
 }) {
-  const { t, locale } = useTranslation(messages);
+  const { t, locale } = useAntigravityTranslation();
   const toast = useToast();
   const cache = useQueryClient();
   const read = useRpc(getOrchestratorRpc);
@@ -219,7 +219,7 @@ export function AccountOrchestratorDialog({
   onSaved(state: OrchestratorState): void;
   onClose(): void;
 }) {
-  const { t } = useTranslation(messages);
+  const { t } = useAntigravityTranslation();
   const toast = useToast();
   const cache = useQueryClient();
   const read = useRpc(getOrchestratorRpc);
@@ -233,13 +233,20 @@ export function AccountOrchestratorDialog({
   const [executor, setExecutor] = useState<string>(account.orchestratorOverride?.executor ?? DEFAULT_VALUE);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const seededAccountRef = useRef<string | null>(account.orchestratorOverride ? account.id : null);
 
   useEffect(() => {
-    if (!account.orchestratorOverride && state && mode === "custom" && planner === DEFAULT_VALUE && executor === DEFAULT_VALUE) {
+    if (account.orchestratorOverride) {
+      seededAccountRef.current = account.id;
+      return;
+    }
+    if (seededAccountRef.current === account.id) return;
+    if (state && mode === "custom") {
+      seededAccountRef.current = account.id;
       setPlanner(state.planner ?? DEFAULT_VALUE);
       setExecutor(state.executor ?? DEFAULT_VALUE);
     }
-  }, [account.orchestratorOverride, state, mode, planner, executor]);
+  }, [account.id, account.orchestratorOverride, state, mode]);
 
   const accountPlanners = (state?.planners ?? []).filter((family) => family.accounts.includes(account.id));
   const accountExecutors = (state?.executors ?? []).filter((family) => family.accounts.includes(account.id));

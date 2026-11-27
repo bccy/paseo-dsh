@@ -1942,14 +1942,38 @@ test("PricingStore.state and registerPricingRpc surface DSH-configured models cl
   assert.equal(rpcFallback.models.find((row) => row.key === "claude-sonnet-4")?.configured, false);
 });
 
-test("shared/pricing.ts stays Hermes-safe and index.server.ts registers zero agent.open.before hooks", () => {
-  const sharedSrc = fs.readFileSync(path.join(__dirname, "../shared/pricing.ts"), "utf8");
+test("client/shared modules stay Hermes-safe (no regex lookbehind) and index.server.ts registers zero agent.open.before hooks", () => {
+  const pluginRoot = path.resolve(__dirname, "..");
+  const sharedSrc = fs.readFileSync(path.join(pluginRoot, "shared/pricing.ts"), "utf8");
   const sharedCode = sharedSrc.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
   assert.equal(/["']node:/.test(sharedCode), false, "shared/pricing.ts must have zero node:* imports");
   assert.equal(/\bstructuredClone\b/.test(sharedCode), false, "shared/pricing.ts must not use structuredClone");
-  assert.equal(/\(\?<[=!]/.test(sharedCode), false, "shared/pricing.ts must not use regex lookbehind");
 
-  const serverEntry = fs.readFileSync(path.join(__dirname, "../index.server.ts"), "utf8");
+  const collectTs = (dir, out = []) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const abs = path.join(dir, entry.name);
+      if (entry.isDirectory()) collectTs(abs, out);
+      else if (/\.(ts|tsx)$/.test(entry.name) && !/\.d\.ts$/.test(entry.name)) out.push(abs);
+    }
+    return out;
+  };
+  const hermesTargets = [
+    path.join(pluginRoot, "index.client.tsx"),
+    ...collectTs(path.join(pluginRoot, "client")),
+    ...collectTs(path.join(pluginRoot, "shared")),
+  ];
+  assert.ok(hermesTargets.length > 0, "Hermes scan must cover client/shared sources");
+  for (const file of hermesTargets) {
+    const src = fs.readFileSync(file, "utf8");
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+    assert.equal(
+      /\(\?<[=!]/.test(code),
+      false,
+      `${path.relative(pluginRoot, file)} must not use regex lookbehind (incompatible with Hermes)`,
+    );
+  }
+
+  const serverEntry = fs.readFileSync(path.join(pluginRoot, "index.server.ts"), "utf8");
   const serverCode = serverEntry.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
   assert.equal(serverCode.includes("agent.session_open"), false);
   assert.equal(serverCode.includes("agent.open.before"), false);
