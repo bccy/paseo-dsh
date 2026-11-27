@@ -180,6 +180,15 @@ export interface DshPluginsOptions {
    * the real global installation.
    */
   installAnchor?: string | null;
+  /** Optional callback fired when a background package job (`install`/`remove`/`update`/`update-all`) settles. */
+  onJobFinished?: (event: {
+    readonly id: string;
+    readonly kind: JobKind;
+    readonly ok: boolean;
+    readonly target?: string;
+    readonly errorCode?: FailureCode;
+    readonly errorDetail?: string;
+  }) => void;
   /**
    * @internal Test seam: spawn one `dsh` invocation (`cwd`/`env`/`detached` are
    * the launcher inputs). Defaults to {@link spawnDshCommand}.
@@ -946,6 +955,7 @@ export class DshPlugins {
 
   /** One spawn point; overridable only by the test seam in the options. */
   readonly #spawnDsh: (args: readonly string[], options: SpawnDshOptions) => ChildProcess;
+  readonly #onJobFinished: DshPluginsOptions["onJobFinished"];
 
   #jobs = new Map<string, Job>();
   #activeJobId: string | undefined;
@@ -962,6 +972,7 @@ export class DshPlugins {
       ? undefined
       : options.installAnchor ?? defaultInstallAnchor();
     this.#spawnDsh = options.spawn ?? spawnDshCommand;
+    this.#onJobFinished = options.onJobFinished;
   }
 
   /**
@@ -1177,6 +1188,15 @@ export class DshPlugins {
     this.#jobs.set(job.id, job);
     this.#activeJobId = job.id;
 
+    const target =
+      input.kind === "install"
+        ? input.spec
+        : input.kind === "remove" || input.kind === "update"
+          ? input.name
+          : input.kind === "update-all" && input.targets.length === 1
+            ? input.targets[0]?.name
+            : undefined;
+
     void this.#runJob(job, input)
       .then(() => {
         job.state = "succeeded";
@@ -1190,6 +1210,16 @@ export class DshPlugins {
       .finally(() => {
         job.finishedAt = Date.now();
         if (this.#activeJobId === job.id) this.#activeJobId = undefined;
+        if (!this.#disposed && job.kind !== "check") {
+          this.#onJobFinished?.({
+            id: job.id,
+            kind: job.kind,
+            ok: job.state === "succeeded",
+            ...(target === undefined ? {} : { target }),
+            ...(job.errorCode === undefined ? {} : { errorCode: job.errorCode }),
+            ...(job.errorDetail === undefined ? {} : { errorDetail: job.errorDetail }),
+          });
+        }
         this.#pruneJobs();
       });
 

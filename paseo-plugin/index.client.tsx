@@ -725,6 +725,35 @@ function buildContributions(client: PluginClientContext): () => void {
     () => workspaceStatus.dispose(),
     bindSubagentLiveClient(client),
     retainRowEntranceObservers(),
+    ...(typeof client.onNotificationOpen === "function"
+      ? [
+          client.onNotificationOpen((context) => {
+            const data = context.event.data;
+            if (!data || typeof data !== "object") return;
+            const kind = typeof data["kind"] === "string" ? data["kind"] : "";
+            if (kind === "account-signed-out") {
+              requestConsoleTab("antigravity");
+              context.openScreen({
+                screenId: CONSOLE_SCREEN_ID,
+                params: { tab: "antigravity" },
+              });
+              return;
+            }
+            if (kind === "dsh-plugin-job") {
+              requestConsoleTab("plugins");
+              context.openScreen({
+                screenId: CONSOLE_SCREEN_ID,
+                params: { tab: "plugins" },
+              });
+              return;
+            }
+            const agentId = typeof data["agentId"] === "string" ? data["agentId"] : "";
+            if (agentId && (kind === "fallback-switch" || kind === "fallback-exhausted" || kind === "dsh-goal")) {
+              context.navigation.openAgent({ agentId });
+            }
+          }),
+        ]
+      : []),
   ];
 
   // The live witness behind the capsule: a per-agent timeline subscription

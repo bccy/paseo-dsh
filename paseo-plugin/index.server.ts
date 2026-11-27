@@ -16,6 +16,7 @@ import { DiagnosticsService, registerDiagnosticsRpc } from "./server/diagnostics
 import { resolveDshCommand } from "./server/dsh-command.mjs";
 import { DshPlugins } from "./server/dsh-plugins";
 import { registerDshPluginsRpc } from "./server/dsh-plugins-rpc";
+import { createGoalNotificationObserver, createNotificationDispatcher } from "./server/notifications";
 import { createPillFeed } from "./server/pill-feed";
 import { PricingStore, registerPricingRpc } from "./server/pricing";
 import { capturePaseo } from "./server/rewind-notice-append";
@@ -219,18 +220,32 @@ export default function contribute(server: PluginServerContext) {
   server.registerSettings(timelineStyleSettings);
   server.registerSettings(languageSettings);
 
+  const notifications = createNotificationDispatcher(server.notifications);
+  const goalNotifications = createGoalNotificationObserver(notifications);
+
   // The DSH Plugins page manages the profile this provider drives. One manager
   // for the whole plugin process: its in-flight job is the page's serialization
   // point, and the write lock it takes is DSH's own (`package.json.lock`), so a
   // page action queues behind a DSH-side install instead of racing it.
-  const dshPlugins = new DshPlugins();
+  const dshPlugins = new DshPlugins({
+    onJobFinished: (event) => {
+      if (event.kind === "check") return;
+      void notifications.notifyDshPluginJob({
+        jobId: event.id,
+        kind: event.kind,
+        ok: event.ok,
+        target: event.target,
+        errorDetail: event.errorDetail,
+      });
+    },
+  });
   const disposeDshPlugins = registerDshPluginsRpc(server, dshPlugins);
 
   // Integrated Antigravity Console server half: multi-account management,
   // fallback, subagents, orchestrator, usage source, and conditional
   // `agent.open.before` hook registration (gated inside `server/antigravity/hooks.ts`
   // by `shouldRegisterAntigravityOpenHookSync()` so pure-DSH hosts never register it).
-  const antigravity = registerAntigravityServer(server, { onContext: capture });
+  const antigravity = registerAntigravityServer(server, { onContext: capture, notifications });
 
   // Environment & Route Overview + on-demand full Doctor RPCs for Console Settings tab.
   const diagnostics = new DiagnosticsService();
@@ -303,7 +318,11 @@ export default function contribute(server: PluginServerContext) {
     },
   });
   const goalFeed = createPillFeed<GoalAnswer>({
-    read: readAgentGoal,
+    read: async (agentId) => {
+      const answer = await readAgentGoal(agentId);
+      goalNotifications.observe(agentId, answer);
+      return answer;
+    },
     isTerminal: (answer) => !answer.available && isTerminalGoalErrorCode(answer.error?.code),
     onError: (message, error) => {
       process.stderr.write(

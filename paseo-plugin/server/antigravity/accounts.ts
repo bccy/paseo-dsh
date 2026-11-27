@@ -54,6 +54,8 @@ export interface StatusUpdateEvent {
   status: AccountSummary["status"];
   quota: QuotaGroup[] | null;
   signedInChanged: boolean;
+  /** True when the user explicitly signed out rather than an unexpected session expiry. */
+  manual?: boolean;
 }
 
 /** Owns the account list, sign-in state, and change notifications. */
@@ -616,7 +618,7 @@ export class AccountService {
       }
     });
     this.runtime.set(accountId, { ...UNKNOWN, status: "signed-out", statusDetail: "Signed out" });
-    this.emitStatus({ accountId, status: "signed-out", quota: null, signedInChanged: true });
+    this.emitStatus({ accountId, status: "signed-out", quota: null, signedInChanged: true, manual: true });
     this.changed();
     await this.refreshOne(accountId);
   }

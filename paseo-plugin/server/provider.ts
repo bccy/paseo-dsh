@@ -154,6 +154,10 @@ const CAPABILITIES = [
   // never `request.completed`, and every failure keeps the runtime.
   "session.can_stop_runtime",
   "permission",
+  // Paseo 0.18+ sends `request.cancel` when the host stops waiting for a slow
+  // request such as a catalog refresh or session listing; declaring it lets
+  // this connection abort the in-flight probe cleanly instead of wasting work.
+  "request.cancel",
 ] as const;
 
 /** Provider id registered with Paseo; distinct from the ACP `deepseek-harness` entry. */
@@ -1124,6 +1128,8 @@ class DshConnection implements ProviderConnection {
    * identifiable — see {@link rewindCanaryNotice}.
    */
   #rewindSeq = 0;
+  /** Per-request abort controllers for host-cancelable requests (`catalog`, `sessions`). */
+  readonly #requestControllers = new Map<string, AbortController>();
 
   constructor(capabilities: readonly string[], pluginId: string = DEFAULT_PLUGIN_ID) {
     this.capabilities = capabilities;
@@ -1194,6 +1200,10 @@ class DshConnection implements ProviderConnection {
   async close(): Promise<void> {
     this.#closed = true;
     this.#stopProbes.abort();
+    for (const controller of this.#requestControllers.values()) {
+      controller.abort();
+    }
+    this.#requestControllers.clear();
     // Deregister before the awaits below: `readAgentJobs` must never walk a
     // connection that is tearing down, and a close that throws partway through
     // would otherwise leave it registered for the life of the process.
@@ -1362,7 +1372,7 @@ class DshConnection implements ProviderConnection {
    * `awaitResident` half waits for an in-flight spawn to publish, and is called
    * outside the spawn gate by design (the spawn holds it).
    */
-  #probeAccess(): ProfileProbeAccess {
+  #probeAccess(extraSignal?: AbortSignal): ProfileProbeAccess {
     return {
       awaitResident: () => this.#awaitPoolSpawn(),
       resident: () => this.#livePoolProcess(),
@@ -1376,7 +1386,7 @@ class DshConnection implements ProviderConnection {
         if (pooled === undefined || this.#claimsOf(pooled) > 0) return;
         await this.#shutdownPool();
       },
-      signal: this.#stopProbes.signal,
+      signal: extraSignal ?? this.#stopProbes.signal,
       trackCleanup: (cleanup) => {
         this.#activeProbeCleanups.add(cleanup);
         void cleanup.finally(() => {
@@ -2406,6 +2416,14 @@ class DshConnection implements ProviderConnection {
         this.#emit({ type: "request.completed", requestId: input.requestId });
         return;
       }
+      case "request.cancel": {
+        const controller = this.#requestControllers.get(input.requestId);
+        if (controller !== undefined) {
+          this.#requestControllers.delete(input.requestId);
+          controller.abort();
+        }
+        return;
+      }
       default: {
         // Every `ProviderInput` variant is handled above, so this is a net for an
         // SDK upgrade that adds one: reporting `request.completed` here would make
@@ -2423,16 +2441,19 @@ class DshConnection implements ProviderConnection {
   }
 
   async #catalog(requestId: string, cwd: string | undefined): Promise<void> {
+    const controller = new AbortController();
+    this.#requestControllers.set(requestId, controller);
     try {
-      const display = await loadCatalog(cwd ?? process.cwd(), this.#probeAccess());
-      // A closed connection publishes no catalog, not even one read just before
-      // it closed.
+      const display = await loadCatalog(cwd ?? process.cwd(), this.#probeAccess(controller.signal));
+      // A closed connection or canceled request publishes no catalog.
+      if (controller.signal.aborted) return;
       if (this.#closed || this.#stopProbes.signal.aborted) {
         throwIfAborted(this.#stopProbes.signal);
         return;
       }
       this.#emit({ type: "catalog", requestId, catalog: display.defaults });
     } catch (error) {
+      if (controller.signal.aborted) return;
       // A failed probe must still answer the request. Leaving it unanswered
       // made Paseo wait out its 60s timeout and report "did not answer
       // paseo/catalog" instead of the real cause — typically `dsh` missing
@@ -2442,12 +2463,18 @@ class DshConnection implements ProviderConnection {
         requestId,
         error: providerError(error),
       });
+    } finally {
+      if (this.#requestControllers.get(requestId) === controller) {
+        this.#requestControllers.delete(requestId);
+      }
     }
   }
 
   /** List DSH's stored sessions so Paseo can offer to import them. */
   async #listSessions(input: Extract<ProviderInput, { type: "sessions" }>): Promise<void> {
     const cwd = input.cwd ?? process.cwd();
+    const controller = new AbortController();
+    this.#requestControllers.set(input.requestId, controller);
     let sessions: Array<{ sessionId: string; cwd?: string; title?: string; preview?: string; updatedAt?: string }>;
     try {
       sessions = await listDshSessions(cwd, {
@@ -2458,10 +2485,16 @@ class DshConnection implements ProviderConnection {
         ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
         ...(input.query === undefined ? {} : { query: input.query }),
         ...(input.limit === undefined ? {} : { limit: input.limit }),
-      }, this.#probeAccess());
+      }, this.#probeAccess(controller.signal));
+      if (controller.signal.aborted) return;
     } catch (error) {
+      if (controller.signal.aborted) return;
       this.#emit({ type: "request.failed", requestId: input.requestId, error: { message: messageOf(error) } });
       return;
+    } finally {
+      if (this.#requestControllers.get(input.requestId) === controller) {
+        this.#requestControllers.delete(input.requestId);
+      }
     }
     this.#emit({
       type: "sessions",
@@ -3828,6 +3861,7 @@ export function createDshProvider(options: DshProviderOptions = {}): ProviderReg
     label: "DeepSeek Harness",
     icon: "icon.svg",
     docsUrl: DSH_DOCS_URL,
+    catalogRefresh: "background",
     installation: {
       installUrl: DSH_INSTALL_URL,
       inspect: ({ signal }) => inspectDshInstallation({ signal }),

@@ -3796,3 +3796,134 @@ test("subagentsArchive persists non-destructively, never hides running workers, 
   assert.equal(archiveSubagentIds(new Set(["a"]), ["b", "a"]), "b,a");
   assert.equal(unarchiveSubagentId(new Set(["a", "b"]), "a"), "b");
 });
+
+test("Paseo 0.18 notifications dispatcher formats bilingual payloads, routes tap targets, and degrades safely on 0.17 hosts", async () => {
+  const {
+    createNotificationDispatcher,
+    formatAccountSignedOutNotification,
+    formatFallbackExhaustedNotification,
+    formatFallbackSwitchNotification,
+    resolveNotificationLocale,
+  } = require("../server/notifications.ts");
+
+  // Locale resolution
+  assert.equal(resolveNotificationLocale("zh-CN"), "zh-CN");
+  assert.equal(resolveNotificationLocale("en"), "en");
+  assert.equal(resolveNotificationLocale(undefined, { LANG: "en_US.UTF-8" }), "en");
+  assert.equal(resolveNotificationLocale(undefined, { LANG: "zh_CN.UTF-8" }), "zh-CN");
+
+  // Graceful no-op on Paseo 0.17.x hosts without `server.notifications`
+  const disabled = createNotificationDispatcher(undefined);
+  assert.equal(disabled.enabled, false);
+  assert.equal(
+    await disabled.notifyFallbackSwitch({ agentId: "ag-1", from: "A", to: "B", reason: "quota" }),
+    null,
+  );
+
+  // Active 0.18+ host delivers deduplicated payloads and swallows transient send errors
+  const sent = [];
+  let shouldThrow = false;
+  const dispatcher = createNotificationDispatcher(
+    {
+      async send(input) {
+        if (shouldThrow) throw new Error("relay offline");
+        sent.push(input);
+        return { status: "sent", notificationId: `n-${sent.length}` };
+      },
+    },
+    { locale: "zh-CN" },
+  );
+  assert.equal(dispatcher.enabled, true);
+
+  const r1 = await dispatcher.notifyFallbackSwitch({
+    agentId: "ag-1",
+    from: "Ultra",
+    to: "Backup",
+    reason: "quota",
+  });
+  assert.deepEqual(r1, { status: "sent", notificationId: "n-1" });
+  assert.equal(sent[0].key, "ag-fallback-switch:ag-1:Backup");
+  assert.deepEqual(sent[0].open, { type: "agent", agentId: "ag-1" });
+  assert.deepEqual(sent[0].data, { kind: "fallback-switch", agentId: "ag-1" });
+  assert.ok(sent[0].body.includes("Ultra") && sent[0].body.includes("Backup"));
+
+  await dispatcher.notifyFallbackExhausted({ agentId: "ag-2", from: "Ultra", reason: "auth" });
+  assert.equal(sent[1].key, "ag-fallback-exhausted:ag-2");
+  assert.deepEqual(sent[1].open, { type: "agent", agentId: "ag-2" });
+
+  await dispatcher.notifyAccountSignedOut({ accountId: "a12345678", label: "Work" });
+  assert.equal(sent[2].key, "ag-account-signed-out:a12345678");
+  assert.deepEqual(sent[2].open, {
+    type: "screen",
+    screenId: "dsh-console",
+    params: { tab: "antigravity" },
+  });
+  assert.deepEqual(sent[2].data, { kind: "account-signed-out", accountId: "a12345678" });
+
+  // English formatting sanity
+  const enSwitch = formatFallbackSwitchNotification(
+    { agentId: "ag-1", from: "A", to: "B", reason: "quota" },
+    "en",
+  );
+  assert.ok(enSwitch.title.includes("switched"));
+  const enExhausted = formatFallbackExhaustedNotification(
+    { agentId: "ag-1", from: "A", reason: "quota" },
+    "en",
+  );
+  assert.ok(enExhausted.title.includes("exhausted"));
+  const enSignedOut = formatAccountSignedOutNotification({ accountId: "default", label: "System" }, "en");
+  assert.ok(enSignedOut.title.includes("expired"));
+
+  // Errors from host never throw out of dispatcher
+  shouldThrow = true;
+  assert.equal(await dispatcher.notifyAccountSignedOut({ accountId: "default", label: "System" }), null);
+
+  // DSH goal live-transition observer: never notifies on initial load, notifies on active -> complete/blocked
+  const {
+    createGoalNotificationObserver,
+    formatDshPluginJobNotification,
+  } = require("../server/notifications.ts");
+  const goalAlerts = [];
+  const observer = createGoalNotificationObserver({
+    async notifyDshGoal(input) {
+      goalAlerts.push(input);
+      return null;
+    },
+  });
+  const baseGoal = {
+    id: "goal-1",
+    revision: 1,
+    objective: "重构构建流水线并跑通全量检查",
+    activation: "armed",
+    roundsStarted: 1,
+    maxGoalRounds: 10,
+  };
+  // Initial load of an already-completed goal must NOT fire
+  observer.observe("ag-old", { available: true, goal: { ...baseGoal, phase: "complete" } });
+  assert.equal(goalAlerts.length, 0);
+
+  // Live transition active -> blocked fires once
+  observer.observe("ag-live", { available: true, goal: { ...baseGoal, phase: "active" } });
+  observer.observe("ag-live", {
+    available: true,
+    goal: { ...baseGoal, revision: 2, phase: "blocked", blockedReason: { code: "needs-input", message: "等待确认部署目标" } },
+  });
+  assert.equal(goalAlerts.length, 1);
+  assert.equal(goalAlerts[0].phase, "blocked");
+  assert.equal(goalAlerts[0].blockedMessage, "等待确认部署目标");
+
+  // Re-armed active -> complete fires once
+  observer.observe("ag-live", { available: true, goal: { ...baseGoal, revision: 3, phase: "active" } });
+  observer.observe("ag-live", { available: true, goal: { ...baseGoal, revision: 4, phase: "complete" } });
+  assert.equal(goalAlerts.length, 2);
+  assert.equal(goalAlerts[1].phase, "complete");
+
+  // DSH plugin job notification routes to console plugins tab
+  const pluginDone = formatDshPluginJobNotification(
+    { jobId: "j-1", kind: "install", ok: true, target: "@deepseek-ai/dsh-example" },
+    "zh-CN",
+  );
+  assert.equal(pluginDone.key, "dsh-plugin-job:j-1");
+  assert.deepEqual(pluginDone.open, { type: "screen", screenId: "dsh-console", params: { tab: "plugins" } });
+  assert.deepEqual(pluginDone.data, { kind: "dsh-plugin-job", jobId: "j-1" });
+});

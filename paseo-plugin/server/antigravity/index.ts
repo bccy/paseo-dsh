@@ -41,10 +41,13 @@ import {
 import { UsageStatsReader } from "./stats";
 import { SubagentReader } from "./subagents";
 import { createUsageSource } from "./usage";
+import type { PluginNotificationsDispatcher } from "../notifications";
 
 export interface RegisterAntigravityServerOptions {
   /** Optional callback invoked with each hook/RPC handler context (e.g. to capture PaseoApi). */
   onContext?: (ctx: PluginHandlerContext) => void;
+  /** Optional Paseo 0.18+ notification dispatcher for fallback and unexpected sign-out alerts. */
+  notifications?: PluginNotificationsDispatcher;
   /** Optional override for `agent.open.before` hook gating (defaults to `shouldRegisterAntigravityOpenHookSync()`). */
   registerOpenBefore?: boolean;
   /** Optional override for Antigravity presence detection (defaults to `detectAntigravityPresence`). */
@@ -85,8 +88,21 @@ export function registerAntigravityServer(
   let quotaTimer: NodeJS.Timeout | null = null;
   let sweepTimer: NodeJS.Timeout | null = null;
 
-  const fallback = new FallbackController(service, pending, orchestrator);
+  const fallback = new FallbackController(service, pending, orchestrator, opts.notifications);
   const removers: Array<() => void> = [];
+  const lastAccountStatus = new Map<string, string>();
+  removers.push(
+    service.onStatusUpdated((event) => {
+      const prev = lastAccountStatus.get(event.accountId);
+      lastAccountStatus.set(event.accountId, event.status);
+      if (prev === "signed-in" && event.status === "signed-out" && !event.manual) {
+        void opts.notifications?.notifyAccountSignedOut({
+          accountId: event.accountId,
+          label: service.labelOf(event.accountId),
+        });
+      }
+    }),
+  );
 
   const dispose = () => {
     disposed = true;

@@ -15,6 +15,7 @@ import {
 } from "../../shared/antigravity/contracts";
 import type { AccountService } from "./accounts";
 import { switchAgentAccount, type PendingSwitches } from "./hooks";
+import type { PluginNotificationsDispatcher } from "../notifications";
 import type { PaseoApi } from "./types";
 
 export type FailureKind = FallbackEvent["reason"];
@@ -248,6 +249,7 @@ export class FallbackController {
     private readonly service: AccountService,
     private readonly pending: PendingSwitches,
     private readonly models?: ModelSupport,
+    private readonly notifications?: PluginNotificationsDispatcher,
   ) {
     this.service.setCooldownProvider((accountId) => this.cooldownsOf(accountId));
   }
@@ -655,6 +657,20 @@ export class FallbackController {
         data: event,
       })
       .catch((error: unknown) => console.error("dsh-paseo/antigravity: could not add the fallback note", error));
+    if (event.event === "switch" && event.to) {
+      void this.notifications?.notifyFallbackSwitch({
+        agentId,
+        from: event.from,
+        to: event.to,
+        reason: event.reason,
+      });
+    } else if (event.event === "exhausted") {
+      void this.notifications?.notifyFallbackExhausted({
+        agentId,
+        from: event.from,
+        reason: event.reason,
+      });
+    }
   }
 
   private scheduleRetry(agentId: string, ms: number, task: () => Promise<void>): void {
