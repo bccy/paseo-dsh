@@ -16,7 +16,7 @@
  *
  * @module dsh-paseo/client/assistant-bloom
  */
-import { useSettings, type PluginTimelineItemProps } from "@getpaseo/plugin/client";
+import { useAgent, useSettings, type PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import { Markdown } from "@getpaseo/plugin/client/ui";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Platform, Text, View, type TextStyle } from "react-native";
@@ -31,6 +31,8 @@ import {
 import { AnimatedBodyParagraph } from "./row-entrance";
 import { STREAM_FRAME_INTERVAL_MS } from "./stream-reveal";
 import {
+  ASSISTANT_BLOOM_ALPHA_STEPS,
+  ASSISTANT_BLOOM_LOOKAHEAD_CHARS,
   ASSISTANT_BLOOM_WAVE_WIDTH,
   type InlineBloomKind,
   type InlineBloomRun,
@@ -42,15 +44,22 @@ import {
   shouldStartAssistantBloomFromZero,
   splitAssistantMarkdownBlocks,
 } from "./thinking-text";
+import {
+  readBloomProgress,
+  releaseAssistantBloom,
+  writeBloomProgress,
+  type BloomProgressState,
+} from "./assistant-bloom-handoff";
 import { withAlpha } from "./tokens";
 
 export interface AssistantBloomData {
   text: string;
   phase: "streaming" | "complete";
+  bloomKey?: string;
 }
 
-/** Brief debounce for Paseo's flickering `phase` between live chunks. */
-const ASSISTANT_PHASE_SETTLE_MS = 320;
+/** Brief settle hold after streaming ends so rich blocks (tables/code) finish fading cleanly. */
+const ASSISTANT_PHASE_SETTLE_MS = 380;
 const MONO_FONT = Platform?.OS === "ios" ? "Menlo" : Platform?.OS === "android" ? "monospace" : "monospace";
 
 interface BlockPlan {
@@ -148,6 +157,8 @@ function renderBloomingProseRuns(
     localProgress,
     ASSISTANT_BLOOM_WAVE_WIDTH,
     localSettledFloor,
+    ASSISTANT_BLOOM_LOOKAHEAD_CHARS,
+    ASSISTANT_BLOOM_ALPHA_STEPS,
   );
   if (segments.length === 0) return null;
   return (
@@ -207,42 +218,72 @@ export function AssistantMessageBloom({
   timestamp,
   item,
 }: PluginTimelineItemProps<AssistantBloomData>) {
-  const { text, phase } = item.data;
+  const { text, phase, bloomKey } = item.data;
   const styleState = useSettings(timelineStyleSettings);
   const timelineStyle = styleState.status === "ready" ? styleState.values : TIMELINE_STYLE_DEFAULTS;
   const blockGap = Math.max(6, Math.min(14, 10 + Math.round(timelineStyle.rowMarginY * 0.5)));
+  const agentStatus = useAgent(agentId ?? "", (snapshot) => snapshot.status);
   const hasRaf =
     typeof globalThis.requestAnimationFrame === "function" &&
     typeof globalThis.cancelAnimationFrame === "function";
 
   const rowAt = normalizeRowTimestamp(timestamp);
-  const rowIdentity = `${agentId ?? ""}\0${rowAt}`;
+  const rowIdentity = bloomKey ? `${agentId ?? ""}\0${bloomKey}` : `${agentId ?? ""}\0${rowAt}`;
 
   const blocks = useMemo(() => splitAssistantMarkdownBlocks(text), [text]);
   const { plans, totalCp } = useMemo(() => buildBlockPlans(blocks), [blocks]);
 
+  // Restore any in-flight progress persisted across Paseo's `liveHead -> history`
+  // remount when `turn_completed` moves the row from the live head slot into
+  // the virtualized history list — preventing the cursor from resetting and
+  // eliminating the completion flash.
+  const persisted = readBloomProgress(bloomKey);
   const initialBloomFromZero =
-    hasRaf &&
-    shouldStartAssistantBloomFromZero({
-      phase,
-      totalCp,
-      rowTimestampMs: rowAt,
-    });
+    persisted !== undefined
+      ? persisted.everStreamed
+      : hasRaf &&
+        shouldStartAssistantBloomFromZero({
+          phase,
+          totalCp,
+          agentStatus,
+        });
 
   const prevIdentityRef = useRef<string>(rowIdentity);
   const prevTextRef = useRef<string>(text);
   const everStreamedRef = useRef<boolean>(initialBloomFromZero);
-  const [growing, setGrowing] = useState<boolean>(initialBloomFromZero);
+  const [growing, setGrowing] = useState<boolean>(
+    persisted !== undefined ? persisted.everStreamed && phase === "streaming" : initialBloomFromZero,
+  );
 
   const totalCpRef = useRef<number>(totalCp);
   const cursorRef = useRef<number>(
-    initialBloomFromZero ? 0 : totalCp + ASSISTANT_BLOOM_WAVE_WIDTH,
+    persisted !== undefined
+      ? persisted.cursor
+      : initialBloomFromZero
+        ? 0
+        : totalCp + ASSISTANT_BLOOM_WAVE_WIDTH,
   );
-  const settledFloorRef = useRef<number>(initialBloomFromZero ? 0 : totalCp);
+  const settledFloorRef = useRef<number>(
+    persisted !== undefined ? persisted.settledFloor : initialBloomFromZero ? 0 : totalCp,
+  );
+  const fadedRichBlocksRef = useRef<Set<number>>(
+    persisted !== undefined ? persisted.fadedRichBlocks : new Set<number>(),
+  );
   const rafRef = useRef<number | null>(null);
   const lastFrameRef = useRef<number>(0);
   const handoffBoostRef = useRef<boolean>(false);
   const [, setTick] = useState(0);
+
+  const syncProgress = () => {
+    if (!bloomKey) return;
+    const state: BloomProgressState = {
+      everStreamed: everStreamedRef.current,
+      cursor: cursorRef.current,
+      settledFloor: settledFloorRef.current,
+      fadedRichBlocks: fadedRichBlocksRef.current,
+    };
+    writeBloomProgress(bloomKey, state);
+  };
 
   if (prevIdentityRef.current !== rowIdentity) {
     const isContinuation =
@@ -251,22 +292,33 @@ export function AssistantMessageBloom({
       text.startsWith(prevTextRef.current);
     prevIdentityRef.current = rowIdentity;
     if (!isContinuation) {
-      const freshFromZero =
-        hasRaf &&
-        shouldStartAssistantBloomFromZero({
-          phase,
-          totalCp,
-          rowTimestampMs: rowAt,
-        });
-      everStreamedRef.current = freshFromZero;
-      handoffBoostRef.current = false;
-      totalCpRef.current = totalCp;
-      if (freshFromZero) {
-        cursorRef.current = 0;
-        settledFloorRef.current = 0;
+      const nextPersisted = readBloomProgress(bloomKey);
+      if (nextPersisted !== undefined) {
+        everStreamedRef.current = nextPersisted.everStreamed;
+        handoffBoostRef.current = false;
+        totalCpRef.current = totalCp;
+        cursorRef.current = nextPersisted.cursor;
+        settledFloorRef.current = nextPersisted.settledFloor;
+        fadedRichBlocksRef.current = nextPersisted.fadedRichBlocks;
       } else {
-        cursorRef.current = totalCp + ASSISTANT_BLOOM_WAVE_WIDTH;
-        settledFloorRef.current = totalCp;
+        const freshFromZero =
+          hasRaf &&
+          shouldStartAssistantBloomFromZero({
+            phase,
+            totalCp,
+            agentStatus,
+          });
+        everStreamedRef.current = freshFromZero;
+        handoffBoostRef.current = false;
+        totalCpRef.current = totalCp;
+        fadedRichBlocksRef.current = new Set<number>();
+        if (freshFromZero) {
+          cursorRef.current = 0;
+          settledFloorRef.current = 0;
+        } else {
+          cursorRef.current = totalCp + ASSISTANT_BLOOM_WAVE_WIDTH;
+          settledFloorRef.current = totalCp;
+        }
       }
     }
   } else if (text !== prevTextRef.current) {
@@ -288,6 +340,7 @@ export function AssistantMessageBloom({
   }
   prevTextRef.current = text;
   totalCpRef.current = totalCp;
+  syncProgress();
 
   const yieldedPulseRowRef = useRef<string | null>(null);
 
@@ -321,6 +374,24 @@ export function AssistantMessageBloom({
 
   const needsAnimRef = useRef<boolean>(needsAnim);
   needsAnimRef.current = needsAnim;
+  const phaseRef = useRef<"streaming" | "complete">(phase);
+  phaseRef.current = phase;
+  const bloomKeyRef = useRef<string | undefined>(bloomKey);
+  bloomKeyRef.current = bloomKey;
+
+  // Release back to Paseo's native `assistant_message` renderer (restoring the
+  // native Copy / Fork / Turn Timing footer) as soon as the bloom wave settles,
+  // or immediately when an idle/reloaded row skipped bloom on mount.
+  useEffect(() => {
+    if (!bloomKey) return;
+    if (!everStreamedRef.current) {
+      releaseAssistantBloom(bloomKey);
+      return;
+    }
+    if (phase === "complete" && !activeLive) {
+      releaseAssistantBloom(bloomKey);
+    }
+  }, [bloomKey, phase, activeLive]);
 
   useEffect(() => {
     return () => {
@@ -331,6 +402,13 @@ export function AssistantMessageBloom({
       lastFrameRef.current = 0;
       handoffBoostRef.current = false;
       clearActiveBloom(agentId);
+      // Persist latest cursor on unmount so a `liveHead -> history` remount
+      // picks up seamlessly; release only if already settled in `complete`.
+      if (phaseRef.current === "complete" && !needsAnimRef.current && bloomKeyRef.current) {
+        releaseAssistantBloom(bloomKeyRef.current);
+      } else {
+        syncProgress();
+      }
     };
   }, [agentId, rowIdentity]);
 
@@ -378,12 +456,14 @@ export function AssistantMessageBloom({
       if (done) {
         cursorRef.current = target + ASSISTANT_BLOOM_WAVE_WIDTH;
         settledFloorRef.current = target;
+        syncProgress();
         lastFrameRef.current = 0;
         handoffBoostRef.current = false;
         clearActiveBloom(agentId);
         setTick((v) => (v + 1) & 0x7fffffff);
         return;
       }
+      syncProgress();
       publishRemaining();
       if (lastEmitAt === 0 || now - lastEmitAt >= STREAM_FRAME_INTERVAL_MS) {
         lastEmitAt = now;
@@ -416,7 +496,11 @@ export function AssistantMessageBloom({
     settledCacheRef.current.clear();
   }
 
-  if (!activeLive || plans.length === 0) {
+  // When a `bloomKey` is active and we streamed this row, keep rendering our
+  // settled prose/rich layout right up until `releaseAssistantBloom(bloomKey)`
+  // hands the row back to Paseo's native `<AssistantMessage>` in one step —
+  // avoiding a redundant intermediate `<Markdown>` mount/measure flash on iOS.
+  if (plans.length === 0 || (!activeLive && (!bloomKey || !everStreamedRef.current))) {
     return <Markdown>{text}</Markdown>;
   }
 
@@ -435,8 +519,13 @@ export function AssistantMessageBloom({
     if (plan.startCp > cursor + 1 && i > 0) break;
 
     if (plan.rich) {
+      const alreadyFaded = fadedRichBlocksRef.current.has(i);
+      if (!alreadyFaded) {
+        fadedRichBlocksRef.current.add(i);
+        syncProgress();
+      }
       const node = (
-        <AnimatedBodyParagraph key={`rich:${i}`} animate fromOpacity={0} durationMs={320}>
+        <AnimatedBodyParagraph key={`rich:${i}`} animate={!alreadyFaded} fromOpacity={0} durationMs={320}>
           <Markdown>{plan.raw}</Markdown>
         </AnimatedBodyParagraph>
       );

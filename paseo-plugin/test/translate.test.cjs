@@ -929,34 +929,118 @@ test("client/thinking-text.ts left-scroll stream normalizer and adaptive cursor 
   assert.ok(styledBloom.some((s) => s.kind === "bold" && s.alpha > 0 && s.alpha < 1));
   assert.ok(styledBloom.some((s) => s.alpha === 0), "upcoming glyphs pre-placed invisibly");
 
-  // Responsive assistant bloom velocity & reload/replay fresh-mount guard
+  // Responsive assistant bloom velocity & agentStatus reload/replay guard
   const {
+    ASSISTANT_BLOOM_ALPHA_STEPS,
+    ASSISTANT_BLOOM_LOOKAHEAD_CHARS,
     ASSISTANT_BLOOM_WAVE_WIDTH,
     advanceAssistantBloomCursor,
     shouldStartAssistantBloomFromZero,
   } = require("../client/thinking-text.ts");
-  const nowMs = 1_700_000_000_000;
+  assert.equal(ASSISTANT_BLOOM_WAVE_WIDTH, 56);
   assert.equal(
-    shouldStartAssistantBloomFromZero({ phase: "streaming", totalCp: 24, rowTimestampMs: nowMs - 800, nowMs }),
+    shouldStartAssistantBloomFromZero({ phase: "streaming", totalCp: 420, agentStatus: "running" }),
     true,
-    "fresh opening streaming delta blooms from char 0",
+    "live running reply blooms from char 0 even on a large first burst",
   );
   assert.equal(
-    shouldStartAssistantBloomFromZero({ phase: "streaming", totalCp: 420, rowTimestampMs: nowMs - 500, nowMs }),
+    shouldStartAssistantBloomFromZero({ phase: "streaming", totalCp: 420, agentStatus: "idle" }),
     false,
-    "large pre-filled reply on reload renders settled immediately",
+    "reloaded idle conversation renders settled immediately",
   );
   assert.equal(
-    shouldStartAssistantBloomFromZero({ phase: "streaming", totalCp: 30, rowTimestampMs: nowMs - 12_000, nowMs }),
+    shouldStartAssistantBloomFromZero({ phase: "streaming", totalCp: 30, agentStatus: "initializing" }),
     false,
-    "replayed reply with stale timestamp renders settled immediately",
+    "initializing reload conversation renders settled immediately",
   );
   assert.equal(
-    shouldStartAssistantBloomFromZero({ phase: "complete", totalCp: 24, rowTimestampMs: nowMs - 200, nowMs }),
+    shouldStartAssistantBloomFromZero({ phase: "complete", totalCp: 24, agentStatus: "running" }),
     false,
   );
   const replyTrickle = advanceAssistantBloomCursor(0, 10, 16, ASSISTANT_BLOOM_WAVE_WIDTH);
   const replyBurst = advanceAssistantBloomCursor(0, 300, 16, ASSISTANT_BLOOM_WAVE_WIDTH);
-  assert.ok(replyTrickle > 0.5 && replyTrickle < 2.0, `expected smooth trickle step, got ${replyTrickle}`);
-  assert.ok(replyBurst > 3.5 && replyBurst <= 4.6, `expected responsive burst drain ~280 chars/sec, got ${replyBurst}`);
+  assert.ok(replyTrickle > 0.5 && replyTrickle < 1.0, `expected smooth wide-veil trickle step, got ${replyTrickle}`);
+  assert.ok(replyBurst > 1.5 && replyBurst <= 1.8, `expected smooth wide-veil burst ~105 chars/sec, got ${replyBurst}`);
+  // Banded wide mist veil merges 56-char gradient into <= 16 RN text runs without dropping any glyph
+  const longText = "这是一段用于验证宽幕柔雾分带合并效果的较长中文测试文本，确保在高速流式爆发下依然顺滑不掉帧。".repeat(3);
+  const banded = buildStyledBloomRuns(
+    [{ text: longText, kind: "plain" }],
+    80,
+    ASSISTANT_BLOOM_WAVE_WIDTH,
+    0,
+    ASSISTANT_BLOOM_LOOKAHEAD_CHARS,
+    ASSISTANT_BLOOM_ALPHA_STEPS,
+  );
+  assert.ok(banded.length <= 18, `expected <=18 merged bands across 56-char veil, got ${banded.length}`);
+  assert.ok(banded.some((s) => s.alpha > 0.1 && s.alpha < 0.9), "wide veil keeps visible mid-mist gradient");
+
+  // Two-phase bloom handoff controller: holds complete row while still blooming, releases to native on completion
+  const { createBloomHandoffController } = require("../client/assistant-bloom-handoff.ts");
+  let reprojections = 0;
+  let scheduledFn = null;
+  const controller = createBloomHandoffController({
+    onChanged: () => {
+      reprojections += 1;
+    },
+    maxHoldMs: 5000,
+    schedule: (fn) => {
+      scheduledFn = fn;
+      return 1;
+    },
+    cancel: () => {
+      scheduledFn = null;
+    },
+  });
+  // Historical complete message is never intercepted
+  assert.deepEqual(
+    controller.resolve({ text: "Historical reply", messageId: "old-1" }, "complete", 1000),
+    { transform: false },
+  );
+  // Live streaming reply with messageId stays transformed across turn_completed until released
+  const live1 = controller.resolve({ text: "Fast reply", messageId: "m-1" }, "streaming", 1000);
+  assert.equal(live1.transform, true);
+  assert.equal(live1.bloomKey, "id:m-1");
+  const held = controller.resolve({ text: "Fast reply full table", messageId: "m-1" }, "complete", 1300);
+  assert.equal(held.transform, true);
+  assert.equal(held.bloomKey, "id:m-1");
+  assert.equal(reprojections, 0);
+  // Once bloom finishes, release triggers re-projection and hands back to native renderer
+  assert.equal(controller.release("id:m-1"), true);
+  assert.equal(reprojections, 1);
+  assert.deepEqual(
+    controller.resolve({ text: "Fast reply full table", messageId: "m-1" }, "complete", 2000),
+    { transform: false },
+  );
+  // Fallback prefix matching (when provider omits messageId) + safety timer auto-release
+  const liveNoId = controller.resolve({ text: "本机健康，无需处理。" }, "streaming", 3000);
+  assert.equal(liveNoId.transform, true);
+  const heldNoId = controller.resolve({ text: "本机健康，无需处理。更多指标表格…" }, "complete", 3300);
+  assert.equal(heldNoId.transform, true);
+  assert.equal(heldNoId.bloomKey, liveNoId.bloomKey);
+  assert.ok(typeof scheduledFn === "function");
+  scheduledFn();
+  assert.equal(reprojections, 2);
+  assert.deepEqual(
+    controller.resolve({ text: "本机健康，无需处理。更多指标表格…" }, "complete", 9000),
+    { transform: false },
+  );
+  // Shared bloom progress survives Paseo's `liveHead -> history` remount and clears on release
+  const { readBloomProgress, writeBloomProgress } = require("../client/assistant-bloom-handoff.ts");
+  const liveProgress = controller.resolve({ text: "Continuity check", messageId: "m-cont" }, "streaming", 10_000);
+  writeBloomProgress(liveProgress.bloomKey, {
+    everStreamed: true,
+    cursor: 42.5,
+    settledFloor: 18,
+    fadedRichBlocks: new Set([2]),
+  });
+  // `turn_completed` moves row to history (`phase: "complete"`): progress must still be intact
+  const afterComplete = controller.resolve({ text: "Continuity check full", messageId: "m-cont" }, "complete", 10_300);
+  assert.equal(afterComplete.bloomKey, liveProgress.bloomKey);
+  assert.equal(readBloomProgress(afterComplete.bloomKey)?.cursor, 42.5);
+  assert.equal(readBloomProgress(afterComplete.bloomKey)?.fadedRichBlocks.has(2), true);
+  // Release clears shared progress cleanly
+  assert.equal(controller.release(afterComplete.bloomKey), true);
+  assert.equal(readBloomProgress(afterComplete.bloomKey), undefined);
+
+  controller.dispose();
 });

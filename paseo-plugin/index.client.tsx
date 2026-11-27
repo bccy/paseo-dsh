@@ -39,6 +39,10 @@ import { DEEPSEEK_MARK_SVG } from "./client/deepseek-mark-svg";
 import { guardCleanup, installFatalGuard, report } from "./client/dsh-plugins-guard";
 import { contributeGoalPill } from "./client/goal-pill";
 import { AssistantMessageBloom } from "./client/assistant-bloom";
+import {
+  createBloomHandoffController,
+  registerBloomReleaseHandler,
+} from "./client/assistant-bloom-handoff";
 import { InlineThinking } from "./client/inline-thinking";
 import { isStandaloneMarkdownImage } from "./client/thinking-text";
 import { registerAntigravityToolSummariesReader } from "./client/antigravity/tool-summaries";
@@ -278,36 +282,63 @@ function buildContributions(client: PluginClientContext): () => void {
   });
 
   // Global smooth block-emergence for live streaming assistant replies across
-  // all providers. Only transforms `phase === "streaming"`: once settled
-  // (`phase === "complete"`), returning `undefined` hands the row back to
-  // Paseo's native `assistant_message` renderer so the completed-turn footer
-  // (Copy result, Fork to new tab, turn timing), ChatFind, and 32k cap stay intact.
-  // Registered after `antigravity-ask-question-echo` so echo suppression keeps
-  // first precedence, and skips standalone markdown image messages so Paseo's
-  // built-in image renderer handles tool-emitted images untouched.
-  client.addTimelineTransformer({
-    id: "dsh-assistant-bloom",
-    query: { itemType: "assistant_message" },
-    transform: ({ item, phase }) => {
-      if (phase !== "streaming") return undefined;
-      if (isStandaloneMarkdownImage(item.text)) return undefined;
-      return {
-        items: [
-          {
-            type: "plugin",
-            kind: "dsh-assistant-bloom",
-            version: 1,
-            data: { text: item.text, phase },
-          },
-        ],
-      };
+  // all providers, with two-phase handoff back to Paseo's native renderer:
+  // - Live `phase === "streaming"` replies register as active and keep blooming
+  //   even if `turn_completed` flips `phase` to `"complete"` 200ms later (fast
+  //   models like `deepseek-flash` or replies ending in tables/code).
+  // - Once `AssistantMessageBloom` finishes its mist wave, `release(bloomKey)`
+  //   re-registers this transformer so Paseo re-projects the finished row as a
+  //   native `assistant_message`, restoring Paseo's native Copy Result, Fork to
+  //   New Tab, and Turn Timing footer.
+  // - Historical / already-complete replies return `undefined` on frame 0.
+  let unregisterBloomTransformer: (() => void) | null = null;
+  let bloomHandoffDisposed = false;
+  const registerBloomTransformer = () =>
+    client.addTimelineTransformer({
+      id: "dsh-assistant-bloom",
+      query: { itemType: "assistant_message" },
+      transform: ({ item, phase }) => {
+        if (isStandaloneMarkdownImage(item.text)) return undefined;
+        const decision = bloomHandoff.resolve(item, phase);
+        if (!decision.transform) return undefined;
+        return {
+          items: [
+            {
+              type: "plugin",
+              kind: "dsh-assistant-bloom",
+              version: 1,
+              data: {
+                text: item.text,
+                phase,
+                ...(decision.bloomKey ? { bloomKey: decision.bloomKey } : {}),
+              },
+            },
+          ],
+        };
+      },
+    });
+  const bloomHandoff = createBloomHandoffController({
+    onChanged: () => {
+      if (bloomHandoffDisposed) return;
+      const prev = unregisterBloomTransformer;
+      unregisterBloomTransformer = null;
+      prev?.();
+      unregisterBloomTransformer = registerBloomTransformer();
     },
   });
+  const unregisterBloomRelease = registerBloomReleaseHandler((bloomKey) => {
+    bloomHandoff.release(bloomKey);
+  });
+  unregisterBloomTransformer = registerBloomTransformer();
 
   client.addTimelineRenderer({
     kind: "dsh-assistant-bloom",
     version: 1,
-    schema: z.object({ text: z.string(), phase: z.enum(["streaming", "complete"]) }),
+    schema: z.object({
+      text: z.string(),
+      phase: z.enum(["streaming", "complete"]),
+      bloomKey: z.string().optional(),
+    }),
     Component: AssistantMessageBloom,
   });
 
@@ -683,6 +714,13 @@ function buildContributions(client: PluginClientContext): () => void {
   });
 
   const cleanups = [
+    () => {
+      bloomHandoffDisposed = true;
+      unregisterBloomRelease();
+      bloomHandoff.dispose();
+      unregisterBloomTransformer?.();
+      unregisterBloomTransformer = null;
+    },
     unregisterThinkingTranslator,
     () => {
       disposed = true;

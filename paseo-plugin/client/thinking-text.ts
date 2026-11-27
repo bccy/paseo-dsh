@@ -222,37 +222,48 @@ export function countCodePoints(text: string): number {
 
 /** Width (code points) of the soft front-to-back emergence wave in expanded thinking body. */
 export const EXPANDED_BLOOM_WAVE_WIDTH = 24;
-/** Soft front-to-back wave width (code points) for live assistant reply emergence. */
-export const ASSISTANT_BLOOM_WAVE_WIDTH = 16;
+/**
+ * Wide soft front-to-back mist curtain (code points) for live assistant reply
+ * emergence (~2.5–3 lines on mobile) so even fast streaming bursts feel like a
+ * smooth luminous veil sweeping across whole phrases rather than a narrow
+ * character-by-character typewriter.
+ */
+export const ASSISTANT_BLOOM_WAVE_WIDTH = 56;
 /** Transparent lookahead characters pre-placed in layout so whole sentences/paragraphs emerge without wrap jitter. */
 export const EXPANDED_BLOOM_LOOKAHEAD_CHARS = 48;
-/** Maximum age (ms) of a row timestamp to still be considered a freshly opening live reply. */
-export const ASSISTANT_BLOOM_FRESH_MOUNT_MS = 5000;
+/** Lookahead window for live assistant replies, wide enough to cover the 56-char mist veil cleanly. */
+export const ASSISTANT_BLOOM_LOOKAHEAD_CHARS = 64;
 /**
- * Maximum initial code-point count on mount that still blooms from char 0.
- * A live streaming reply's opening delta is typically 1–80 chars, whereas a
- * replayed/reloaded full reply arrives as hundreds of characters on mount.
+ * Alpha quantization bands across the wide assistant mist veil.
+ * Adjacent characters falling into the same band merge into a single `<Text>`
+ * span, keeping native iOS/RN attributed-string rebuilds to <= ~14 spans/frame
+ * (smoother and lighter than 24 unmerged single-char spans) while covering a
+ * 2.3x wider gradient curtain.
  */
-export const ASSISTANT_BLOOM_FRESH_MOUNT_MAX_CP = 96;
+export const ASSISTANT_BLOOM_ALPHA_STEPS = 14;
 
 /**
- * Decides whether a mounting `AssistantMessageBloom` row represents a freshly
- * opening live stream (bloom from char 0) versus an already-populated reply
- * arriving on conversation reload / session replay (render settled immediately
- * and only bloom newly appended tokens thereafter).
+ * Decides whether a mounting `AssistantMessageBloom` row should bloom from
+ * char 0 (live streaming turn) versus render settled immediately (reloaded or
+ * reopened idle/initializing conversation whose trailing reply briefly lands
+ * in Paseo's `head` with `phase: "streaming"`).
+ *
+ * Intentionally does NOT gate on initial text length or timestamp age: live
+ * ACP/Antigravity replies often arrive as a 150–400 char first burst or after
+ * a multi-second tool/thinking turn, and must still get the full mist bloom.
  */
 export function shouldStartAssistantBloomFromZero(input: {
   readonly phase: "streaming" | "complete";
   readonly totalCp: number;
-  readonly rowTimestampMs: number;
-  readonly nowMs?: number;
+  readonly agentStatus?: string | null;
 }): boolean {
   if (input.phase !== "streaming" || input.totalCp <= 0) return false;
-  if (input.totalCp > ASSISTANT_BLOOM_FRESH_MOUNT_MAX_CP) return false;
-  const now = input.nowMs ?? Date.now();
-  if (Number.isFinite(input.rowTimestampMs) && input.rowTimestampMs > 0) {
-    const ageMs = now - input.rowTimestampMs;
-    if (ageMs > ASSISTANT_BLOOM_FRESH_MOUNT_MS) return false;
+  if (
+    input.agentStatus !== undefined &&
+    input.agentStatus !== null &&
+    input.agentStatus !== "running"
+  ) {
+    return false;
   }
   return true;
 }
@@ -283,13 +294,12 @@ export function advanceExpandedInkCursor(
 }
 
 /**
- * Responsive backlog-adaptive emergence cursor for live assistant replies.
+ * Smooth, wide-veil front-to-back soft-mist emergence cursor for live
+ * assistant replies (~34–105 chars/sec across a 56-char mist frontier).
  *
- * Unlike `advanceExpandedInkCursor` (capped at 42 chars/sec for calm thinking),
- * assistant replies stream at 80–260+ chars/sec. Draining backlog over a short
- * ~260ms horizon (38–280 chars/sec) keeps the soft 16-char mist frontier
- * visibly flowing while tracking the model's real pace closely, so handoff to
- * native `<Markdown>` at turn completion never jumps hundreds of characters.
+ * Even at peak burst speed (105 chars/sec), every glyph still spends >= 0.53s
+ * gliding across the 56-char mist curtain so fast streams never degenerate into
+ * a choppy character-by-character typewriter while staying responsive to bursts.
  */
 export function advanceAssistantBloomCursor(
   current: number,
@@ -306,8 +316,8 @@ export function advanceAssistantBloomCursor(
   const unread = Math.max(0, target - current);
   const charsPerSec =
     unread > 0
-      ? Math.min(280, Math.max(38, 38 + unread / 0.26))
-      : Math.max(48, waveWidth / 0.28);
+      ? Math.min(105, 34 + unread * 0.5)
+      : Math.max(48, waveWidth / 0.65);
   return Math.min(settledTarget, current + (charsPerSec * clampedDt) / 1000);
 }
 
@@ -644,6 +654,7 @@ export function buildStyledBloomRuns(
   waveWidth = EXPANDED_BLOOM_WAVE_WIDTH,
   settledFloor = 0,
   lookaheadChars = EXPANDED_BLOOM_LOOKAHEAD_CHARS,
+  alphaSteps = 0,
 ): StyledBloomSegment[] {
   if (runs.length === 0) return [];
   const glyphs: Array<{ ch: string; kind: InlineBloomKind }> = [];
@@ -687,7 +698,9 @@ export function buildStyledBloomRuns(
     const age = waveProgress - i;
     const t = Math.max(0, Math.min(1, age / waveWidth));
     const smooth = t * t * (3 - 2 * t);
-    const alpha = Number(smooth.toFixed(3));
+    const quantized =
+      alphaSteps > 1 ? Math.round(smooth * alphaSteps) / alphaSteps : smooth;
+    const alpha = Number(quantized.toFixed(3));
     if (alpha <= 0.005) {
       transparentStart = i;
       break;
