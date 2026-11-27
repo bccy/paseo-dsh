@@ -53,6 +53,14 @@ import {
 } from "../shared/usage";
 import { dshHome } from "./bootstrap";
 import { assistantStreamFirstTokenTime } from "./first-token";
+import {
+  CALENDAR_BIN_RANGES as RANGES,
+  buildCalendarBins,
+  findBinIndex,
+  localDayKey,
+} from "./stats-bins";
+
+export { buildCalendarBins, localDayKey };
 
 // v2: seeded/fork sessions no longer re-count their fork-inherited event prefix.
 const CACHE_VERSION = 2 as const;
@@ -63,12 +71,6 @@ const DEFAULT_RPC_WAIT_MS = 250;
 const DAY_MS = 86_400_000;
 /** Corrupt files modified within this window are not cached as empty (may still be mid-write). */
 const RECENT_CORRUPT_GRACE_MS = 10_000;
-
-const RANGES: Record<UsageRange, { binMs: number; bins: number }> = {
-  today: { binMs: 3_600_000, bins: 24 },
-  "7d": { binMs: 6 * 3_600_000, bins: 28 },
-  "30d": { binMs: DAY_MS, bins: 30 },
-};
 
 /** One parsed LLM call extracted from a DSH session log file. */
 export interface CachedCallRecord {
@@ -559,70 +561,9 @@ export function parseSessionJsonl(
   return { isSubagent, calls };
 }
 
-/**
- * Local-calendar-aligned bin windows (hourly bins from local midnight 00:00 for
- * `today`, 6-hour slots for `7d`, and calendar days for `30d`).
- */
-export function buildCalendarBins(now: number, range: UsageRange): Array<{ start: number; end: number }> {
-  const { bins: count } = RANGES[range];
-  const anchor = new Date(now);
-  const year = anchor.getFullYear();
-  const month = anchor.getMonth();
-  const day = anchor.getDate();
-  if (range === "30d") {
-    return Array.from({ length: count }, (_, index) => {
-      const offset = index - (count - 1);
-      const start = new Date(year, month, day + offset, 0, 0, 0, 0).getTime();
-      const end = new Date(year, month, day + offset + 1, 0, 0, 0, 0).getTime();
-      return { start, end };
-    });
-  }
-  if (range === "7d") {
-    const slot = Math.floor(anchor.getHours() / 6);
-    const currentIndex = day * 4 + slot;
-    return Array.from({ length: count }, (_, index) => {
-      const target = currentIndex - (count - 1 - index);
-      const targetDay = Math.floor(target / 4);
-      const targetSlot = ((target % 4) + 4) % 4;
-      const next = target + 1;
-      const nextDay = Math.floor(next / 4);
-      const nextSlot = ((next % 4) + 4) % 4;
-      const start = new Date(year, month, targetDay, targetSlot * 6, 0, 0, 0).getTime();
-      const end = new Date(year, month, nextDay, nextSlot * 6, 0, 0, 0).getTime();
-      return { start, end };
-    });
-  }
-  return Array.from({ length: count }, (_, hour) => {
-    const start = new Date(year, month, day, hour, 0, 0, 0).getTime();
-    const end = new Date(year, month, day, hour + 1, 0, 0, 0).getTime();
-    return { start, end };
-  });
-}
-
-/** Local calendar day key `"YYYY-MM-DD"`. */
-export function localDayKey(at: number): string {
-  const date = new Date(at);
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${date.getFullYear()}-${month}-${day}`;
-}
-
 function dayNumberFromKey(key: string): number {
   const [year = 1970, month = 1, day = 1] = key.split("-").map(Number);
   return Math.round(Date.UTC(year, month - 1, day) / DAY_MS);
-}
-
-function findBinIndex(bins: readonly { start: number; end: number }[], at: number): number {
-  let lo = 0;
-  let hi = bins.length - 1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    const bin = bins[mid]!;
-    if (at < bin.start) hi = mid - 1;
-    else if (at >= bin.end) lo = mid + 1;
-    else return mid;
-  }
-  return -1;
 }
 
 function accumulateCall(totals: UsageTotals, call: CachedCallRecord, cost: number | null): void {

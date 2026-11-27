@@ -2,7 +2,7 @@
   "id": "dsh-paseo",
   "description": "DeepSeek Harness (dsh) native Paseo provider & integrated Antigravity Console: question cards, plan mode, thinking levels, steering, images, slash menu, permissions and presets, rewind, goal/team/background pills, multi-account Antigravity management with quota & fallback, subagents, Orchestrator settings, and unified dual-currency usage analytics. 把 DeepSeek Harness 接成 Paseo 原生 provider，并集成 Antigravity 控制台：提问卡片、计划模式、思考档位、插话、图片、斜杠菜单、权限与预设、撤回、目标/团队/后台任务 pill、多账号额度与自动切换、子代理、Orchestrator 设置及统一双币种用量统计。",
   "requirements": {
-    "paseo": ">=0.17.1"
+    "paseo": ">=0.18.1"
   },
   "translations": {
     "zh-CN": {

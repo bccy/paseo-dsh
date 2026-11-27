@@ -15,7 +15,6 @@ import type {
 import { useSettings } from "@getpaseo/plugin/client";
 import * as PaseoUi from "@getpaseo/plugin/client/ui";
 import type {
-  SettingsActionProps,
   SettingsRowProps,
   SettingsSelectProps,
 } from "@getpaseo/plugin/client/ui";
@@ -474,82 +473,6 @@ export function renderHostSettingsSelect<Value extends string>(
           );
         })}
       </View>
-    ),
-  });
-}
-
-export interface GuardedSettingsActionOptions extends SettingsActionProps {
-  compact?: boolean;
-}
-
-/**
- * Render Paseo's native `SettingsAction` when exported by the host, falling back to a row
- * with a secondary button on older hosts.
- */
-export function renderHostSettingsAction(
-  colors: SettingsThemeColors,
-  {
-    label,
-    hint,
-    error,
-    actionLabel,
-    onPress,
-    disabled = false,
-    testID,
-    compact = false,
-  }: GuardedSettingsActionOptions,
-): ReactNode {
-  const ActionComp = uiExports["SettingsAction"] as
-    | ComponentType<SettingsActionProps>
-    | undefined;
-  if (isHostComponent(ActionComp) && ActionComp) {
-    return (
-      <ActionComp
-        label={label}
-        hint={hint}
-        error={error}
-        actionLabel={actionLabel}
-        onPress={onPress}
-        disabled={disabled}
-        testID={testID}
-      />
-    );
-  }
-  return renderHostSettingsRow(colors, {
-    label,
-    hint,
-    error,
-    compact,
-    inline: true,
-    testID,
-    children: (
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel={actionLabel}
-        accessibilityState={{ disabled }}
-        disabled={disabled}
-        onPress={onPress}
-        style={{
-          paddingHorizontal: 14,
-          paddingVertical: compact ? 8 : 9,
-          borderRadius: 8,
-          backgroundColor: colors.surface0,
-          borderWidth: 1,
-          borderColor: colors.border,
-          opacity: disabled ? 0.5 : 1,
-          alignSelf: "center",
-        }}
-      >
-        <Text
-          style={{
-            color: colors.foreground,
-            fontSize: compact ? 12.5 : 13,
-            fontWeight: "600",
-          }}
-        >
-          {actionLabel}
-        </Text>
-      </Pressable>
     ),
   });
 }

@@ -19,6 +19,30 @@ export class PendingSwitches {
   private readonly executing = new Set<string>();
   private readonly deferredTurns = new Map<string, { turnId: string | null; at: number }>();
   private readonly manualCounts = new Map<string, number>();
+  private readonly locks = new Map<string, Promise<unknown>>();
+
+  /**
+   * Serializes account switches on the same agent so refresh, CAS, metadata update,
+   * and reload run atomically without interleaving manual switches and fallback.
+   */
+  async withAgentLock<T>(agentId: string, task: () => Promise<T>): Promise<T> {
+    const prev = this.locks.get(agentId) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = prev.then(() => gate);
+    this.locks.set(agentId, tail);
+    await prev;
+    try {
+      return await task();
+    } finally {
+      release();
+      if (this.locks.get(agentId) === tail) {
+        this.locks.delete(agentId);
+      }
+    }
+  }
 
   set(agentId: string, accountId: string): void {
     this.pending.set(agentId, accountId);
@@ -116,71 +140,82 @@ export async function switchAgentAccount(
   pending: PendingSwitches,
   input: SwitchInput,
 ): Promise<SwitchOutcome> {
-  const target = service.requireAccount(input.accountId);
-  if (target?.unsafeDetail) throw new Error(target.unsafeDetail);
-  const accountLabel = service.labelOf(input.accountId);
-  if (target) {
-    // Moving an agent onto an account that cannot run would strand it there.
-    // Only block on a live probe when the account has never been checked or was
-    // last seen signed-out/error; when already known signed-in, switch at once
-    // and refresh stale quota in the background so failover/manual switches never
-    // stall 10+ seconds waiting on `agy -p /usage`.
-    const known = typeof service.knownStatus === "function" ? service.knownStatus(input.accountId) : "unknown";
-    if (known === "signed-in") {
-      void Promise.resolve(service.quotaFor(input.accountId, 5 * 60_000)).catch(() => undefined);
-    } else {
-      const status = await service.quotaFor(input.accountId, 5 * 60_000);
-      if (status.status === "signed-out") {
-        throw new Error(`Sign in to "${accountLabel}" in Antigravity accounts before moving an agent to it.`);
-      }
-    }
-  }
-  const handle = paseo.agents.ref(input.agentId);
-  const refreshed = await handle.refresh();
-  if (!refreshed) throw new Error("That agent no longer exists.");
-  const agent = refreshed.agent;
-  if (!isAntigravityProvider(agent.provider)) {
-    throw new Error("Only Antigravity agents can switch Google accounts.");
-  }
-  if (agent.archivedAt) throw new Error("That agent is archived.");
-  const current = accountIdFromMetadata(agent.metadata);
-  if (input.expectedCurrentAccountId !== undefined && current !== input.expectedCurrentAccountId) {
-    return { result: "unchanged", accountLabel: service.labelOf(current) };
-  }
-  if (current === input.accountId) {
-    pending.delete(input.agentId);
-    return { result: "unchanged", accountLabel };
-  }
-  const running = agent.status === "running" || agent.status === "initializing";
-  if (input.when === "after-turn" && running) {
-    // Do not overwrite metadata while the turn is still executing on `current`:
-    // turn-after attribution and fallback must see the account that actually ran this turn.
-    pending.set(input.agentId, input.accountId);
-    return { result: "scheduled", accountLabel };
-  }
-  // An explicit "default" keeps the system choice even when another account is the default.
-  await handle.setMetadata({ [ACCOUNT_METADATA_KEY]: input.accountId });
-  pending.delete(input.agentId);
-  // Protect both forward reload and failure rollback reload from re-entering `redirectForOpen`.
-  pending.beginManual(input.agentId);
+  const isUserManual = input.manual === true && input.expectedCurrentAccountId === undefined;
+  if (isUserManual) pending.beginManual(input.agentId);
   try {
-    await handle.reload();
-  } catch (error) {
-    // Put the agent back where it worked, then report why the new account failed.
-    const reason = error instanceof Error ? error.message : String(error);
-    await handle.setMetadata({ [ACCOUNT_METADATA_KEY]: current }).catch(() => undefined);
-    const restored = await handle.reload().then(
-      () => true,
-      () => false,
-    );
-    throw new Error(
-      `"${accountLabel}" could not open this agent: ${reason}` +
-        (restored ? ` The agent stays on "${service.labelOf(current)}".` : ""),
-    );
+    return await pending.withAgentLock(input.agentId, async () => {
+      const target = service.requireAccount(input.accountId);
+      if (target?.unsafeDetail) throw new Error(target.unsafeDetail);
+      const accountLabel = service.labelOf(input.accountId);
+      if (target) {
+        // Moving an agent onto an account that cannot run would strand it there.
+        // Only block on a live probe when the account has never been checked or was
+        // last seen signed-out/error; when already known signed-in, switch at once
+        // and refresh stale quota in the background so failover/manual switches never
+        // stall 10+ seconds waiting on `agy -p /usage`.
+        const known = typeof service.knownStatus === "function" ? service.knownStatus(input.accountId) : "unknown";
+        if (known === "signed-in") {
+          void Promise.resolve(service.quotaFor(input.accountId, 5 * 60_000)).catch(() => undefined);
+        } else {
+          const status = await service.quotaFor(input.accountId, 5 * 60_000);
+          if (status.status === "signed-out") {
+            throw new Error(`Sign in to "${accountLabel}" in Antigravity accounts before moving an agent to it.`);
+          }
+        }
+      }
+      const handle = paseo.agents.ref(input.agentId);
+      const refreshed = await handle.refresh();
+      if (!refreshed) throw new Error("That agent no longer exists.");
+      const agent = refreshed.agent;
+      if (!isAntigravityProvider(agent.provider)) {
+        throw new Error("Only Antigravity agents can switch Google accounts.");
+      }
+      if (agent.archivedAt) throw new Error("That agent is archived.");
+      const current = accountIdFromMetadata(agent.metadata);
+      if (
+        input.expectedCurrentAccountId !== undefined &&
+        (current !== input.expectedCurrentAccountId || pending.isManual(input.agentId))
+      ) {
+        return { result: "unchanged", accountLabel: service.labelOf(current) };
+      }
+      if (current === input.accountId) {
+        pending.delete(input.agentId);
+        return { result: "unchanged", accountLabel };
+      }
+      const running = agent.status === "running" || agent.status === "initializing";
+      if (input.when === "after-turn" && running) {
+        // Do not overwrite metadata while the turn is still executing on `current`:
+        // turn-after attribution and fallback must see the account that actually ran this turn.
+        pending.set(input.agentId, input.accountId);
+        return { result: "scheduled", accountLabel };
+      }
+      // An explicit "default" keeps the system choice even when another account is the default.
+      await handle.setMetadata({ [ACCOUNT_METADATA_KEY]: input.accountId });
+      pending.delete(input.agentId);
+      // Protect both forward reload and failure rollback reload from re-entering `redirectForOpen`.
+      pending.beginManual(input.agentId);
+      try {
+        await handle.reload();
+      } catch (error) {
+        // Put the agent back where it worked, then report why the new account failed.
+        const reason = error instanceof Error ? error.message : String(error);
+        await handle.setMetadata({ [ACCOUNT_METADATA_KEY]: current }).catch(() => undefined);
+        const restored = await handle.reload().then(
+          () => true,
+          () => false,
+        );
+        throw new Error(
+          `"${accountLabel}" could not open this agent: ${reason}` +
+            (restored ? ` The agent stays on "${service.labelOf(current)}".` : ""),
+        );
+      } finally {
+        pending.endManual(input.agentId);
+      }
+      return { result: "switched", accountLabel };
+    });
   } finally {
-    pending.endManual(input.agentId);
+    if (isUserManual) pending.endManual(input.agentId);
   }
-  return { result: "switched", accountLabel };
 }
 
 export interface MigrateInput {
@@ -425,26 +460,28 @@ export function registerHooks(
           if (!account || account.unsafeDetail) return;
         }
         await new Promise((resolve) => setTimeout(resolve, 500));
-        const handle = paseo.agents.ref(agent.id);
-        const snapshot = await handle.refresh().catch(() => null);
-        if (!snapshot || snapshot.agent.archivedAt) return;
-        const previous = accountIdFromMetadata(snapshot.agent.metadata);
-        if (previous === target) return;
-        pending.beginManual(agent.id);
-        try {
-          await handle.setMetadata({ [ACCOUNT_METADATA_KEY]: target });
+        await pending.withAgentLock(agent.id, async () => {
+          const handle = paseo.agents.ref(agent.id);
+          const snapshot = await handle.refresh().catch(() => null);
+          if (!snapshot || snapshot.agent.archivedAt) return;
+          const previous = accountIdFromMetadata(snapshot.agent.metadata);
+          if (previous === target) return;
+          pending.beginManual(agent.id);
           try {
-            await handle.reload();
-          } catch (reloadError) {
-            await handle.setMetadata({ [ACCOUNT_METADATA_KEY]: previous }).catch(() => undefined);
-            await handle.reload().catch(() => undefined);
-            throw reloadError;
+            await handle.setMetadata({ [ACCOUNT_METADATA_KEY]: target });
+            try {
+              await handle.reload();
+            } catch (reloadError) {
+              await handle.setMetadata({ [ACCOUNT_METADATA_KEY]: previous }).catch(() => undefined);
+              await handle.reload().catch(() => undefined);
+              throw reloadError;
+            }
+          } catch (error) {
+            console.error(`dsh-paseo/antigravity: deferred switch of ${agent.id} failed`, error);
+          } finally {
+            pending.endManual(agent.id);
           }
-        } catch (error) {
-          console.error(`dsh-paseo/antigravity: deferred switch of ${agent.id} failed`, error);
-        } finally {
-          pending.endManual(agent.id);
-        }
+        });
       } finally {
         // Refresh timestamp on exit so a slow reload never expires the turnId-less fallback window
         // before the next serial `agent.turn.after` handler runs.

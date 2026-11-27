@@ -39,10 +39,7 @@ import { DEEPSEEK_MARK_SVG } from "./client/deepseek-mark-svg";
 import { guardCleanup, installFatalGuard, report } from "./client/dsh-plugins-guard";
 import { contributeGoalPill } from "./client/goal-pill";
 import { AssistantMessageBloom } from "./client/assistant-bloom";
-import {
-  createBloomHandoffController,
-  registerBloomReleaseHandler,
-} from "./client/assistant-bloom-handoff";
+import { createLiveBloomTracker } from "./client/assistant-bloom-handoff";
 import { InlineThinking } from "./client/inline-thinking";
 import { isStandaloneMarkdownImage } from "./client/thinking-text";
 import { registerAntigravityToolSummariesReader } from "./client/antigravity/tool-summaries";
@@ -281,55 +278,46 @@ function buildContributions(client: PluginClientContext): () => void {
     Component: InlineThinking,
   });
 
-  // Global smooth block-emergence for live streaming assistant replies across
-  // all providers, with two-phase handoff back to Paseo's native renderer:
-  // - Live `phase === "streaming"` replies register as active and keep blooming
-  //   even if `turn_completed` flips `phase` to `"complete"` 200ms later (fast
-  //   models like `deepseek-flash` or replies ending in tables/code).
-  // - Once `AssistantMessageBloom` finishes its mist wave, `release(bloomKey)`
-  //   re-registers this transformer so Paseo re-projects the finished row as a
-  //   native `assistant_message`, restoring Paseo's native Copy Result, Fork to
-  //   New Tab, and Turn Timing footer.
-  // - Historical / already-complete replies return `undefined` on frame 0.
-  let unregisterBloomTransformer: (() => void) | null = null;
-  let bloomHandoffDisposed = false;
-  const registerBloomTransformer = () =>
-    client.addTimelineTransformer({
-      id: "dsh-assistant-bloom",
-      query: { itemType: "assistant_message" },
-      transform: ({ item, phase }) => {
-        if (isStandaloneMarkdownImage(item.text)) return undefined;
-        const decision = bloomHandoff.resolve(item, phase);
-        if (!decision.transform) return undefined;
-        return {
-          items: [
-            {
-              type: "plugin",
-              kind: "dsh-assistant-bloom",
-              version: 1,
-              data: {
-                text: item.text,
-                phase,
-                ...(decision.bloomKey ? { bloomKey: decision.bloomKey } : {}),
-              },
+  // Global 0-flash GPU mist-veil emergence for live streaming assistant replies:
+  // - Historical / already-complete replies return `undefined` on frame 0 so
+  //   Paseo renders its native `<AssistantMessage>` + full native footer.
+  // - Replies first seen with `phase === "streaming"` stay on this single
+  //   `dsh-assistant-bloom` row for the lifetime of the session — registered
+  //   once and never re-registered — avoiding full-page `projectionCache`
+  //   invalidation and `LegendList` ID-swap flicker.
+  const liveBloomTracker = createLiveBloomTracker();
+  const unregisterBloomTransformer = client.addTimelineTransformer({
+    id: "dsh-assistant-bloom",
+    query: { itemType: "assistant_message" },
+    transform: (ctx) => {
+      const { item, phase } = ctx;
+      if (isStandaloneMarkdownImage(item.text)) return undefined;
+      const rawCtxAgent = (ctx as { agentId?: unknown }).agentId;
+      const rawItemAgent = (item as { agentId?: unknown }).agentId;
+      const ctxAgentId =
+        typeof rawCtxAgent === "string"
+          ? rawCtxAgent
+          : typeof rawItemAgent === "string"
+            ? rawItemAgent
+            : undefined;
+      const decision = liveBloomTracker.resolve(item, phase, ctxAgentId);
+      if (!decision.transform) return undefined;
+      return {
+        items: [
+          {
+            type: "plugin",
+            kind: "dsh-assistant-bloom",
+            version: 1,
+            data: {
+              text: item.text,
+              phase,
+              ...(decision.bloomKey ? { bloomKey: decision.bloomKey } : {}),
             },
-          ],
-        };
-      },
-    });
-  const bloomHandoff = createBloomHandoffController({
-    onChanged: () => {
-      if (bloomHandoffDisposed) return;
-      const prev = unregisterBloomTransformer;
-      unregisterBloomTransformer = null;
-      prev?.();
-      unregisterBloomTransformer = registerBloomTransformer();
+          },
+        ],
+      };
     },
   });
-  const unregisterBloomRelease = registerBloomReleaseHandler((bloomKey) => {
-    bloomHandoff.release(bloomKey);
-  });
-  unregisterBloomTransformer = registerBloomTransformer();
 
   client.addTimelineRenderer({
     kind: "dsh-assistant-bloom",
@@ -715,11 +703,8 @@ function buildContributions(client: PluginClientContext): () => void {
 
   const cleanups = [
     () => {
-      bloomHandoffDisposed = true;
-      unregisterBloomRelease();
-      bloomHandoff.dispose();
-      unregisterBloomTransformer?.();
-      unregisterBloomTransformer = null;
+      liveBloomTracker.dispose();
+      unregisterBloomTransformer();
     },
     unregisterThinkingTranslator,
     () => {

@@ -45,7 +45,7 @@
     "test:process": "node --test test/process.test.cjs"
   },
   "peerDependencies": {
-    "@getpaseo/plugin": ">=0.17.1"
+    "@getpaseo/plugin": ">=0.18.1"
   },
   "peerDependenciesMeta": {
     "@getpaseo/plugin": {

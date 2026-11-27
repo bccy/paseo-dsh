@@ -1114,6 +1114,9 @@ function commonUtf16PrefixLength(a: string, b: string): number {
   return i;
 }
 
+/** Emit cadence (~30fps) for expanded thinking body ink reveal. */
+const EXPANDED_INK_FRAME_INTERVAL_MS = 33;
+
 /**
  * Streams newly arriving text inside an expanded thinking box with the same
  * 5.5-character soft ink-bloom trail used on the timeline (`renderInkTrailText`).
@@ -1121,7 +1124,7 @@ function commonUtf16PrefixLength(a: string, b: string): number {
  * - Text already present when the user expands appears immediately (0ms).
  * - Completed paragraphs above the active ink tail freeze into a memoized
  *   static `<Text>` so even 30k+ character thoughts only re-layout the active
- *   trailing paragraph (~50–250 chars) at 60fps.
+ *   trailing paragraph (~50–250 chars) at ~30fps (33ms).
  * - `settledFloor` guarantees already-settled trailing characters stay at
  *   opacity 1.0 when a new chunk arrives while new characters bloom cleanly
  *   from the very first appended glyph.
@@ -1231,16 +1234,6 @@ function useExpandedBodyInkReveal(
           gapLines: 0,
           paragraphIndex: frozenRef.current.paragraphIndex,
         };
-      }
-    } else if (prevText !== "" && text.startsWith(prevText)) {
-      // Fast O(delta) path for normal streaming appends — avoids O(N) rescans
-      // across 10k-30k char DSH thinking streams on every arriving token.
-      const prevTotal = totalCpRef.current;
-      const deltaCp = countCodePoints(text.slice(prevText.length));
-      totalCpRef.current = prevTotal + deltaCp;
-      if (cursorRef.current > prevTotal) {
-        settledFloorRef.current = Math.max(settledFloorRef.current, prevTotal);
-        cursorRef.current = prevTotal;
       }
     } else {
       const commonUtf16 = commonUtf16PrefixLength(prevText, text);
@@ -1363,11 +1356,9 @@ function useExpandedBodyInkReveal(
         setTick((v) => (v + 1) & 0x7fffffff);
         return;
       }
-      const emitInterval =
-        text.length - frozenRef.current.activeStartUtf16 > 400
-          ? STREAM_FRAME_INTERVAL_MS * 2
-          : STREAM_FRAME_INTERVAL_MS;
-      if (lastEmitAt === 0 || now - lastEmitAt >= emitInterval) {
+      // Thinking text streams slowly (14–42 chars/sec), so 30fps (~33ms) stays
+      // visually smooth while halving JS/CoreText layout wakeups on mobile.
+      if (lastEmitAt === 0 || now - lastEmitAt >= EXPANDED_INK_FRAME_INTERVAL_MS) {
         lastEmitAt = now;
         setTick((v) => (v + 1) & 0x7fffffff);
       }

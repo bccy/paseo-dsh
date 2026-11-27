@@ -156,6 +156,9 @@ interface Chain {
 interface CooldownEntry {
   until: number;
   reason: FailureKind;
+  setAt: number;
+  /** Remaining quota fraction observed when cooldown was set, or -1 if unknown/non-quota. */
+  baselineScore: number;
 }
 
 interface AccountCooldownState {
@@ -290,9 +293,15 @@ export class FallbackController {
     return null;
   }
 
-  private setCooldown(accountId: string, pool: QuotaPool, until: number, reason: FailureKind): void {
+  private setCooldown(
+    accountId: string,
+    pool: QuotaPool,
+    until: number,
+    reason: FailureKind,
+    baselineScore = -1,
+  ): void {
     const entry = this.cooldowns.get(accountId) ?? {};
-    entry[pool] = { until, reason };
+    entry[pool] = { until, reason, setAt: Date.now(), baselineScore };
     this.cooldowns.set(accountId, entry);
     this.service.notifyChange();
   }
@@ -320,7 +329,18 @@ export class FallbackController {
       changed = true;
     }
     for (const pool of ["gemini", "third-party"] as const) {
-      if (entry[pool]?.reason === "quota" && !exhausted(quota, pool) && poolRemainingScore(quota, pool) > EXHAUSTED_THRESHOLD) {
+      const item = entry[pool];
+      if (item?.reason !== "quota") continue;
+      if (exhausted(quota, pool)) continue;
+      const freshScore = poolRemainingScore(quota, pool);
+      if (freshScore <= EXHAUSTED_THRESHOLD) continue;
+      // When a soft limit fired at a non-zero remaining fraction (e.g. 0.05), require real
+      // quota recovery before clearing the cooldown instead of clearing on the same stale 0.05.
+      const recovered =
+        item.baselineScore >= 0
+          ? freshScore > item.baselineScore + 0.05 || freshScore >= 0.5
+          : true;
+      if (recovered) {
         delete entry[pool];
         changed = true;
       }
@@ -451,18 +471,6 @@ export class FallbackController {
     const cooldownPool: QuotaPool = reason === "auth" ? "all" : pool;
     const resetDelayMs = reason === "quota" ? parseResetDelayMs(error.message) : null;
 
-    // Refresh the failed account's quota in the background so the sidebar updates and
-    // cooldown timing refines without stalling failover for 10+ seconds on `agy -p /usage`.
-    void Promise.resolve(this.service.refreshOne(current))
-      .then(() => {
-        if (reason !== "quota") return;
-        const freshUntil = resetOfExhausted(this.service.knownQuota(current), pool, Date.now());
-        if (freshUntil !== null && this.activeCooldown(current, pool)?.reason === "quota") {
-          this.setCooldown(current, cooldownPool, freshUntil, reason);
-        }
-      })
-      .catch(() => undefined);
-
     if ((reason === "transient" || reason === "error") && chain.attempts < retries) {
       chain.attempts += 1;
       const attempt = chain.attempts;
@@ -471,14 +479,31 @@ export class FallbackController {
       return;
     }
 
+    const knownBefore = this.service.knownQuota(current);
+    const baselineScore = reason === "quota" ? poolRemainingScore(knownBefore, pool) : -1;
     const until =
       reason === "quota"
-        ? (resetOfExhausted(this.service.knownQuota(current), pool, now) ??
+        ? (resetOfExhausted(knownBefore, pool, now) ??
           (resetDelayMs !== null ? now + resetDelayMs : now + 30 * 60_000))
         : reason === "auth"
           ? now + 6 * 3_600_000
           : now + 10 * 60_000;
-    this.setCooldown(current, cooldownPool, until, reason);
+    this.setCooldown(current, cooldownPool, until, reason, baselineScore);
+
+    if (reason === "quota") {
+      // Refresh the failed account's quota in the background *after* setting cooldown so
+      // baselineScore protects against immediate self-clearing on a soft limit, while still
+      // updating the sidebar and refining `until` without stalling failover on `agy -p /usage`.
+      void Promise.resolve(this.service.refreshOne(current))
+        .then(() => {
+          const freshUntil = resetOfExhausted(this.service.knownQuota(current), pool, Date.now());
+          const active = this.activeCooldown(current, pool);
+          if (freshUntil !== null && active?.reason === "quota") {
+            this.setCooldown(current, cooldownPool, freshUntil, reason, active.baselineScore);
+          }
+        })
+        .catch(() => undefined);
+    }
 
     // Keep trying candidates when one fails to open (e.g. an account that lacks the agent's model).
     for (;;) {
@@ -653,7 +678,7 @@ export class FallbackController {
 
   /** Sends the resume prompt unless the agent is already busy, archived, or fallback was turned off. */
   private async resume(paseo: PaseoApi, agentId: string): Promise<void> {
-    if (!this.service.fallbackSettings().enabled) {
+    if (!this.service.fallbackSettings().enabled || this.pending.hasPendingOrActive(agentId) || this.pending.isManual(agentId)) {
       this.chains.delete(agentId);
       return;
     }

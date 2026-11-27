@@ -155,11 +155,3 @@ export function toneColor(colors: ToneColors, tone: Tone): string {
       return colors.foregroundMuted;
   }
 }
-
-/** Severity tone for a used-capacity fraction (`<0.6` accent, `<0.85` warning, `>=0.85` danger). */
-export function usedTone(fraction: number | null | undefined): Tone {
-  if (fraction === null || fraction === undefined || !Number.isFinite(fraction)) return "neutral";
-  if (fraction < 0.6) return "accent";
-  if (fraction < 0.85) return "warning";
-  return "danger";
-}

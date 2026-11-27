@@ -382,13 +382,6 @@ export function longDate(date: Date | number | string, locale = "en"): string {
   );
 }
 
-/** Numeric month/day label (`"11/23"`), safe across mobile ICU implementations. */
-export function monthDay(timestamp: Date | number | string, locale = "en"): string {
-  return dateText(timestamp, locale, { month: "numeric", day: "numeric" }, (d) =>
-    `${d.getMonth() + 1}/${d.getDate()}`,
-  );
-}
-
 /** Sunday-first (`0`) weeks in English, Monday-first (`1`) in Chinese. */
 export function weekStartsOn(locale = "en"): 0 | 1 {
   return isChineseLocale(locale) ? 1 : 0;

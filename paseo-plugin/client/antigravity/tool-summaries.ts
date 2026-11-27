@@ -94,6 +94,31 @@ function getEntry(agentId: string): AgentCacheEntry {
   return entry;
 }
 
+function summariesEqual(
+  prev: AntigravityToolSummaries | null,
+  next: AntigravityToolSummaries | null,
+): boolean {
+  if (prev === next) return true;
+  if (!prev || !next) return false;
+  const prevKeys = Object.keys(prev.byCommand);
+  const nextKeys = Object.keys(next.byCommand);
+  if (prevKeys.length !== nextKeys.length) return false;
+  for (const key of prevKeys) {
+    if (!Object.prototype.hasOwnProperty.call(next.byCommand, key)) return false;
+    if (prev.byCommand[key] !== next.byCommand[key]) return false;
+  }
+  if (prev.prefixes.length !== next.prefixes.length) return false;
+  for (let i = 0; i < prev.prefixes.length; i += 1) {
+    if (
+      prev.prefixes[i]!.prefix !== next.prefixes[i]!.prefix ||
+      prev.prefixes[i]!.summary !== next.prefixes[i]!.summary
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function fetchSummaries(agentId: string, force = false): void {
   const reader = activeReader;
   if (!reader) return;
@@ -104,8 +129,9 @@ function fetchSummaries(agentId: string, force = false): void {
   entry.inflight = reader(agentId)
     .then((data) => {
       if (activeReader !== reader) return;
-      entry.data = data;
       entry.fetchedAt = Date.now();
+      if (summariesEqual(entry.data, data)) return;
+      entry.data = data;
       for (const listener of Array.from(entry.listeners)) listener();
     })
     .catch(() => {
@@ -176,6 +202,10 @@ export function useAntigravityCommandSummary(
 
   const cachedData = active ? (agentCache.get(agentId)?.data ?? null) : null;
   const summary = active ? matchSummary(cachedData, command) : "";
+  const commandRef = useRef(command);
+  const summaryRef = useRef(summary);
+  commandRef.current = command;
+  summaryRef.current = summary;
 
   useEffect(() => {
     if (!eligible) return undefined;
@@ -189,8 +219,14 @@ export function useAntigravityCommandSummary(
   useEffect(() => {
     if (!active) return undefined;
     const entry = getEntry(agentId);
-    const onUpdate = () => setTick((n) => n + 1);
+    const onUpdate = () => {
+      if (matchSummary(entry.data, commandRef.current) !== summaryRef.current) {
+        setTick((n) => n + 1);
+      }
+    };
     entry.listeners.add(onUpdate);
+    // Catch an in-flight fetch that settled between render and effect commit.
+    onUpdate();
     return () => {
       entry.listeners.delete(onUpdate);
     };

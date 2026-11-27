@@ -213,9 +213,6 @@ export const ANTIGRAVITY_DEFAULT_PRICING: readonly AntigravityDefaultPricingEntr
   },
 ];
 
-/** Compatibility alias matching `antigravity-accounts/shared/pricing.ts`. */
-export const DEFAULT_PRICING: readonly AntigravityDefaultPricingEntry[] = ANTIGRAVITY_DEFAULT_PRICING;
-
 const BY_KEY = new Map<string, AntigravityDefaultPricingEntry>(
   ANTIGRAVITY_DEFAULT_PRICING.map((entry) => [entry.key, entry]),
 );
@@ -379,7 +376,7 @@ export interface ParsedLegacyAntigravityPricing {
   readonly skippedKeys: readonly string[];
 }
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
+export function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 

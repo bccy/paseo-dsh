@@ -90,7 +90,7 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   与按 `provider` / `model` 交叉筛选；首字延迟 TTFT `0..300s` 钳制与输出速度 `<=3000 tok/s` 边界过滤；
   371 天每日汇总与连续活跃天数（streak）；以及异步后台预热（background prewarm）与实时
   `indexing: { active, done, total }` 状态上报。运行：`cd paseo-plugin && node --test test/usage-stats.test.cjs`。
-  **动了 `shared/usage.ts`、`server/usage-stats.ts` 或 `index.server.ts` 的用量统计 RPC / 预热接线必跑。**
+  **动了 `shared/usage.ts`、`server/stats-bins.ts`、`server/usage-stats.ts`、`server/antigravity/stats.ts` 或 `index.server.ts` 的用量统计 RPC / 分桶 / 预热接线必跑。**
 - `paseo-plugin/test/subagent-card.test.cjs` — 时间线子代理卡片服务端元数据、跨回合实时推送与状态摘要解析回归
   （**17 条**；已登记在 `offline-checks.cjs` 的 `pluginTests`，纳入 portable CI）：
   `item.metadata.dshSubagent` 只携带观测到的事实（缺失即省略，不伪造，启动回执不作最终报告，且不改

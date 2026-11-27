@@ -462,67 +462,6 @@ export const usageDailyRpc = defineRpc({
   output: usageDailySchema,
 });
 
-// ---- API Pricing ---------------------------------------------------------------------------
-
-const rateNumber = z.number().finite().min(0).max(10_000);
-
-export const modelRatesSchema = z.object({
-  input: rateNumber,
-  cached: rateNumber,
-  output: rateNumber,
-  longContextThreshold: z.number().int().positive().max(10_000_000).optional(),
-  longInput: rateNumber.optional(),
-  longCached: rateNumber.optional(),
-  longOutput: rateNumber.optional(),
-});
-
-export const pricingModelRowSchema = z.object({
-  key: z.string().min(1).max(120),
-  label: z.string().min(1).max(120),
-  provider: z.string().nullable(),
-  /** Official rates effective right now, or null for custom/unrecognized models. */
-  official: modelRatesSchema.nullable(),
-  /** User-configured override rates, or null when using official defaults. */
-  custom: modelRatesSchema.nullable(),
-  /** Effective rates currently used for estimation, or null when unpriced. */
-  effective: modelRatesSchema.nullable(),
-  /** Optional note about official scheduled or tiered rates. */
-  note: z.string().nullable(),
-  /** True when this model appeared in recent local conversations. */
-  seenLocally: z.boolean(),
-});
-
-export type PricingModelRow = z.infer<typeof pricingModelRowSchema>;
-
-export const pricingStateSchema = z.object({
-  models: z.array(pricingModelRowSchema),
-  /** Raw custom overrides map so clients (e.g. subagent views) can also estimate costs locally. */
-  overrides: z.record(z.string(), modelRatesSchema),
-});
-
-export type PricingState = z.infer<typeof pricingStateSchema>;
-
-export const getPricingRpc = defineRpc({
-  name: "pricing.get",
-  input: empty,
-  output: pricingStateSchema,
-});
-
-export const setPricingRpc = defineRpc({
-  name: "pricing.set",
-  input: z
-    .object({
-      /** Model pricing family key (e.g. "gemini-4-neon"). Required unless resetAll is true. */
-      key: z.string().trim().min(1).max(120).optional(),
-      /** Custom rates in USD per 1M tokens, or null to restore the official default for `key`. */
-      rates: modelRatesSchema.nullable().optional(),
-      /** When true, clears all custom overrides and restores official API pricing. */
-      resetAll: z.boolean().optional(),
-    })
-    .strict(),
-  output: pricingStateSchema,
-});
-
 export const setFallbackRpc = defineRpc({
   name: "accounts.set-fallback",
   input: fallbackSettingsSchema.partial().strict(),

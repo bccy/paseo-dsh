@@ -1265,3 +1265,58 @@ test("range 'today' anchors at local midnight 00:00 and strictly excludes yester
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("stats-bins preserves local calendar alignment across DST spring-forward and fall-back transitions", () => {
+  const { execFileSync } = require("node:child_process");
+  const script = `
+    require(${JSON.stringify(path.join(__dirname, "register-typescript.cjs"))});
+    const assert = require("node:assert/strict");
+    const { buildCalendarBins, findBinIndex, localDayKey } = require(${JSON.stringify(path.join(__dirname, "../server/stats-bins.ts"))});
+
+    // Spring-forward (2026-03-08, 23h day) and fall-back (2026-11-01, 25h day) in America/New_York
+    const anchors = [
+      new Date(2026, 2, 8, 15, 30, 0, 0).getTime(),
+      new Date(2026, 10, 1, 15, 30, 0, 0).getTime(),
+    ];
+    for (const now of anchors) {
+      for (const range of ["today", "24h", "7d", "30d"]) {
+        const bins = buildCalendarBins(now, range);
+        assert.ok(bins.length > 0);
+        for (let i = 0; i < bins.length; i += 1) {
+          if (i > 0) assert.equal(bins[i].start, bins[i - 1].end, range + " bin " + i + " must be contiguous");
+          assert.ok(bins[i].end >= bins[i].start, range + " bin " + i + " must be monotonic");
+        }
+        if (range === "30d") {
+          for (const bin of bins) {
+            const d = new Date(bin.start);
+            assert.equal(d.getHours(), 0, "30d bin start must stay at local 00:00 across DST");
+            assert.equal(d.getMinutes(), 0);
+          }
+        }
+        if (range === "7d") {
+          for (const bin of bins) {
+            const d = new Date(bin.start);
+            assert.equal(d.getHours() % 6, 0, "7d bin start must stay on 6h local boundary across DST");
+            assert.equal(d.getMinutes(), 0);
+          }
+        }
+        if (range === "24h") {
+          assert.equal(bins.length, 24);
+          for (const bin of bins) {
+            assert.equal(bin.end - bin.start, 3_600_000, "24h bins must stay 1 real hour each across DST");
+          }
+        }
+        const idx = findBinIndex(bins, now);
+        assert.ok(idx >= 0 && idx < bins.length, range + " must locate anchor timestamp");
+        assert.equal(findBinIndex(bins, bins[0].start - 1), -1);
+        assert.equal(findBinIndex(bins, bins[bins.length - 1].end), -1);
+      }
+    }
+    assert.equal(localDayKey(anchors[0]), "2026-03-08");
+    assert.equal(localDayKey(anchors[1]), "2026-11-01");
+  `;
+  execFileSync(process.execPath, ["-e", script], {
+    env: { ...process.env, TZ: "America/New_York" },
+    stdio: "pipe",
+  });
+});

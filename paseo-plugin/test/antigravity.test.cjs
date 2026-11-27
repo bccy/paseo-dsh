@@ -4084,3 +4084,424 @@ test("FallbackController switches immediately without blocking on refreshOne/quo
     controller.dispose();
   }
 });
+
+test("tool-summaries poll skips listener notifications when map content is unchanged and only wakes rows whose summary changed", async (t) => {
+  let activeInst = null;
+  const reactStub = {
+    useState(init) {
+      const inst = activeInst;
+      const idx = inst.cursor++;
+      if (!(idx in inst.states)) inst.states[idx] = typeof init === "function" ? init() : init;
+      const setState = (next) => {
+        inst.ticks += 1;
+        inst.states[idx] = typeof next === "function" ? next(inst.states[idx]) : next;
+      };
+      return [inst.states[idx], setState];
+    },
+    useRef(init) {
+      const inst = activeInst;
+      const idx = inst.cursor++;
+      if (!(idx in inst.refs)) inst.refs[idx] = { current: init };
+      return inst.refs[idx];
+    },
+    useEffect(fn, deps) {
+      const inst = activeInst;
+      const idx = inst.cursor++;
+      const prev = inst.effects[idx];
+      const changed =
+        !prev || !deps || !prev.deps || deps.length !== prev.deps.length || deps.some((d, i) => !Object.is(d, prev.deps[i]));
+      if (changed) inst.pendingEffects.push({ idx, fn, deps, prevCleanup: prev?.cleanup });
+    },
+  };
+  function mount(renderFn) {
+    const inst = { cursor: 0, states: [], refs: [], effects: [], pendingEffects: [], ticks: 0 };
+    const render = () => {
+      inst.cursor = 0;
+      inst.pendingEffects = [];
+      activeInst = inst;
+      let out;
+      try {
+        out = renderFn();
+      } finally {
+        activeInst = null;
+      }
+      for (const eff of inst.pendingEffects) {
+        eff.prevCleanup?.();
+        const cleanup = eff.fn();
+        inst.effects[eff.idx] = { deps: eff.deps, cleanup: typeof cleanup === "function" ? cleanup : undefined };
+      }
+      return out;
+    };
+    const unmount = () => {
+      for (const eff of inst.effects) eff?.cleanup?.();
+      inst.effects = [];
+    };
+    render();
+    return { render, unmount, get ticks() { return inst.ticks; } };
+  }
+
+  const realNow = Date.now;
+  const realSetInterval = global.setInterval;
+  const realClearInterval = global.clearInterval;
+  let fakeNow = 10_000;
+  let nextTimerId = 1;
+  const intervals = new Map();
+  Date.now = () => fakeNow;
+  global.setInterval = (fn) => {
+    const id = nextTimerId++;
+    intervals.set(id, fn);
+    return id;
+  };
+  global.clearInterval = (id) => {
+    intervals.delete(id);
+  };
+  t.after(() => {
+    Date.now = realNow;
+    global.setInterval = realSetInterval;
+    global.clearInterval = realClearInterval;
+  });
+
+  const originalLoad = Module._load;
+  const modPath = require.resolve("../client/antigravity/tool-summaries.ts");
+  delete require.cache[modPath];
+  Module._load = function patchedLoad(id, parent, isMain) {
+    if (id === "react") return reactStub;
+    return originalLoad.call(this, id, parent, isMain);
+  };
+  let mod;
+  try {
+    mod = require(modPath);
+  } finally {
+    Module._load = originalLoad;
+  }
+  t.after(() => {
+    delete require.cache[modPath];
+  });
+
+  let payload = { byCommand: { "cmd-a": "摘要 A" }, prefixes: [{ prefix: "git status --porcelain", summary: "检查状态" }] };
+  let fetches = 0;
+  const unregister = mod.registerAntigravityToolSummariesReader(async () => {
+    fetches += 1;
+    // Return a fresh object with copied maps/arrays on every poll to simulate JSON-RPC.
+    return {
+      byCommand: { ...payload.byCommand },
+      prefixes: payload.prefixes.map((p) => ({ ...p })),
+    };
+  });
+  t.after(() => unregister());
+
+  const rowA = mount(() => mod.useAntigravityCommandSummary("ag-diff", "cmd-a", "completed", "rA", true));
+  const rowB = mount(() => mod.useAntigravityCommandSummary("ag-diff", "cmd-b", "running", "rB", true));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(fetches, 1);
+  assert.equal(rowA.ticks, 1, "rowA wakes once when its summary arrives");
+  assert.equal(rowB.ticks, 0, "rowB must not wake when its summary is still empty");
+  assert.equal(rowA.render(), "摘要 A");
+  assert.equal(intervals.size, 1, "running row without summary holds one poll interval");
+
+  // Unchanged poll after STALE_MS must not notify any listener.
+  fakeNow += 2_000;
+  for (const fn of intervals.values()) fn();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(fetches, 2);
+  assert.equal(rowA.ticks, 1, "unchanged poll must not re-render settled historical rows");
+  assert.equal(rowB.ticks, 0, "unchanged poll must not re-render waiting rows");
+
+  // Next poll adds cmd-b while cmd-a stays identical: only rowB wakes.
+  payload = {
+    byCommand: { "cmd-a": "摘要 A", "cmd-b": "摘要 B" },
+    prefixes: [{ prefix: "git status --porcelain", summary: "检查状态" }],
+  };
+  fakeNow += 2_000;
+  for (const fn of intervals.values()) fn();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(fetches, 3);
+  assert.equal(rowA.ticks, 1, "historical row whose summary did not change must not re-render");
+  assert.equal(rowB.ticks, 1, "rowB must wake once when its summary arrives");
+  assert.equal(rowB.render(), "摘要 B");
+  assert.equal(intervals.size, 0, "poll interval stops once running row gets its summary");
+
+  // Render-to-effect race: an in-flight fetch settles after render saw empty cache
+  // but before the new row's listener effect commits. `add(onUpdate)` must immediately
+  // reconcile so the row never gets permanently stuck on "".
+  let resolveRace;
+  const racePayload = { byCommand: { "cmd-race": "竞态摘要" }, prefixes: [] };
+  const unregisterRace = mod.registerAntigravityToolSummariesReader(
+    () => new Promise((resolve) => { resolveRace = () => resolve({ byCommand: { ...racePayload.byCommand }, prefixes: [] }); }),
+  );
+  t.after(() => unregisterRace());
+  const triggerRow = mount(() => mod.useAntigravityCommandSummary("ag-race", "cmd-other", "completed", "rTrig", true));
+  const raceInst = { cursor: 0, states: [], refs: [], effects: [], pendingEffects: [], ticks: 0 };
+  activeInst = raceInst;
+  let raceFirstOut;
+  try {
+    raceFirstOut = mod.useAntigravityCommandSummary("ag-race", "cmd-race", "completed", "rRace", true);
+  } finally {
+    activeInst = null;
+  }
+  assert.equal(raceFirstOut, "", "render before fetch settles sees empty summary");
+  resolveRace();
+  await new Promise((r) => setImmediate(r));
+  for (const eff of raceInst.pendingEffects) {
+    const cleanup = eff.fn();
+    raceInst.effects[eff.idx] = { deps: eff.deps, cleanup: typeof cleanup === "function" ? cleanup : undefined };
+  }
+  assert.equal(raceInst.ticks, 1, "listener effect must reconcile summary settled between render and commit");
+  for (const eff of raceInst.effects) eff?.cleanup?.();
+  triggerRow.unmount();
+
+  rowA.unmount();
+  rowB.unmount();
+});
+
+test("switchAgentAccount per-agent lock + early manual guard prevents concurrent fallback from overwriting a manual switch", async () => {
+  const { FallbackController } = require("../server/antigravity/fallback.ts");
+  const { PendingSwitches, switchAgentAccount } = require("../server/antigravity/hooks.ts");
+
+  const metadata = { [agContracts.ACCOUNT_METADATA_KEY]: "acc-a" };
+  let reloads = 0;
+  const notes = [];
+  const prompts = [];
+  let releaseFallbackRefresh;
+  let fallbackRefreshEntered;
+  const fallbackRefreshReady = new Promise((resolve) => {
+    fallbackRefreshEntered = resolve;
+  });
+  let refreshCalls = 0;
+
+  const fakeService = {
+    init: async () => {},
+    setCooldownProvider: () => {},
+    onStatusUpdated: () => () => {},
+    notifyChange: () => {},
+    fallbackSettings: () => ({ enabled: true, retries: 1, strategy: "order" }),
+    labelOf: (id) => id,
+    requireAccount: (id) => ({ id, label: id, unsafeDetail: null }),
+    knownStatus: () => "signed-in",
+    quotaFor: async () => ({ status: "signed-in" }),
+    refreshOne: async () => {},
+    knownQuota: () => null,
+    state: async () => ({
+      defaultAccountId: "acc-a",
+      accounts: [
+        { id: "acc-a", label: "acc-a", kind: "profile", status: "signed-in", usable: true, fallbackEnabled: true },
+        { id: "acc-b", label: "acc-b", kind: "profile", status: "signed-in", usable: true, fallbackEnabled: true },
+        { id: "acc-c", label: "acc-c", kind: "profile", status: "signed-in", usable: true, fallbackEnabled: true },
+      ],
+    }),
+  };
+
+  const pending = new PendingSwitches();
+  const controller = new FallbackController(fakeService, pending);
+  const { server, hooks } = createFakeServer();
+  const unregister = controller.register(server);
+  try {
+    const turnAfter = hooks.find((h) => h.name === "agent.turn.after");
+    const fakeAgentRef = {
+      refresh: async () => {
+        refreshCalls += 1;
+        // First refresh inside fallback's `switchAgentAccount`: pause after returning snapshot A,
+        // while a concurrent user manual switch to C enters before fallback writes metadata.
+        if (refreshCalls === 1) {
+          fallbackRefreshEntered();
+          await new Promise((resolve) => {
+            releaseFallbackRefresh = resolve;
+          });
+        }
+        return {
+          agent: {
+            id: "agent-race-lock",
+            provider: "antigravity",
+            model: "gemini-4-neon",
+            status: "idle",
+            archivedAt: null,
+            metadata: { ...metadata },
+          },
+        };
+      },
+      setMetadata: async (patch) => Object.assign(metadata, patch),
+      reload: async () => {
+        reloads += 1;
+      },
+      send: async (text) => prompts.push(text),
+      timeline: {
+        refetch: async () => ({
+          agent: { id: "agent-race-lock", provider: "antigravity", model: "gemini-4-neon", metadata: { ...metadata } },
+          entries: [
+            { turnId: "t-lock", item: { type: "user_message", text: "hi" } },
+            { turnId: "t-lock", item: { type: "assistant_message", text: "⚠ Individual quota reached. Resets in 20m." } },
+          ],
+        }),
+        append: async (item) => notes.push(item),
+      },
+    };
+    const fakePaseo = { agents: { ref: () => fakeAgentRef } };
+
+    const fallbackPromise = turnAfter.handler(
+      {
+        agent: { id: "agent-race-lock", provider: "antigravity", metadata: { ...metadata } },
+        turnId: "t-lock",
+        outcome: { kind: "completed" },
+      },
+      { paseo: fakePaseo, signal: new AbortController().signal },
+    );
+
+    await fallbackRefreshReady;
+
+    // User manually switches to C while fallback is mid-refresh inside the lock.
+    const manualPromise = switchAgentAccount(fakePaseo, fakeService, pending, {
+      agentId: "agent-race-lock",
+      accountId: "acc-c",
+      when: "now",
+      manual: true,
+    });
+    assert.equal(pending.isManual("agent-race-lock"), true, "manual flag must be visible before acquiring agent lock");
+
+    releaseFallbackRefresh();
+    const [manualOutcome] = await Promise.all([manualPromise, fallbackPromise]);
+
+    assert.equal(manualOutcome.result, "switched");
+    assert.equal(metadata[agContracts.ACCOUNT_METADATA_KEY], "acc-c", "final account must be manual choice C");
+    assert.equal(reloads, 1, "must reload only once for C, never a second fallback reload");
+    assert.equal(notes.length, 0, "must not append misleading fallback switch note");
+    assert.equal(prompts.length, 0, "must not send Continue. onto wrong account");
+    assert.equal(pending.isManual("agent-race-lock"), false, "manual flag must clean up in finally");
+  } finally {
+    unregister();
+    controller.dispose();
+  }
+});
+
+test("FallbackController preserves soft-quota cooldown across same-fraction status updates, clears on real recovery, and skips refreshOne on transient failures", async () => {
+  const { FallbackController } = require("../server/antigravity/fallback.ts");
+  const { PendingSwitches } = require("../server/antigravity/hooks.ts");
+
+  const statusListeners = new Set();
+  const emitStatus = (accountId, status, quota) => {
+    for (const listener of statusListeners) listener({ accountId, status, quota });
+  };
+  const makeQuota = (fraction) => [
+    {
+      name: "Gemini Models",
+      buckets: [{ id: "gemini-5h", name: "5h", window: "5h", remainingFraction: fraction, resetTime: null, disabled: false }],
+    },
+  ];
+
+  let currentQuota = makeQuota(0.05);
+  const refreshedIds = [];
+  const fakeService = {
+    init: async () => {},
+    setCooldownProvider: () => {},
+    onStatusUpdated: (fn) => {
+      statusListeners.add(fn);
+      return () => statusListeners.delete(fn);
+    },
+    notifyChange: () => {},
+    fallbackSettings: () => ({ enabled: true, retries: 0, strategy: "order" }),
+    labelOf: (id) => id,
+    requireAccount: (id) => ({ id, label: id, unsafeDetail: null }),
+    knownStatus: () => "signed-in",
+    quotaFor: async () => ({ status: "signed-in" }),
+    refreshOne: (id) => {
+      refreshedIds.push(id);
+      // Immediately emit the same 0.05 soft-limited fraction synchronously + asynchronously.
+      emitStatus(id, "signed-in", currentQuota);
+      return Promise.resolve().then(() => emitStatus(id, "signed-in", currentQuota));
+    },
+    knownQuota: (id) => (id === "acc-soft" ? currentQuota : makeQuota(0.9)),
+    state: async () => ({
+      defaultAccountId: "acc-soft",
+      accounts: [
+        { id: "acc-soft", label: "acc-soft", kind: "profile", status: "signed-in", usable: true, fallbackEnabled: true },
+        { id: "acc-next", label: "acc-next", kind: "profile", status: "signed-in", usable: true, fallbackEnabled: true },
+      ],
+    }),
+  };
+
+  const controller = new FallbackController(fakeService, new PendingSwitches());
+  const { server, hooks } = createFakeServer();
+  const unregister = controller.register(server);
+  try {
+    const turnAfter = hooks.find((h) => h.name === "agent.turn.after");
+    const makePaseo = (accountId, warningLine) => {
+      const meta = { [agContracts.ACCOUNT_METADATA_KEY]: accountId };
+      return {
+        agents: {
+          ref: () => ({
+            refresh: async () => ({
+              agent: { id: `ag-${accountId}`, provider: "antigravity", model: "gemini-4-neon", status: "idle", archivedAt: null, metadata: { ...meta } },
+            }),
+            setMetadata: async (patch) => Object.assign(meta, patch),
+            reload: async () => {},
+            send: async () => {},
+            timeline: {
+              refetch: async () => ({
+                agent: { id: `ag-${accountId}`, provider: "antigravity", model: "gemini-4-neon", metadata: { ...meta } },
+                entries: [
+                  { turnId: "t1", item: { type: "user_message", text: "hi" } },
+                  { turnId: "t1", item: { type: "assistant_message", text: warningLine } },
+                ],
+              }),
+              append: async () => {},
+            },
+          }),
+        },
+      };
+    };
+
+    // 1. Soft quota hit at 0.05: refreshOne emits 0.05 -> cooldown must stay active!
+    await turnAfter.handler(
+      {
+        agent: { id: "ag-acc-soft", provider: "antigravity", metadata: { [agContracts.ACCOUNT_METADATA_KEY]: "acc-soft" } },
+        turnId: "t1",
+        outcome: { kind: "completed" },
+      },
+      { paseo: makePaseo("acc-soft", "⚠ Individual quota reached. Resets in 30m."), signal: new AbortController().signal },
+    );
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(refreshedIds, ["acc-soft"], "quota failure triggers background refreshOne");
+    assert.equal(controller.cooldownsOf("acc-soft").length, 1, "same 0.05 fraction must NOT clear soft-quota cooldown");
+
+    // 2. Real quota recovery (1.0): cooldown must clear automatically.
+    currentQuota = makeQuota(1.0);
+    emitStatus("acc-soft", "signed-in", currentQuota);
+    assert.equal(controller.cooldownsOf("acc-soft").length, 0, "full quota recovery (1.0) must clear quota cooldown");
+
+    // 3. Transient failure must NOT invoke refreshOne.
+    refreshedIds.length = 0;
+    await turnAfter.handler(
+      {
+        agent: { id: "ag-acc-soft", provider: "antigravity", metadata: { [agContracts.ACCOUNT_METADATA_KEY]: "acc-soft" } },
+        turnId: "t2",
+        outcome: { kind: "failed", error: { message: "503 Service Unavailable" } },
+      },
+      { paseo: makePaseo("acc-soft", ""), signal: new AbortController().signal },
+    );
+    assert.deepEqual(refreshedIds, [], "transient error must not trigger background /usage refreshOne");
+  } finally {
+    unregister();
+    controller.dispose();
+  }
+});
+
+test("Antigravity format module stays consistent with Console format re-exports across boundary values", () => {
+  const agFmt = require("../client/antigravity/format.ts");
+  const consoleFmt = require("../client/console-format.ts");
+
+  for (const value of [0, 420, 1_500, 100_000, 1_048_576, 12_500_000, 1_500_000_000, Number.NaN]) {
+    assert.equal(agFmt.tokens(value), consoleFmt.tokens(value));
+    assert.equal(agFmt.integer(value, "en"), consoleFmt.integer(value, "en"));
+  }
+  for (const amount of [0, 0.00005, 0.0042, 0.456, 1.28, 1234.6, Number.NaN]) {
+    assert.equal(agFmt.money(amount, "USD", "en"), consoleFmt.money(amount, "USD", "en"));
+    assert.equal(agFmt.money(amount, "CNY", "zh-CN"), consoleFmt.money(amount, "CNY", "zh-CN"));
+    assert.equal(agFmt.usd(amount, "en"), consoleFmt.money(amount, "USD", "en"));
+  }
+  for (const frac of [0, 0.004, 0.5, 0.76, 1, Number.NaN]) {
+    assert.equal(agFmt.percent(frac, "en"), consoleFmt.percent(frac, "en"));
+  }
+  assert.equal(agFmt.safeLocale("zh_CN"), consoleFmt.safeLocale("zh_CN"));
+  assert.equal(agFmt.upper("hello", "en"), consoleFmt.upper("hello", "en"));
+  assert.equal(agFmt.clockTime("2026-11-27T00:05:09Z", "en", true), consoleFmt.clockTime("2026-11-27T00:05:09Z", "en", true));
+  assert.equal(agFmt.relative(10_000, 10_000, "en"), consoleFmt.relative(10_000, 10_000, "en"));
+});

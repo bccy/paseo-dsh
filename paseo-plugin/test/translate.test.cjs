@@ -868,10 +868,16 @@ test("client/thinking-text.ts left-scroll stream normalizer and adaptive cursor 
   assert.equal(segsFrame1[1].text, "新");
   assert.ok(segsFrame1[1].opacity < 0.5 && segsFrame1[1].highlight === 2);
 
-  // Global assistant Markdown block splitter preserves fenced code blocks and skips standalone images
+  // Global assistant Markdown block splitter preserves fenced code blocks, Setext headings,
+  // list-to-paragraph transitions, and skips standalone images
   const {
+    ACTIVE_BLOCK_THROTTLE_MS,
     isStandaloneMarkdownImage,
+    shouldFlushActiveBlockImmediately,
+    shouldMergeToUnifiedMarkdown,
+    shouldStartAssistantBloomFromZero,
     splitAssistantMarkdownBlocks,
+    splitStableMarkdownBlocks,
   } = require("../client/thinking-text.ts");
   assert.equal(isStandaloneMarkdownImage("![preview](file:///tmp/a.png)"), true);
   assert.equal(isStandaloneMarkdownImage("说明文字\n![preview](file:///tmp/a.png)"), false);
@@ -888,60 +894,142 @@ test("client/thinking-text.ts left-scroll stream normalizer and adaptive cursor 
   // Unclosed streaming code fence stays intact as one single block
   const unclosedFence = splitAssistantMarkdownBlocks("开场\n\n```py\nx = 1\n\ny = 2");
   assert.deepEqual(unclosedFence, ["开场", "```py\nx = 1\n\ny = 2"]);
-
-  // Streaming inline Markdown tokenizer + continuous rgba front-to-back bloom runs
-  const {
-    buildStyledBloomRuns,
-    isRichMarkdownBlock,
-    parseInlineMarkdownRuns,
-  } = require("../client/thinking-text.ts");
-  assert.equal(isRichMarkdownBlock("普通段落含 **粗体** 和 `code`"), false);
-  assert.equal(isRichMarkdownBlock("```ts\nconst x = 1;\n```"), true);
-  assert.equal(isRichMarkdownBlock("| a | b |\n|---|---|\n| 1 | 2 |"), true);
-
-  const inlineRuns = parseInlineMarkdownRuns("- **按序屏障**：查看 [file.ts](file:///tmp/file.ts) 的 `code`");
-  assert.deepEqual(inlineRuns, [
-    { text: "• ", kind: "plain" },
-    { text: "按序屏障", kind: "bold" },
-    { text: "：查看 ", kind: "plain" },
-    { text: "file.ts", kind: "link" },
-    { text: " 的 ", kind: "plain" },
-    { text: "code", kind: "code" },
-  ]);
-  // Unclosed streaming bold/link markers never leak raw syntax
-  const unclosedBoldRuns = parseInlineMarkdownRuns("正在输出 **粗体文字");
-  assert.deepEqual(unclosedBoldRuns, [
-    { text: "正在输出 ", kind: "plain" },
-    { text: "粗体文字", kind: "bold" },
-  ]);
-  const unclosedLinkRuns = parseInlineMarkdownRuns("查看 [说明](file:///tmp/in-progress");
-  assert.deepEqual(unclosedLinkRuns, [
-    { text: "查看 ", kind: "plain" },
-    { text: "说明", kind: "link" },
-  ]);
-
-  const styledBloom = buildStyledBloomRuns(inlineRuns, 8, 24, 0, 48);
-  assert.equal(
-    styledBloom.map((s) => s.text).join(""),
-    "• 按序屏障：查看 file.ts 的 code",
-    "continuous styled bloom preserves every glyph with zero dropped chars",
+  // Paragraph followed immediately by list/hr splits cleanly into separate blocks
+  assert.deepEqual(
+    splitAssistantMarkdownBlocks("导语\n- 要点一\n- 要点二\n---\n尾声"),
+    ["导语", "- 要点一\n- 要点二", "---", "尾声"],
   );
-  assert.ok(styledBloom.some((s) => s.kind === "bold" && s.alpha > 0 && s.alpha < 1));
-  assert.ok(styledBloom.some((s) => s.alpha === 0), "upcoming glyphs pre-placed invisibly");
+  // List followed immediately by an unindented paragraph splits cleanly while indented continuation stays in list
+  assert.deepEqual(
+    splitAssistantMarkdownBlocks("- 第一项\n  缩进续行\n- 第二项\n紧跟普通段落"),
+    ["- 第一项\n  缩进续行\n- 第二项", "紧跟普通段落"],
+  );
+  // Setext heading underline directly below a plain paragraph is preserved as one block, not split as <hr>
+  assert.deepEqual(
+    splitAssistantMarkdownBlocks("二级标题\n---\n后续正文"),
+    ["二级标题\n---", "后续正文"],
+  );
+  assert.deepEqual(
+    splitAssistantMarkdownBlocks("一级标题\n===\n后续正文"),
+    ["一级标题\n===", "后续正文"],
+  );
+  // Outer 4-backtick fence is not prematurely closed by inner 3-backtick fence
+  assert.deepEqual(
+    splitAssistantMarkdownBlocks("````md\n```ts\nconst x = 1;\n```\n````\n\n尾段"),
+    ["````md\n```ts\nconst x = 1;\n```\n````", "尾段"],
+  );
+  // CommonMark §4.5: inline triple-backtick span is not a fenced code block opener
+  assert.deepEqual(
+    splitAssistantMarkdownBlocks("```foo```\n\n后续普通段落"),
+    ["```foo```", "后续普通段落"],
+  );
+  assert.deepEqual(splitStableMarkdownBlocks("```foo```\n\n后续普通段落"), {
+    settledBlocks: ["```foo```"],
+    activeBlock: "后续普通段落",
+  });
+  // P1-B: 4-space indented code blocks preserve their leading indentation instead of downgrading to plain prose
+  assert.deepEqual(
+    splitAssistantMarkdownBlocks("说明\n\n    const x = 1;\n    const y = 2;\n\n尾段"),
+    ["说明", "    const x = 1;\n    const y = 2;", "尾段"],
+  );
+  assert.deepEqual(
+    splitStableMarkdownBlocks("说明\n\n    const x = 1;\n    const y = 2;"),
+    {
+      settledBlocks: ["说明"],
+      activeBlock: "    const x = 1;\n    const y = 2;",
+    },
+  );
+  // P1-B: double-buffered unified <Markdown> merge triggers only on completed, settled, multi-block replies
+  assert.equal(
+    shouldMergeToUnifiedMarkdown({ phase: "streaming", tailSettling: false, blockCount: 3 }),
+    false,
+  );
+  assert.equal(
+    shouldMergeToUnifiedMarkdown({ phase: "complete", tailSettling: true, blockCount: 3 }),
+    false,
+  );
+  assert.equal(
+    shouldMergeToUnifiedMarkdown({ phase: "complete", tailSettling: false, blockCount: 1 }),
+    false,
+    "single-block replies already render one unified <Markdown> and need no merge",
+  );
+  assert.equal(
+    shouldMergeToUnifiedMarkdown({ phase: "complete", tailSettling: false, blockCount: 2 }),
+    true,
+  );
 
-  // Responsive assistant bloom velocity & agentStatus reload/replay guard
-  const {
-    ASSISTANT_BLOOM_ALPHA_STEPS,
-    ASSISTANT_BLOOM_LOOKAHEAD_CHARS,
-    ASSISTANT_BLOOM_WAVE_WIDTH,
-    advanceAssistantBloomCursor,
-    shouldStartAssistantBloomFromZero,
-  } = require("../client/thinking-text.ts");
-  assert.equal(ASSISTANT_BLOOM_WAVE_WIDTH, 56);
+  // Stable block splitting separates frozen settledBlocks from the single trailing activeBlock
+  assert.deepEqual(splitStableMarkdownBlocks(""), { settledBlocks: [], activeBlock: "" });
+  assert.deepEqual(splitStableMarkdownBlocks("正在输入首段"), {
+    settledBlocks: [],
+    activeBlock: "正在输入首段",
+  });
+  assert.deepEqual(splitStableMarkdownBlocks("首段完成\n\n"), {
+    settledBlocks: ["首段完成"],
+    activeBlock: "",
+  });
+  assert.deepEqual(splitStableMarkdownBlocks("首段完成\n\n第二段流式中"), {
+    settledBlocks: ["首段完成"],
+    activeBlock: "第二段流式中",
+  });
+  // Unclosed fence ending with blank line still stays active so it is never split mid-fence
+  assert.deepEqual(splitStableMarkdownBlocks("说明\n\n```ts\nconst a = 1;\n\n"), {
+    settledBlocks: ["说明"],
+    activeBlock: "```ts\nconst a = 1;",
+  });
+
+  // Streaming throttle boundary: immediate flush on complete / newly closed block / first non-empty text
+  assert.equal(ACTIVE_BLOCK_THROTTLE_MS, 64);
+  assert.equal(
+    shouldFlushActiveBlockImmediately({
+      prevSettledCount: 1,
+      nextSettledCount: 1,
+      phase: "streaming",
+      hasCommittedText: true,
+      nextActiveText: "继续追加 token",
+    }),
+    false,
+    "steady streaming within the same active block honors the 64ms throttle",
+  );
+  assert.equal(
+    shouldFlushActiveBlockImmediately({
+      prevSettledCount: 1,
+      nextSettledCount: 2,
+      phase: "streaming",
+      hasCommittedText: true,
+      nextActiveText: "新块开头",
+    }),
+    true,
+    "closing a settled block flushes immediately",
+  );
+  assert.equal(
+    shouldFlushActiveBlockImmediately({
+      prevSettledCount: 1,
+      nextSettledCount: 1,
+      phase: "complete",
+      hasCommittedText: true,
+      nextActiveText: "最终定稿",
+    }),
+    true,
+    "phase=complete always flushes synchronously with zero dropped chars",
+  );
+  assert.equal(
+    shouldFlushActiveBlockImmediately({
+      prevSettledCount: 0,
+      nextSettledCount: 0,
+      phase: "streaming",
+      hasCommittedText: false,
+      nextActiveText: "首批文字",
+    }),
+    true,
+    "first non-empty chunk commits immediately without waiting 64ms",
+  );
+
+  // Idle/reload guard keeps reopened conversations animation-free while allowing live bursts
   assert.equal(
     shouldStartAssistantBloomFromZero({ phase: "streaming", totalCp: 420, agentStatus: "running" }),
     true,
-    "live running reply blooms from char 0 even on a large first burst",
+    "live running reply animates even on a large first burst",
   );
   assert.equal(
     shouldStartAssistantBloomFromZero({ phase: "streaming", totalCp: 420, agentStatus: "idle" }),
@@ -957,90 +1045,113 @@ test("client/thinking-text.ts left-scroll stream normalizer and adaptive cursor 
     shouldStartAssistantBloomFromZero({ phase: "complete", totalCp: 24, agentStatus: "running" }),
     false,
   );
-  const replyTrickle = advanceAssistantBloomCursor(0, 10, 16, ASSISTANT_BLOOM_WAVE_WIDTH);
-  const replyBurst = advanceAssistantBloomCursor(0, 300, 16, ASSISTANT_BLOOM_WAVE_WIDTH);
-  assert.ok(replyTrickle > 0.5 && replyTrickle < 1.0, `expected smooth wide-veil trickle step, got ${replyTrickle}`);
-  assert.ok(replyBurst > 1.5 && replyBurst <= 1.8, `expected smooth wide-veil burst ~105 chars/sec, got ${replyBurst}`);
-  // Banded wide mist veil merges 56-char gradient into <= 16 RN text runs without dropping any glyph
-  const longText = "这是一段用于验证宽幕柔雾分带合并效果的较长中文测试文本，确保在高速流式爆发下依然顺滑不掉帧。".repeat(3);
-  const banded = buildStyledBloomRuns(
-    [{ text: longText, kind: "plain" }],
-    80,
-    ASSISTANT_BLOOM_WAVE_WIDTH,
-    0,
-    ASSISTANT_BLOOM_LOOKAHEAD_CHARS,
-    ASSISTANT_BLOOM_ALPHA_STEPS,
-  );
-  assert.ok(banded.length <= 18, `expected <=18 merged bands across 56-char veil, got ${banded.length}`);
-  assert.ok(banded.some((s) => s.alpha > 0.1 && s.alpha < 0.9), "wide veil keeps visible mid-mist gradient");
 
-  // Two-phase bloom handoff controller: holds complete row while still blooming, releases to native on completion
-  const { createBloomHandoffController } = require("../client/assistant-bloom-handoff.ts");
-  let reprojections = 0;
-  let scheduledFn = null;
-  const controller = createBloomHandoffController({
-    onChanged: () => {
-      reprojections += 1;
-    },
-    maxHoldMs: 5000,
-    schedule: (fn) => {
-      scheduledFn = fn;
-      return 1;
-    },
-    cancel: () => {
-      scheduledFn = null;
-    },
-  });
+  // Zero-flash live bloom tracker: historical replies pass through to native;
+  // live replies stay permanently on one stable plugin row across complete transitions.
+  const {
+    MAX_LIVE_BLOOM_KEYS,
+    createLiveBloomTracker,
+    readLiveBloomState,
+    resetLiveBloomStateForTests,
+    writeLiveBloomState,
+  } = require("../client/assistant-bloom-handoff.ts");
+  resetLiveBloomStateForTests();
+  assert.equal(MAX_LIVE_BLOOM_KEYS, 48);
+
+  const tracker = createLiveBloomTracker({ maxKeys: 3 });
   // Historical complete message is never intercepted
   assert.deepEqual(
-    controller.resolve({ text: "Historical reply", messageId: "old-1" }, "complete", 1000),
+    tracker.resolve({ text: "Historical reply", messageId: "old-1" }, "complete"),
     { transform: false },
   );
-  // Live streaming reply with messageId stays transformed across turn_completed until released
-  const live1 = controller.resolve({ text: "Fast reply", messageId: "m-1" }, "streaming", 1000);
-  assert.equal(live1.transform, true);
-  assert.equal(live1.bloomKey, "id:m-1");
-  const held = controller.resolve({ text: "Fast reply full table", messageId: "m-1" }, "complete", 1300);
-  assert.equal(held.transform, true);
-  assert.equal(held.bloomKey, "id:m-1");
-  assert.equal(reprojections, 0);
-  // Once bloom finishes, release triggers re-projection and hands back to native renderer
-  assert.equal(controller.release("id:m-1"), true);
-  assert.equal(reprojections, 1);
+  // Live streaming reply with messageId stays transformed permanently across complete
+  const live1 = tracker.resolve({ text: "Fast reply", messageId: "m-1" }, "streaming");
+  assert.deepEqual(live1, { transform: true, bloomKey: "id:m-1" });
+  const complete1 = tracker.resolve({ text: "Fast reply full table", messageId: "m-1" }, "complete");
+  assert.deepEqual(complete1, { transform: true, bloomKey: "id:m-1" });
+  // Repeated complete re-projections remain stable on the same bloomKey (0 ID swap / 0 flash)
   assert.deepEqual(
-    controller.resolve({ text: "Fast reply full table", messageId: "m-1" }, "complete", 2000),
-    { transform: false },
+    tracker.resolve({ text: "Fast reply full table", messageId: "m-1" }, "complete"),
+    { transform: true, bloomKey: "id:m-1" },
   );
-  // Fallback prefix matching (when provider omits messageId) + safety timer auto-release
-  const liveNoId = controller.resolve({ text: "本机健康，无需处理。" }, "streaming", 3000);
-  assert.equal(liveNoId.transform, true);
-  const heldNoId = controller.resolve({ text: "本机健康，无需处理。更多指标表格…" }, "complete", 3300);
-  assert.equal(heldNoId.transform, true);
-  assert.equal(heldNoId.bloomKey, liveNoId.bloomKey);
-  assert.ok(typeof scheduledFn === "function");
-  scheduledFn();
-  assert.equal(reprojections, 2);
-  assert.deepEqual(
-    controller.resolve({ text: "本机健康，无需处理。更多指标表格…" }, "complete", 9000),
-    { transform: false },
-  );
-  // Shared bloom progress survives Paseo's `liveHead -> history` remount and clears on release
-  const { readBloomProgress, writeBloomProgress } = require("../client/assistant-bloom-handoff.ts");
-  const liveProgress = controller.resolve({ text: "Continuity check", messageId: "m-cont" }, "streaming", 10_000);
-  writeBloomProgress(liveProgress.bloomKey, {
-    everStreamed: true,
-    cursor: 42.5,
-    settledFloor: 18,
-    fadedRichBlocks: new Set([2]),
-  });
-  // `turn_completed` moves row to history (`phase: "complete"`): progress must still be intact
-  const afterComplete = controller.resolve({ text: "Continuity check full", messageId: "m-cont" }, "complete", 10_300);
-  assert.equal(afterComplete.bloomKey, liveProgress.bloomKey);
-  assert.equal(readBloomProgress(afterComplete.bloomKey)?.cursor, 42.5);
-  assert.equal(readBloomProgress(afterComplete.bloomKey)?.fadedRichBlocks.has(2), true);
-  // Release clears shared progress cleanly
-  assert.equal(controller.release(afterComplete.bloomKey), true);
-  assert.equal(readBloomProgress(afterComplete.bloomKey), undefined);
 
-  controller.dispose();
+  // Fallback prefix matching when provider omits messageId (including initial empty chunk adoption)
+  const emptyStart = tracker.resolve({ text: "" }, "streaming");
+  assert.equal(emptyStart.transform, true);
+  const grownNoId = tracker.resolve({ text: "本机健康，无需处理。" }, "streaming");
+  assert.equal(grownNoId.bloomKey, emptyStart.bloomKey);
+  const doneNoId = tracker.resolve({ text: "本机健康，无需处理。更多指标表格…" }, "complete");
+  assert.deepEqual(doneNoId, { transform: true, bloomKey: emptyStart.bloomKey });
+  // A subsequent messageId-less streaming reply sharing a short prefix with an
+  // already-completed reply must get its own fresh key rather than colliding.
+  const nextNoId = tracker.resolve({ text: "本机" }, "streaming");
+  assert.equal(nextNoId.transform, true);
+  assert.notEqual(nextNoId.bloomKey, doneNoId.bloomKey);
+  // Old completed message still resolves to its own key
+  assert.deepEqual(
+    tracker.resolve({ text: "本机健康，无需处理。更多指标表格…" }, "complete"),
+    { transform: true, bloomKey: doneNoId.bloomKey },
+  );
+
+  // Bounded LRU eviction & ghost-state resurrection guard
+  writeLiveBloomState("id:m-1", {
+    everStreamed: true,
+    revealedBlocks: new Set([0, 1]),
+  });
+  assert.equal(tracker.has("id:m-1"), true);
+  assert.equal(readLiveBloomState("id:m-1")?.revealedBlocks.has(1), true);
+  // Add two more live keys -> maxKeys=3 evicts the least-recently-used key (`id:m-1`)
+  tracker.resolve({ text: "Third reply", messageId: "m-3" }, "streaming");
+  tracker.resolve({ text: "Fourth reply", messageId: "m-4" }, "streaming");
+  assert.equal(tracker.size, 3);
+  assert.equal(tracker.has("id:m-1"), false);
+  assert.equal(readLiveBloomState("id:m-1"), undefined, "evicted key clears its in-memory state");
+  // Late unmount write for an evicted key must be ignored (no ghost leak)
+  writeLiveBloomState("id:m-1", {
+    everStreamed: true,
+    revealedBlocks: new Set([0]),
+  });
+  assert.equal(readLiveBloomState("id:m-1"), undefined, "evicted key cannot be resurrected by late write");
+
+  // Re-observing a live state key preserves revealedBlocks across remount
+  writeLiveBloomState("id:m-4", {
+    everStreamed: true,
+    revealedBlocks: new Set([0, 2]),
+  });
+  assert.equal(tracker.has("id:m-4"), true);
+  assert.equal(readLiveBloomState("id:m-4")?.revealedBlocks.has(2), true);
+
+  tracker.dispose();
+  assert.equal(tracker.size, 0);
+  assert.equal(tracker.has("id:m-4"), false);
+  assert.equal(readLiveBloomState("id:m-4"), undefined);
+  assert.deepEqual(
+    tracker.resolve({ text: "After dispose", messageId: "m-5" }, "streaming"),
+    { transform: false },
+  );
+
+  // A-7: concurrent messageId-less streaming replies on different agents never collide
+  const scopedTracker = createLiveBloomTracker({ maxKeys: 8 });
+  const agA1 = scopedTracker.resolve({ text: "好的" }, "streaming", "agent-a");
+  const agB1 = scopedTracker.resolve({ text: "好的" }, "streaming", "agent-b");
+  assert.equal(agA1.transform, true);
+  assert.equal(agB1.transform, true);
+  assert.notEqual(agA1.bloomKey, agB1.bloomKey);
+  assert.equal(scopedTracker.has(agA1.bloomKey), true);
+  assert.equal(scopedTracker.has(agB1.bloomKey), true);
+  assert.deepEqual(
+    scopedTracker.resolve({ text: "好的，这是 agent A 的回复" }, "complete", "agent-a"),
+    { transform: true, bloomKey: agA1.bloomKey },
+  );
+  assert.deepEqual(
+    scopedTracker.resolve({ text: "好的，这是 agent B 的回复" }, "complete", "agent-b"),
+    { transform: true, bloomKey: agB1.bloomKey },
+  );
+  // Also accepts `item.agentId` when third arg is omitted
+  const agC = scopedTracker.resolve({ text: "好的", agentId: "agent-c" }, "streaming");
+  assert.notEqual(agC.bloomKey, agA1.bloomKey);
+  assert.notEqual(agC.bloomKey, agB1.bloomKey);
+  scopedTracker.dispose();
+  assert.equal(scopedTracker.has(agA1.bloomKey), false);
+  resetLiveBloomStateForTests();
 });

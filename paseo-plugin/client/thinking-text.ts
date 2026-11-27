@@ -222,31 +222,14 @@ export function countCodePoints(text: string): number {
 
 /** Width (code points) of the soft front-to-back emergence wave in expanded thinking body. */
 export const EXPANDED_BLOOM_WAVE_WIDTH = 24;
-/**
- * Wide soft front-to-back mist curtain (code points) for live assistant reply
- * emergence (~2.5–3 lines on mobile) so even fast streaming bursts feel like a
- * smooth luminous veil sweeping across whole phrases rather than a narrow
- * character-by-character typewriter.
- */
-export const ASSISTANT_BLOOM_WAVE_WIDTH = 56;
 /** Transparent lookahead characters pre-placed in layout so whole sentences/paragraphs emerge without wrap jitter. */
 export const EXPANDED_BLOOM_LOOKAHEAD_CHARS = 48;
-/** Lookahead window for live assistant replies, wide enough to cover the 56-char mist veil cleanly. */
-export const ASSISTANT_BLOOM_LOOKAHEAD_CHARS = 64;
-/**
- * Alpha quantization bands across the wide assistant mist veil.
- * Adjacent characters falling into the same band merge into a single `<Text>`
- * span, keeping native iOS/RN attributed-string rebuilds to <= ~14 spans/frame
- * (smoother and lighter than 24 unmerged single-char spans) while covering a
- * 2.3x wider gradient curtain.
- */
-export const ASSISTANT_BLOOM_ALPHA_STEPS = 14;
 
 /**
- * Decides whether a mounting `AssistantMessageBloom` row should bloom from
- * char 0 (live streaming turn) versus render settled immediately (reloaded or
- * reopened idle/initializing conversation whose trailing reply briefly lands
- * in Paseo's `head` with `phase: "streaming"`).
+ * Decides whether a mounting `AssistantMessageBloom` row should animate live
+ * GPU emergence versus render settled immediately (reloaded or reopened
+ * idle/initializing conversation whose trailing reply briefly lands in Paseo's
+ * `head` with `phase: "streaming"`).
  *
  * Intentionally does NOT gate on initial text length or timestamp age: live
  * ACP/Antigravity replies often arrive as a 150–400 char first burst or after
@@ -290,34 +273,6 @@ export function advanceExpandedInkCursor(
     unread > 0
       ? Math.min(42, 14 + unread * 0.28)
       : Math.max(18, waveWidth / 0.78);
-  return Math.min(settledTarget, current + (charsPerSec * clampedDt) / 1000);
-}
-
-/**
- * Smooth, wide-veil front-to-back soft-mist emergence cursor for live
- * assistant replies (~34–105 chars/sec across a 56-char mist frontier).
- *
- * Even at peak burst speed (105 chars/sec), every glyph still spends >= 0.53s
- * gliding across the 56-char mist curtain so fast streams never degenerate into
- * a choppy character-by-character typewriter while staying responsive to bursts.
- */
-export function advanceAssistantBloomCursor(
-  current: number,
-  target: number,
-  dtMs: number,
-  waveWidth = ASSISTANT_BLOOM_WAVE_WIDTH,
-): number {
-  if (!Number.isFinite(target) || target <= 0) return 0;
-  const settledTarget = target + waveWidth;
-  if (!Number.isFinite(current) || current < 0) return 0;
-  if (current >= settledTarget) return settledTarget;
-  if (!Number.isFinite(dtMs) || dtMs <= 0) return current;
-  const clampedDt = Math.min(dtMs, 40);
-  const unread = Math.max(0, target - current);
-  const charsPerSec =
-    unread > 0
-      ? Math.min(105, 34 + unread * 0.5)
-      : Math.max(48, waveWidth / 0.65);
   return Math.min(settledTarget, current + (charsPerSec * clampedDt) / 1000);
 }
 
@@ -465,21 +420,41 @@ export function isStandaloneMarkdownImage(text: string): boolean {
   return /^!\[[^\]]*\]\([^)\n]+\)$/.test(trimmed);
 }
 
-/**
- * Splits a streaming Markdown assistant reply into top-level render-safe blocks
- * (paragraphs, headings, lists, tables, blockquotes, and fenced code blocks)
- * without ever tearing apart an open/closed code fence or table.
- */
-export function splitAssistantMarkdownBlocks(text: string): string[] {
-  if (!text) return [];
+/** Throttle interval (ms) for active trailing Markdown block updates (~15 Hz). */
+export const ACTIVE_BLOCK_THROTTLE_MS = 64;
+
+export interface StableMarkdownSplit {
+  /** Already-closed leading blocks whose Markdown source is frozen at stable indices. */
+  readonly settledBlocks: readonly string[];
+  /** Single trailing block currently growing, or `""` when text ends on a closed boundary. */
+  readonly activeBlock: string;
+}
+
+function isClosingFenceLine(trimmed: string, fenceMarker: string): boolean {
+  if (!trimmed.startsWith(fenceMarker)) return false;
+  const fenceChar = fenceMarker[0]!;
+  const stripped = trimmed.trimEnd();
+  for (let i = fenceMarker.length; i < stripped.length; i += 1) {
+    if (stripped[i] !== fenceChar) return false;
+  }
+  return true;
+}
+
+function parseMarkdownBlocksWithState(text: string): {
+  readonly blocks: string[];
+  readonly inOpenFence: boolean;
+} {
+  if (!text) return { blocks: [], inOpenFence: false };
   const lines = text.split(/\r?\n/);
   const blocks: string[] = [];
   let current: string[] = [];
   let fenceMarker: string | null = null;
 
   const flush = () => {
-    const joined = current.join("\n").trim();
-    if (joined !== "") blocks.push(joined);
+    // Preserve leading indentation (e.g. 4-space indented code blocks); only
+    // trim trailing blank lines / whitespace.
+    const joined = current.join("\n").trimEnd();
+    if (joined.trim() !== "") blocks.push(joined);
     current = [];
   };
 
@@ -487,17 +462,22 @@ export function splitAssistantMarkdownBlocks(text: string): string[] {
     const trimmed = line.trimStart();
     if (fenceMarker !== null) {
       current.push(line);
-      if (trimmed.startsWith(fenceMarker) && trimmed.slice(fenceMarker.length).trim() === "") {
+      if (isClosingFenceLine(trimmed, fenceMarker)) {
         fenceMarker = null;
         flush();
       }
       continue;
     }
 
-    const fenceMatch = /^(`{3,}|~{3,})/.exec(trimmed);
-    if (fenceMatch !== null) {
+    const fenceMatch = /^(`{3,}|~{3,})(.*)$/.exec(trimmed);
+    // CommonMark §4.5: info strings for backtick code fences cannot contain
+    // backtick characters (e.g. an inline triple-backtick span like ```foo```).
+    if (
+      fenceMatch !== null &&
+      !(fenceMatch[1]![0] === "`" && fenceMatch[2]!.includes("`"))
+    ) {
       if (current.length > 0) flush();
-      fenceMarker = fenceMatch[1]!.slice(0, 3);
+      fenceMarker = fenceMatch[1]!;
       current.push(line);
       continue;
     }
@@ -514,214 +494,115 @@ export function splitAssistantMarkdownBlocks(text: string): string[] {
       continue;
     }
 
+    const leadingSpaces = line.length - trimmed.length;
+    const prevTrimmed = current.length > 0 ? (current[0] ?? "").trimStart() : "";
+    const prevIsList = current.length > 0 && /^(?:[-*+]|\d+\.)\s+/.test(prevTrimmed);
+    const prevIsQuote = current.length > 0 && prevTrimmed.startsWith(">");
+    const prevIsTable = current.length > 0 && prevTrimmed.startsWith("|");
+    const currentIsPlainParagraph =
+      current.length > 0 && !prevIsList && !prevIsQuote && !prevIsTable;
+
+    // Setext heading underline (`---` or `===`) directly beneath a plain paragraph
+    // belongs to that heading block rather than being split as a standalone `<hr>`.
+    if (
+      currentIsPlainParagraph &&
+      leadingSpaces <= 3 &&
+      /^(?:-{2,}|={2,})\s*$/.test(trimmed)
+    ) {
+      current.push(line);
+      flush();
+      continue;
+    }
+
+    if (/^(?:[-*_])(?:\s*[-*_]){2,}\s*$/.test(trimmed)) {
+      const compactHr = trimmed.replace(/\s+/g, "");
+      if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(compactHr)) {
+        if (current.length > 0) flush();
+        current.push(compactHr);
+        flush();
+        continue;
+      }
+    }
+
+    const isListLine = /^(?:[-*+]|\d+\.)\s+/.test(trimmed);
+    const isQuoteLine = trimmed.startsWith(">");
+    const isIndentedContinuation = /^(?: {2,}|\t)\S/.test(line);
+    if (current.length > 0) {
+      if (
+        (isListLine && !prevIsList) ||
+        (!isListLine && prevIsList && !isIndentedContinuation) ||
+        (isQuoteLine && !prevIsQuote) ||
+        (!isQuoteLine && prevIsQuote)
+      ) {
+        flush();
+      }
+    }
+
     current.push(line);
   }
 
   if (current.length > 0) flush();
-  return blocks;
-}
-
-export type InlineBloomKind = "plain" | "bold" | "code" | "link" | "heading";
-
-export interface InlineBloomRun {
-  readonly text: string;
-  readonly kind: InlineBloomKind;
-}
-
-export interface StyledBloomSegment {
-  readonly text: string;
-  readonly kind: InlineBloomKind;
-  readonly alpha: number;
+  return { blocks, inOpenFence: fenceMarker !== null };
 }
 
 /**
- * Returns true when a Markdown block should stay on Paseo's full `<Markdown>`
- * component during streaming (fenced code blocks, tables, or images) rather
- * than lightweight inline-styled prose bloom.
+ * Splits a streaming Markdown assistant reply into top-level render-safe blocks
+ * (paragraphs, headings, Setext headings, lists, tables, blockquotes, and fenced
+ * code blocks) without ever tearing apart an open/closed code fence or table.
  */
-export function isRichMarkdownBlock(block: string): boolean {
-  const trimmed = block.trimStart();
-  if (/^(?:`{3,}|~{3,})/.test(trimmed)) return true;
-  if (/!\[[^\]]*\]\(/.test(block)) return true;
-  const lines = block.split(/\r?\n/);
-  let pipeLines = 0;
-  for (const line of lines) {
-    const t = line.trim();
-    if (t.startsWith("|") && t.includes("|", 1)) pipeLines += 1;
-    else if (/^\|?[-:\s|]+\|[-:\s|]+$/.test(t) && t.includes("-")) pipeLines += 1;
+export function splitAssistantMarkdownBlocks(text: string): string[] {
+  return parseMarkdownBlocksWithState(text).blocks;
+}
+
+/**
+ * Splits streaming Markdown into frozen `settledBlocks` (keyed by stable block
+ * index behind `React.memo`) and the single growing trailing `activeBlock`.
+ */
+export function splitStableMarkdownBlocks(text: string): StableMarkdownSplit {
+  const { blocks, inOpenFence } = parseMarkdownBlocksWithState(text);
+  if (blocks.length === 0) {
+    return { settledBlocks: [], activeBlock: "" };
   }
-  return pipeLines >= 2;
-}
-
-/**
- * Lightweight streaming-safe inline Markdown tokenizer for continuous soft-wave
- * emergence (`buildStyledBloomRuns`). Strips raw `**`, `` ` ``, `### `, and
- * link URLs — including still-unclosed trailing markers while streaming — so
- * assistant replies emerge cleanly without raw markdown syntax flickering.
- */
-export function parseInlineMarkdownRuns(text: string): InlineBloomRun[] {
-  if (!text) return [];
-  const lines = text.split(/\r?\n/);
-  const runs: InlineBloomRun[] = [];
-
-  const pushRun = (str: string, kind: InlineBloomKind) => {
-    if (!str) return;
-    const prev = runs[runs.length - 1];
-    if (prev !== undefined && prev.kind === kind) {
-      runs[runs.length - 1] = { text: prev.text + str, kind };
-    } else {
-      runs.push({ text: str, kind });
-    }
+  if (!inOpenFence && /(?:\r?\n[\t ]*){2,}$/.test(text)) {
+    return { settledBlocks: blocks, activeBlock: "" };
+  }
+  return {
+    settledBlocks: blocks.slice(0, -1),
+    activeBlock: blocks[blocks.length - 1]!,
   };
-
-  for (let li = 0; li < lines.length; li += 1) {
-    if (li > 0) pushRun("\n", "plain");
-    let line = lines[li] ?? "";
-    let defaultKind: InlineBloomKind = "plain";
-    const headingMatch = /^(\s*)#{1,6}\s+(.*)$/.exec(line);
-    if (headingMatch !== null) {
-      defaultKind = "heading";
-      line = headingMatch[2] ?? "";
-    } else {
-      line = line.replace(/^(\s*)[-*+]\s+/, "$1• ");
-      line = line.replace(/^(\s*)>\s?/, "$1");
-    }
-
-    let i = 0;
-    let buf = "";
-    const flushBuf = () => {
-      if (buf) {
-        pushRun(buf, defaultKind);
-        buf = "";
-      }
-    };
-
-    while (i < line.length) {
-      const ch = line[i]!;
-      if (ch === "`") {
-        flushBuf();
-        const close = line.indexOf("`", i + 1);
-        if (close !== -1) {
-          pushRun(line.slice(i + 1, close), "code");
-          i = close + 1;
-        } else {
-          pushRun(line.slice(i + 1), "code");
-          i = line.length;
-        }
-        continue;
-      }
-      if (ch === "*" && line[i + 1] === "*") {
-        flushBuf();
-        const close = line.indexOf("**", i + 2);
-        if (close !== -1) {
-          pushRun(line.slice(i + 2, close), "bold");
-          i = close + 2;
-        } else {
-          pushRun(line.slice(i + 2), "bold");
-          i = line.length;
-        }
-        continue;
-      }
-      if (ch === "[") {
-        const closeBracket = line.indexOf("]", i + 1);
-        if (closeBracket !== -1 && line[closeBracket + 1] === "(") {
-          const label = line.slice(i + 1, closeBracket);
-          const closeParen = line.indexOf(")", closeBracket + 2);
-          flushBuf();
-          pushRun(label, "link");
-          i = closeParen !== -1 ? closeParen + 1 : line.length;
-          continue;
-        }
-      }
-      buf += ch;
-      i += 1;
-    }
-    flushBuf();
-  }
-
-  return runs;
 }
 
 /**
- * Applies our wide front-to-back smoothstep emergence wave (`0 -> 1`) across
- * lightweight inline Markdown runs (`parseInlineMarkdownRuns`), preserving
- * bold/code/link/heading styling and keeping upcoming characters pre-placed at
- * `alpha: 0` so there is zero layout popping or word-wrap jumping.
+ * Returns true when the trailing active block must commit synchronously without
+ * waiting for the 64ms streaming throttle window (completion, newly closed
+ * leading block, or first non-empty content).
  */
-export function buildStyledBloomRuns(
-  runs: readonly InlineBloomRun[],
-  waveProgress: number,
-  waveWidth = EXPANDED_BLOOM_WAVE_WIDTH,
-  settledFloor = 0,
-  lookaheadChars = EXPANDED_BLOOM_LOOKAHEAD_CHARS,
-  alphaSteps = 0,
-): StyledBloomSegment[] {
-  if (runs.length === 0) return [];
-  const glyphs: Array<{ ch: string; kind: InlineBloomKind }> = [];
-  for (const run of runs) {
-    for (const ch of Array.from(run.text)) {
-      glyphs.push({ ch, kind: run.kind });
-    }
-  }
-  const len = glyphs.length;
-  if (len === 0) return [];
+export function shouldFlushActiveBlockImmediately(input: {
+  readonly prevSettledCount: number;
+  readonly nextSettledCount: number;
+  readonly phase: "streaming" | "complete";
+  readonly hasCommittedText: boolean;
+  readonly nextActiveText: string;
+}): boolean {
+  if (input.phase === "complete") return true;
+  if (input.nextSettledCount !== input.prevSettledCount) return true;
+  if (!input.hasCommittedText && input.nextActiveText.length > 0) return true;
+  if (input.nextActiveText.length === 0) return true;
+  return false;
+}
 
-  if (!Number.isFinite(waveProgress) || waveProgress >= len + waveWidth) {
-    return runs.map((r) => ({ text: r.text, kind: r.kind, alpha: 1 }));
-  }
-
-  const floorEnd = Number.isFinite(settledFloor) ? Math.max(0, Math.floor(settledFloor)) : 0;
-  const waveEnd = Math.min(len, Math.max(floorEnd, Math.ceil(waveProgress)));
-  const settledEnd = Math.min(
-    waveEnd,
-    Math.max(floorEnd, Math.floor(waveProgress - waveWidth)),
-  );
-
-  const out: StyledBloomSegment[] = [];
-  const pushSeg = (text: string, kind: InlineBloomKind, alpha: number) => {
-    if (!text) return;
-    const prev = out[out.length - 1];
-    if (prev !== undefined && prev.kind === kind && prev.alpha === alpha) {
-      out[out.length - 1] = { text: prev.text + text, kind, alpha };
-    } else {
-      out.push({ text, kind, alpha });
-    }
-  };
-
-  for (let i = 0; i < settledEnd; i += 1) {
-    const g = glyphs[i]!;
-    pushSeg(g.ch, g.kind, 1);
-  }
-
-  let transparentStart = waveEnd;
-  for (let i = settledEnd; i < waveEnd; i += 1) {
-    const age = waveProgress - i;
-    const t = Math.max(0, Math.min(1, age / waveWidth));
-    const smooth = t * t * (3 - 2 * t);
-    const quantized =
-      alphaSteps > 1 ? Math.round(smooth * alphaSteps) / alphaSteps : smooth;
-    const alpha = Number(quantized.toFixed(3));
-    if (alpha <= 0.005) {
-      transparentStart = i;
-      break;
-    }
-    const g = glyphs[i]!;
-    pushSeg(g.ch, g.kind, alpha);
-  }
-
-  if (transparentStart < len && lookaheadChars > 0) {
-    let lookEnd = Math.min(len, Math.max(waveEnd, transparentStart) + lookaheadChars);
-    const maxSnap = Math.min(len, lookEnd + 8);
-    while (lookEnd < maxSnap && !/[\s\n.,!?;:，。！？；：]/.test(glyphs[lookEnd]!.ch)) {
-      lookEnd += 1;
-    }
-    for (let i = transparentStart; i < lookEnd; i += 1) {
-      const g = glyphs[i]!;
-      pushSeg(g.ch, g.kind, 0);
-    }
-  }
-
-  return out;
+/**
+ * Returns true when a completed multi-block live reply should double-buffer
+ * merge into a single unified `<Markdown>{text}</Markdown>` (restoring
+ * reference-style links `[x][1]`, loose lists, and cross-paragraph selection
+ * without remounting the plugin row).
+ */
+export function shouldMergeToUnifiedMarkdown(input: {
+  readonly phase: "streaming" | "complete";
+  readonly tailSettling: boolean;
+  readonly blockCount: number;
+}): boolean {
+  return input.phase === "complete" && !input.tailSettling && input.blockCount > 1;
 }
 
 /**

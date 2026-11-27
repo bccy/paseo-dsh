@@ -17,6 +17,7 @@ import { z } from "zod";
 import {
   ANTIGRAVITY_DEFAULT_PRICING,
   defaultPricingEntry as getAntigravityDefaultPricingEntry,
+  isPlainRecord,
   officialRatesAt as antigravityOfficialRatesAt,
   resolvePricingKey as resolveAntigravityPricingKey,
   toUsdDualCurrencyRates,
@@ -728,10 +729,6 @@ export function formatLongContextNote(rates: ModelRates): string | null {
 }
 
 // ---- Official Registry (`models.dev`) Parsing & Indexing -----------------------------------
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function parseOptionalRateNumber(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value)) return undefined;

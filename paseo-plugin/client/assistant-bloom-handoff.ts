@@ -1,43 +1,39 @@
 /**
- * Two-phase handoff coordinator for `dsh-assistant-bloom`.
+ * Lightweight session-scoped live tracker for `dsh-assistant-bloom`.
  *
- * Why this exists:
- * - Fast models (e.g. `deepseek-flash`) often emit `turn_completed` 200–400 ms
- *   after streaming begins, which moves the row from Paseo's `head`
- *   (`phase: "streaming"`) into `tail` (`phase: "complete"`).
- * - If our timeline transformer immediately returned `undefined` on
- *   `phase: "complete"`, Paseo would unmount `AssistantMessageBloom` mid-wave
- *   and pop 90% of the reply onto screen in one frame.
- * - Conversely, if our transformer kept the row as `kind: "plugin"` forever,
- *   Paseo's `findTurnFooterSource()` (`layout.ts:105`) would never attach the
- *   native Copy Result / Fork to New Tab / Turn Timing footer.
+ * Why this exists (0-flash, 0-reflow architecture):
+ * - Historical / already-complete replies (first seen with `phase === "complete"`)
+ *   always return `{ transform: false }` on frame 0 so Paseo renders its native
+ *   `<AssistantMessage>` directly.
+ * - Replies first seen with `phase === "streaming"` are recorded in a bounded
+ *   LRU map (`MAX_LIVE_BLOOM_KEYS = 48`) and stay on the same `dsh-assistant-bloom`
+ *   plugin row even after `phase` transitions to `"complete"` — never
+ *   unregistering/re-registering the transformer (which would invalidate
+ *   Paseo's page-wide `projectionCache`) and never swapping `LegendList` item
+ *   IDs (which would unmount/remount iOS `EnrichedMarkdown` and flash).
+ *   On Paseo >= 0.18.1, `source: item` preserves the native Copy / Fork / Turn
+ *   Timing footer automatically on this plugin row.
+ * - Fallback `txt:` tracking (when a provider omits `messageId`) supports
+ *   optional `agentId` scoping so concurrent agents sharing a short opening
+ *   prefix never collide.
+ * - A matching bounded in-memory state cache (`readLiveBloomState` /
+ *   `writeLiveBloomState`) preserves revealed block indices across rare
+ *   `liveHead -> history` remounts without ever resurrecting evicted keys.
  *
- * Solution (100% public `PluginClientContext.addTimelineTransformer` API):
- * 1. When an assistant reply is seen with `phase === "streaming"`, mark its
- *    identity active (`active` map) and keep transforming it even after
- *    `phase` flips to `"complete"` so the full soft-mist bloom finishes.
- * 2. When `AssistantMessageBloom` finishes its wave (or skips bloom on an idle
- *    reload), it calls `release(bloomKey)`. That removes the key and invokes
- *    `onChanged()`, which removes & re-adds the transformer so Paseo re-projects
- *    that row back to native `assistant_message` + native Copy/Fork footer.
- * 3. Historical / already-complete replies (never seen streaming) always return
- *    `{ transform: false }` on frame 0 — zero bloom, native footer immediately.
- *
- * Kept strictly React/RN-free so offline unit tests can verify every branch.
+ * Kept strictly React/RN-free so offline Node tests can verify every branch.
  *
  * @module dsh-paseo/client/assistant-bloom-handoff
  */
 
-export const BLOOM_HANDOFF_MAX_HOLD_MS = 18_000;
+export const MAX_LIVE_BLOOM_KEYS = 48;
 const PREFIX_MATCH_LEN = 48;
-const MAX_ACTIVE_KEYS = 32;
+const MAX_EVICTED_TOMBSTONES = 128;
 
-interface ActiveBloomEntry {
+interface TrackedBloomEntry {
   readonly key: string;
+  readonly scope: string;
   prefix: string;
-  updatedAt: number;
-  completedAt: number | null;
-  fallbackTimer: ReturnType<typeof setTimeout> | null;
+  completed: boolean;
 }
 
 export interface BloomTransformDecision {
@@ -45,184 +41,206 @@ export interface BloomTransformDecision {
   readonly bloomKey?: string;
 }
 
-export interface BloomHandoffController {
+export interface LiveBloomTracker {
   resolve(
-    item: { readonly text: string; readonly messageId?: string },
+    item: { readonly text: string; readonly messageId?: string; readonly agentId?: string },
     phase: "streaming" | "complete",
-    now?: number,
+    agentId?: string,
   ): BloomTransformDecision;
-  release(bloomKey: string): boolean;
+  has(bloomKey: string): boolean;
   dispose(): void;
   readonly size: number;
 }
 
-export interface BloomProgressState {
+export interface LiveBloomState {
+  /** Whether this reply has ever streamed live in the current session. */
   everStreamed: boolean;
-  cursor: number;
-  settledFloor: number;
-  readonly fadedRichBlocks: Set<number>;
+  /** Block indices that have already started/completed their GPU entrance fade. */
+  readonly revealedBlocks: Set<number>;
 }
 
-const progressByKey = new Map<string, BloomProgressState>();
+const liveStateByKey = new Map<string, LiveBloomState>();
+const evictedKeys = new Set<string>();
 
-export function readBloomProgress(bloomKey: string | undefined): BloomProgressState | undefined {
-  if (!bloomKey) return undefined;
-  return progressByKey.get(bloomKey);
-}
-
-export function writeBloomProgress(bloomKey: string | undefined, state: BloomProgressState): void {
-  if (!bloomKey) return;
-  progressByKey.set(bloomKey, state);
-}
-
-export function clearBloomProgress(bloomKey: string | undefined): void {
-  if (!bloomKey) return;
-  progressByKey.delete(bloomKey);
-}
-
-type ReleaseHandler = (bloomKey: string) => void;
-const releaseHandlers = new Set<ReleaseHandler>();
-
-export function registerBloomReleaseHandler(handler: ReleaseHandler): () => void {
-  releaseHandlers.add(handler);
-  return () => {
-    releaseHandlers.delete(handler);
-  };
-}
-
-export function releaseAssistantBloom(bloomKey: string | undefined): void {
-  if (!bloomKey) return;
-  progressByKey.delete(bloomKey);
-  for (const handler of releaseHandlers) {
-    handler(bloomKey);
+function markEvicted(bloomKey: string): void {
+  liveStateByKey.delete(bloomKey);
+  if (evictedKeys.has(bloomKey)) {
+    evictedKeys.delete(bloomKey);
+  } else if (evictedKeys.size >= MAX_EVICTED_TOMBSTONES) {
+    const oldest = evictedKeys.values().next().value;
+    if (oldest !== undefined) evictedKeys.delete(oldest);
   }
+  evictedKeys.add(bloomKey);
 }
 
-export function createBloomHandoffController(options: {
-  readonly onChanged: () => void;
-  readonly maxHoldMs?: number;
-  readonly schedule?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
-  readonly cancel?: (timer: ReturnType<typeof setTimeout>) => void;
-}): BloomHandoffController {
-  const maxHoldMs = options.maxHoldMs ?? BLOOM_HANDOFF_MAX_HOLD_MS;
-  const schedule = options.schedule ?? ((fn, ms) => setTimeout(fn, ms));
-  const cancel = options.cancel ?? ((timer) => clearTimeout(timer));
-  const active = new Map<string, ActiveBloomEntry>();
+function unmarkEvicted(bloomKey: string): void {
+  evictedKeys.delete(bloomKey);
+}
+
+export function readLiveBloomState(bloomKey: string | undefined): LiveBloomState | undefined {
+  if (!bloomKey || evictedKeys.has(bloomKey)) return undefined;
+  return liveStateByKey.get(bloomKey);
+}
+
+/**
+ * Persist lightweight in-memory bloom state for a live key.
+ * Keys that were already evicted by overflow or tracker disposal are ignored
+ * so late component unmounts can never resurrect ghost entries.
+ */
+export function writeLiveBloomState(
+  bloomKey: string | undefined,
+  state: LiveBloomState,
+): void {
+  if (!bloomKey || evictedKeys.has(bloomKey)) return;
+  if (liveStateByKey.has(bloomKey)) {
+    liveStateByKey.delete(bloomKey);
+  } else if (liveStateByKey.size >= MAX_LIVE_BLOOM_KEYS) {
+    const oldest = liveStateByKey.keys().next().value;
+    if (oldest !== undefined) markEvicted(oldest);
+  }
+  liveStateByKey.set(bloomKey, state);
+}
+
+/** Reset module-level in-memory bloom state (offline tests only). */
+export function resetLiveBloomStateForTests(): void {
+  liveStateByKey.clear();
+  evictedKeys.clear();
+}
+
+export function createLiveBloomTracker(options?: {
+  readonly maxKeys?: number;
+}): LiveBloomTracker {
+  const maxKeys = Math.max(1, Math.floor(options?.maxKeys ?? MAX_LIVE_BLOOM_KEYS));
+  const tracked = new Map<string, TrackedBloomEntry>();
   let seq = 0;
   let disposed = false;
 
-  function clearEntry(entry: ActiveBloomEntry) {
-    if (entry.fallbackTimer !== null) {
-      cancel(entry.fallbackTimer);
-      entry.fallbackTimer = null;
-    }
-    active.delete(entry.key);
-    progressByKey.delete(entry.key);
+  function touch(entry: TrackedBloomEntry): void {
+    tracked.delete(entry.key);
+    tracked.set(entry.key, entry);
   }
 
-  function pruneOverflow() {
-    while (active.size > MAX_ACTIVE_KEYS) {
-      const oldest = active.values().next().value;
+  function pruneOverflow(): void {
+    while (tracked.size > maxKeys) {
+      const oldest = tracked.values().next().value;
       if (!oldest) break;
-      clearEntry(oldest);
+      tracked.delete(oldest.key);
+      markEvicted(oldest.key);
     }
   }
 
   function findMatchingEntry(
     item: { readonly text: string; readonly messageId?: string },
     trimmed: string,
-  ): ActiveBloomEntry | undefined {
+    phase: "streaming" | "complete",
+    scope: string,
+  ): TrackedBloomEntry | undefined {
     if (item.messageId) {
-      return active.get(`id:${item.messageId}`);
+      return tracked.get(`id:${item.messageId}`);
     }
-    if (!trimmed) return undefined;
-    let best: ActiveBloomEntry | undefined;
-    for (const entry of active.values()) {
+    const allowEmptyAdoption = phase === "streaming";
+    if (!trimmed) {
+      if (!allowEmptyAdoption) return undefined;
+      let latestEmpty: TrackedBloomEntry | undefined;
+      for (const entry of tracked.values()) {
+        if (
+          entry.key.startsWith("txt:") &&
+          entry.scope === scope &&
+          !entry.completed &&
+          entry.prefix === ""
+        ) {
+          latestEmpty = entry;
+        }
+      }
+      return latestEmpty;
+    }
+    let best: TrackedBloomEntry | undefined;
+    let fallbackEmpty: TrackedBloomEntry | undefined;
+    for (const entry of tracked.values()) {
       if (!entry.key.startsWith("txt:")) continue;
-      if (!entry.prefix) continue;
+      if (entry.scope !== scope) continue;
+      // A new streaming reply without `messageId` must never collide with an
+      // already-completed reply whose prefix happens to share the first few chars.
+      if (phase === "streaming" && entry.completed) continue;
+      if (!entry.prefix) {
+        if (allowEmptyAdoption) fallbackEmpty = entry;
+        continue;
+      }
       if (trimmed.startsWith(entry.prefix) || entry.prefix.startsWith(trimmed)) {
-        if (!best || entry.prefix.length > best.prefix.length) {
+        if (
+          !best ||
+          entry.prefix.length > best.prefix.length ||
+          (entry.prefix.length === best.prefix.length && best.completed && !entry.completed)
+        ) {
           best = entry;
         }
       }
     }
-    return best;
-  }
-
-  function release(bloomKey: string): boolean {
-    if (disposed) return false;
-    const entry = active.get(bloomKey);
-    if (!entry) return false;
-    clearEntry(entry);
-    options.onChanged();
-    return true;
+    return best ?? fallbackEmpty;
   }
 
   return {
     get size() {
-      return active.size;
+      return tracked.size;
     },
-    resolve(item, phase, now = Date.now()) {
+    has(bloomKey: string): boolean {
+      return !disposed && tracked.has(bloomKey) && !evictedKeys.has(bloomKey);
+    },
+    resolve(item, phase, explicitAgentId): BloomTransformDecision {
       if (disposed) return { transform: false };
       const trimmed = item.text.trim();
-
-      // Drop any stale completed entries that exceeded maxHoldMs without explicit release.
-      for (const entry of [...active.values()]) {
-        if (entry.completedAt !== null && now - entry.completedAt >= maxHoldMs) {
-          clearEntry(entry);
-        }
-      }
+      const scope =
+        typeof explicitAgentId === "string" && explicitAgentId !== ""
+          ? explicitAgentId
+          : typeof item.agentId === "string" && item.agentId !== ""
+            ? item.agentId
+            : "";
 
       if (phase === "streaming") {
-        const existing = findMatchingEntry(item, trimmed);
+        const existing = findMatchingEntry(item, trimmed, "streaming", scope);
         if (existing) {
-          if (trimmed.length >= existing.prefix.length) {
+          if (trimmed.length > existing.prefix.length && existing.prefix.length < PREFIX_MATCH_LEN) {
             existing.prefix = trimmed.slice(0, PREFIX_MATCH_LEN);
           }
-          existing.updatedAt = now;
-          if (existing.fallbackTimer !== null) {
-            cancel(existing.fallbackTimer);
-            existing.fallbackTimer = null;
-          }
-          existing.completedAt = null;
+          existing.completed = false;
+          unmarkEvicted(existing.key);
+          touch(existing);
           return { transform: true, bloomKey: existing.key };
         }
-        const key = item.messageId ? `id:${item.messageId}` : `txt:${++seq}`;
-        const entry: ActiveBloomEntry = {
+        const key = item.messageId
+          ? `id:${item.messageId}`
+          : scope !== ""
+            ? `txt:${scope}:${++seq}`
+            : `txt:${++seq}`;
+        unmarkEvicted(key);
+        const entry: TrackedBloomEntry = {
           key,
+          scope,
           prefix: trimmed.slice(0, PREFIX_MATCH_LEN),
-          updatedAt: now,
-          completedAt: null,
-          fallbackTimer: null,
+          completed: false,
         };
-        active.set(key, entry);
+        tracked.set(key, entry);
         pruneOverflow();
         return { transform: true, bloomKey: key };
       }
 
       // phase === "complete"
-      const match = findMatchingEntry(item, trimmed);
+      const match = findMatchingEntry(item, trimmed, "complete", scope);
       if (!match) return { transform: false };
-      if (match.completedAt === null) {
-        match.completedAt = now;
-        match.fallbackTimer = schedule(() => {
-          match.fallbackTimer = null;
-          release(match.key);
-        }, maxHoldMs);
+      match.completed = true;
+      if (trimmed.length > match.prefix.length && match.prefix.length < PREFIX_MATCH_LEN) {
+        match.prefix = trimmed.slice(0, PREFIX_MATCH_LEN);
       }
+      touch(match);
       return { transform: true, bloomKey: match.key };
     },
-    release,
-    dispose() {
+    dispose(): void {
+      if (disposed) return;
       disposed = true;
-      for (const entry of active.values()) {
-        if (entry.fallbackTimer !== null) {
-          cancel(entry.fallbackTimer);
-          entry.fallbackTimer = null;
-        }
-        progressByKey.delete(entry.key);
+      for (const key of tracked.keys()) {
+        markEvicted(key);
       }
-      active.clear();
+      tracked.clear();
     },
   };
 }

@@ -1,55 +1,78 @@
 /**
- * Global continuous front-to-back soft emergence renderer for live streaming
- * assistant replies across all providers (DSH, Antigravity, Codex, Claude).
+ * Zero-flash, native-GPU soft-mist renderer for live streaming assistant replies.
  *
- * - Historical / already-complete replies render Paseo's native `<Markdown>`
- *   directly on frame 0 with zero animations and zero timers.
- * - Live streaming replies emerge continuously from front to back through the
- *   same wide 24-char `rgba` soft mist wave (`14–42 chars/sec`, zero vertical
- *   jumping, zero block-by-block popping) with lightweight inline Markdown
- *   styling (bold, inline code, headings, list bullets, link labels).
- * - Fenced code blocks and Markdown tables render in-place via Paseo's
- *   `<Markdown>` with a soft pure-opacity fade (no vertical hop).
- * - Once the reply completes and the emergence wave finishes, it hands off
- *   cleanly to a single Paseo `<Markdown>{text}</Markdown>` for full native
- *   links, tables, code copy buttons, and cross-paragraph selection.
+ * Architecture:
+ * 1. **100% real Paseo `<Markdown>`**: every block renders through Paseo's host
+ *    `<Markdown>` component, automatically inheriting the user's Appearance
+ *    font size, font family, `density.blockGap`, `accentBright`, workspace file
+ *    links, tables, code blocks, and native text selection.
+ * 2. **Stable-index block freezing + double-buffered unified merge**:
+ *    - During streaming, `splitStableMarkdownBlocks` splits the stream into
+ *      `settledBlocks` (frozen behind `React.memo` at stable indices so earlier
+ *      blocks NEVER re-parse when new tokens arrive) plus one trailing
+ *      `activeBlock` throttled to `64ms` (~15 Hz) with immediate synchronous
+ *      flush on new block boundaries or `phase === "complete"`.
+ *    - Once `phase === "complete"` and the 280ms mist settle window finishes on
+ *      a multi-block reply, a single unified `<Markdown>{text}</Markdown>` is
+ *      pre-warmed off-flow at `opacity: 0` inside the exact same plugin row.
+ *      Only after its `onLayout(height > 0)` (or 120ms safety fallback) confirms
+ *      iOS `EnrichedMarkdown` AST parsing has landed does it swap in at
+ *      `opacity: 1` and unmount the split blocks — restoring full Markdown
+ *      fidelity (reference links `[x][1]`, cross-paragraph selection, loose
+ *      lists) with 0 flash and 0 LegendList ID swap.
+ * 3. **120Hz native GPU mist veil (zero JS `requestAnimationFrame` loops)**:
+ *    - Newly appearing blocks wait for `onLayout(height > 0)` (masking iOS
+ *      `EnrichedMarkdown` async AST first-frame blank) before running a 280ms
+ *      ease-out cubic `opacity: 0 -> 1` native-driver fade (with 55ms batch
+ *      stagger capped at 275ms).
+ *    - While streaming (and for a 280ms settle window on completion), a 5-band
+ *      `theme.colors.surface0` soft mist curtain overlays the active block's
+ *      bottom ~56px (`pointerEvents="none"`) and glides smoothly away via
+ *      `Animated.parallel` (`useNativeDriver: true`) whenever new lines arrive,
+ *      then unmounts completely when idle (0 extra GPU layers at rest).
+ * 4. **Native Paseo >= 0.18.1 Turn Footer**: Paseo automatically attaches its
+ *    native Copy Result / Fork / Turn Timing footer to this plugin row via
+ *    `source: item`, so we draw zero duplicate footer chrome.
  *
  * @module dsh-paseo/client/assistant-bloom
  */
-import { useAgent, useSettings, type PluginTimelineItemProps } from "@getpaseo/plugin/client";
+import { useAgent, type PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import { Markdown } from "@getpaseo/plugin/client/ui";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Platform, Text, View, type TextStyle } from "react-native";
-import { TIMELINE_STYLE_DEFAULTS, timelineStyleSettings } from "../shared/settings";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  Animated,
+  Easing,
+  Platform,
+  View,
+  type LayoutChangeEvent,
+} from "react-native";
+import {
+  readLiveBloomState,
+  writeLiveBloomState,
+  type LiveBloomState,
+} from "./assistant-bloom-handoff";
 import { normalizeRowTimestamp, yieldRowPulse } from "./newest";
 import {
-  BLOOM_HANDOFF_SPEED_BOOST,
   clearActiveBloom,
   markAgentLiveActivity,
   reportActiveBloom,
 } from "./row-cascade";
-import { AnimatedBodyParagraph } from "./row-entrance";
-import { STREAM_FRAME_INTERVAL_MS } from "./stream-reveal";
 import {
-  ASSISTANT_BLOOM_ALPHA_STEPS,
-  ASSISTANT_BLOOM_LOOKAHEAD_CHARS,
-  ASSISTANT_BLOOM_WAVE_WIDTH,
-  type InlineBloomKind,
-  type InlineBloomRun,
-  advanceAssistantBloomCursor,
-  buildStyledBloomRuns,
+  ACTIVE_BLOCK_THROTTLE_MS,
   countCodePoints,
-  isRichMarkdownBlock,
-  parseInlineMarkdownRuns,
+  shouldFlushActiveBlockImmediately,
+  shouldMergeToUnifiedMarkdown,
   shouldStartAssistantBloomFromZero,
-  splitAssistantMarkdownBlocks,
+  splitStableMarkdownBlocks,
 } from "./thinking-text";
-import {
-  readBloomProgress,
-  releaseAssistantBloom,
-  writeBloomProgress,
-  type BloomProgressState,
-} from "./assistant-bloom-handoff";
 import { withAlpha } from "./tokens";
 
 export interface AssistantBloomData {
@@ -58,158 +81,457 @@ export interface AssistantBloomData {
   bloomKey?: string;
 }
 
-/** Brief settle hold after streaming ends so rich blocks (tables/code) finish fading cleanly. */
-const ASSISTANT_PHASE_SETTLE_MS = 380;
-const MONO_FONT = Platform?.OS === "ios" ? "Menlo" : Platform?.OS === "android" ? "monospace" : "monospace";
+const BLOCK_ENTRANCE_DURATION_MS = 280;
+const BLOCK_STAGGER_STEP_MS = 55;
+const BLOCK_STAGGER_MAX_MS = 275;
+const BLOCK_LAYOUT_FALLBACK_MS = 120;
+const UNIFIED_MERGE_FALLBACK_MS = 120;
+const MIST_VEIL_HEIGHT_PX = 56;
+const MIST_VEIL_DURATION_MS = 300;
+const MIST_TAIL_SETTLE_MS = 280;
+const MIST_TEXT_GROWTH_THRESHOLD = 14;
+const MIST_RETRIGGER_COOLDOWN_MS = 140;
+/** Throttle interval (ms) for publishing active-bloom handoff hints to `row-cascade`. */
+const CASCADE_REPORT_THROTTLE_MS = 120;
+const CASCADE_REPORT_REMAINING_MS = 200;
+/** Heartbeat interval (ms) to keep `row-cascade`'s 15s live-activity window fresh on long streams. */
+const LIVE_ACTIVITY_HEARTBEAT_MS = 5_000;
 
-interface BlockPlan {
-  readonly raw: string;
-  readonly rich: boolean;
-  readonly runs: readonly InlineBloomRun[];
-  readonly startCp: number;
-  readonly cpCount: number;
+/** 5 stepped horizontal bands (top -> bottom) forming a wide ~56px mist curtain. */
+const MIST_BAND_ALPHAS = [0.08, 0.24, 0.48, 0.76, 0.96] as const;
+
+const WEB_BLOOM_STYLE_ID = "dsh-assistant-bloom-styles";
+const WEB_BLOCK_ENTER_TEST_ID = "dsh-bloom-block-enter";
+const WEB_MIST_SWEEP_TEST_ID = "dsh-bloom-mist-sweep";
+
+const ROOT_STYLE = { position: "relative" as const, paddingTop: 4, paddingBottom: 4 };
+const UNIFIED_PREWARM_STYLE = {
+  position: "absolute" as const,
+  top: 4,
+  left: 0,
+  right: 0,
+  opacity: 0,
+};
+
+interface WebStyleElement {
+  id: string;
+  textContent: string | null;
 }
 
-function buildBlockPlans(blocks: readonly string[]): { plans: BlockPlan[]; totalCp: number } {
-  const plans: BlockPlan[] = [];
-  let offset = 0;
-  for (const raw of blocks) {
-    const rich = isRichMarkdownBlock(raw);
-    if (rich) {
-      // Rich blocks (fenced code / tables) fade smoothly as a single unit over ~18 cp budget.
-      const budget = 18;
-      plans.push({ raw, rich: true, runs: [], startCp: offset, cpCount: budget });
-      offset += budget;
-    } else {
-      const runs = parseInlineMarkdownRuns(raw);
-      let cp = 0;
-      for (const r of runs) cp += countCodePoints(r.text);
-      plans.push({ raw, rich: false, runs, startCp: offset, cpCount: cp });
-      offset += cp;
+interface WebStyleDocument {
+  getElementById?: (id: string) => unknown;
+  createElement?: (tag: string) => WebStyleElement;
+  head?: { appendChild?: (el: WebStyleElement) => void };
+  documentElement?: { appendChild?: (el: WebStyleElement) => void };
+}
+
+function isWebPlatform(): boolean {
+  return Platform?.OS === "web";
+}
+
+function canUseNativeAnimated(): boolean {
+  return (
+    !isWebPlatform() &&
+    typeof Animated?.View !== "undefined" &&
+    typeof Animated?.Value === "function" &&
+    typeof Animated?.timing === "function"
+  );
+}
+
+function easeOutCubic() {
+  return typeof Easing?.out === "function" && Easing?.cubic
+    ? Easing.out(Easing.cubic)
+    : undefined;
+}
+
+function ensureWebBloomStyles(): void {
+  const doc = (globalThis as { document?: WebStyleDocument }).document;
+  if (!doc || typeof doc.getElementById !== "function" || doc.getElementById(WEB_BLOOM_STYLE_ID)) {
+    return;
+  }
+  const head = doc.head ?? doc.documentElement;
+  if (!head || typeof head.appendChild !== "function" || typeof doc.createElement !== "function") {
+    return;
+  }
+  const style = doc.createElement("style");
+  style.id = WEB_BLOOM_STYLE_ID;
+  style.textContent = [
+    `@keyframes dsh-bloom-fade-in{from{opacity:0}to{opacity:1}}`,
+    `@keyframes dsh-bloom-mist-sweep{0%{opacity:0.95;transform:translateY(-10px)}100%{opacity:0;transform:translateY(12px)}}`,
+    `[data-testid="${WEB_BLOCK_ENTER_TEST_ID}"]{animation:dsh-bloom-fade-in ${BLOCK_ENTRANCE_DURATION_MS}ms cubic-bezier(0.215,0.61,0.355,1) both}`,
+    `[data-testid="${WEB_MIST_SWEEP_TEST_ID}"]{animation:dsh-bloom-mist-sweep ${MIST_VEIL_DURATION_MS}ms cubic-bezier(0.215,0.61,0.355,1) forwards}`,
+  ].join("\n");
+  head.appendChild(style);
+}
+
+// Eagerly inject Web CSS keyframes at module load so the very first mounted
+// block never flashes unstyled for one frame before effects commit.
+if (
+  isWebPlatform() &&
+  typeof (globalThis as { document?: WebStyleDocument }).document !== "undefined"
+) {
+  ensureWebBloomStyles();
+}
+
+const useIsomorphicLayoutEffect =
+  typeof (globalThis as { document?: unknown }).document !== "undefined"
+    ? useLayoutEffect
+    : useEffect;
+
+/**
+ * Throttles active trailing-block updates to `ACTIVE_BLOCK_THROTTLE_MS` (~15 Hz)
+ * while streaming, and flushes synchronously with zero latency whenever a new
+ * settled block closes or `phase` reaches `"complete"`.
+ */
+function useThrottledActiveBlock(
+  activeBlock: string,
+  settledCount: number,
+  phase: "streaming" | "complete",
+  active: boolean,
+): string {
+  const [committed, setCommitted] = useState<string>(activeBlock);
+  const lastCommitAtRef = useRef<number>(Date.now());
+  const prevSettledCountRef = useRef<number>(settledCount);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const immediate =
+    !active ||
+    shouldFlushActiveBlockImmediately({
+      prevSettledCount: prevSettledCountRef.current,
+      nextSettledCount: settledCount,
+      phase,
+      hasCommittedText: committed.length > 0,
+      nextActiveText: activeBlock,
+    });
+
+  useEffect(() => {
+    prevSettledCountRef.current = settledCount;
+    if (immediate) {
+      if (timerRef.current !== null) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+      lastCommitAtRef.current = Date.now();
+      setCommitted(activeBlock);
+      return;
     }
-  }
-  return { plans, totalCp: offset };
-}
 
-interface BloomColors {
-  readonly foreground: string;
-  readonly accent: string;
-  readonly codeBg: string;
-}
+    if (activeBlock === committed) return;
 
-function kindBaseColor(kind: InlineBloomKind, colors: BloomColors): string {
-  return kind === "link" ? colors.accent : colors.foreground;
-}
+    const now = Date.now();
+    const elapsed = now - lastCommitAtRef.current;
+    if (elapsed >= ACTIVE_BLOCK_THROTTLE_MS) {
+      if (timerRef.current !== null) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+      lastCommitAtRef.current = now;
+      setCommitted(activeBlock);
+      return;
+    }
 
-function kindTextStyle(kind: InlineBloomKind, baseFontSize: number): TextStyle | undefined {
-  if (kind === "bold") return { fontWeight: "600" };
-  if (kind === "heading") {
-    return {
-      fontWeight: "700",
-      fontSize: Math.round(baseFontSize * 1.2),
-      lineHeight: Math.round(baseFontSize * 1.2 * 1.3),
+    if (timerRef.current !== null) {
+      clearTimeout(timerRef.current);
+    }
+    const waitMs = Math.max(1, ACTIVE_BLOCK_THROTTLE_MS - elapsed);
+    timerRef.current = setTimeout(() => {
+      timerRef.current = null;
+      lastCommitAtRef.current = Date.now();
+      setCommitted(activeBlock);
+    }, waitMs);
+  }, [activeBlock, settledCount, immediate, committed]);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current !== null) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
     };
+  }, []);
+
+  return immediate ? activeBlock : committed;
+}
+
+interface MistVeilOverlayProps {
+  readonly surfaceColor: string;
+  readonly pulseId: number;
+  readonly intensity: number;
+}
+
+/**
+ * Wide (~56px) 5-band stepped soft-mist frontier built strictly from host
+ * `theme.colors.surface0` `View` bands (no SVG/MaskedView required).
+ * Animated purely on the native GPU driver (or Web CSS keyframes) and unmounted
+ * completely once streaming settles.
+ */
+const MistVeilOverlay = memo(function MistVeilOverlay({
+  surfaceColor,
+  pulseId,
+  intensity,
+}: MistVeilOverlayProps) {
+  const web = isWebPlatform();
+  const nativeAnim = canUseNativeAnimated();
+  const opacityRef = useRef<InstanceType<typeof Animated.Value> | null>(null);
+  const translateYRef = useRef<InstanceType<typeof Animated.Value> | null>(null);
+  const runningRef = useRef<Animated.CompositeAnimation | null>(null);
+
+  if (nativeAnim) {
+    if (opacityRef.current === null) opacityRef.current = new Animated.Value(0);
+    if (translateYRef.current === null) translateYRef.current = new Animated.Value(0);
   }
-  if (kind === "code") return { fontFamily: MONO_FONT, fontSize: 12 };
-  return undefined;
+
+  useIsomorphicLayoutEffect(() => {
+    if (web) ensureWebBloomStyles();
+  }, [web]);
+
+  useEffect(() => {
+    if (!nativeAnim || pulseId <= 0 || !opacityRef.current || !translateYRef.current) return;
+    runningRef.current?.stop();
+    const startOpacity = Math.max(0.45, Math.min(0.95, intensity));
+    opacityRef.current.setValue(startOpacity);
+    translateYRef.current.setValue(-10);
+    const easing = easeOutCubic();
+    const anim = Animated.parallel([
+      Animated.timing(opacityRef.current, {
+        toValue: 0,
+        duration: MIST_VEIL_DURATION_MS,
+        useNativeDriver: true,
+        ...(easing !== undefined ? { easing } : {}),
+      }),
+      Animated.timing(translateYRef.current, {
+        toValue: 12,
+        duration: MIST_VEIL_DURATION_MS,
+        useNativeDriver: true,
+        ...(easing !== undefined ? { easing } : {}),
+      }),
+    ]);
+    runningRef.current = anim;
+    anim.start(({ finished }) => {
+      if (finished && runningRef.current === anim) {
+        runningRef.current = null;
+      }
+    });
+    return () => {
+      anim.stop();
+    };
+  }, [nativeAnim, pulseId, intensity]);
+
+  const bands = useMemo(
+    () =>
+      MIST_BAND_ALPHAS.map((alpha, idx) => {
+        const tinted = withAlpha(surfaceColor, alpha);
+        const style =
+          tinted !== "transparent"
+            ? { flex: 1 as const, backgroundColor: tinted }
+            : { flex: 1 as const, backgroundColor: surfaceColor, opacity: alpha };
+        return <View key={idx} style={style} />;
+      }),
+    [surfaceColor],
+  );
+
+  if (pulseId <= 0) return null;
+
+  if (web) {
+    return (
+      <View
+        key={pulseId}
+        testID={WEB_MIST_SWEEP_TEST_ID}
+        pointerEvents="none"
+        style={{
+          position: "absolute",
+          left: 0,
+          right: 0,
+          bottom: 0,
+          height: MIST_VEIL_HEIGHT_PX,
+        }}
+      >
+        {bands}
+      </View>
+    );
+  }
+
+  if (nativeAnim && opacityRef.current && translateYRef.current) {
+    const AnimatedView = Animated.View;
+    return (
+      <AnimatedView
+        pointerEvents="none"
+        style={{
+          position: "absolute",
+          left: 0,
+          right: 0,
+          bottom: 0,
+          height: MIST_VEIL_HEIGHT_PX,
+          opacity: opacityRef.current,
+          transform: [{ translateY: translateYRef.current }],
+        }}
+      >
+        {bands}
+      </AnimatedView>
+    );
+  }
+
+  return null;
+});
+
+interface MarkdownBlockItemProps {
+  readonly content: string;
+  readonly animateEntrance: boolean;
+  readonly staggerDelayMs: number;
+  readonly mistActive: boolean;
+  readonly streaming: boolean;
+  readonly surfaceColor: string;
 }
 
-function renderStaticProseRuns(
-  runs: readonly InlineBloomRun[],
-  baseStyle: TextStyle,
-  colors: BloomColors,
-  baseFontSize: number,
-) {
-  return (
-    <Text style={baseStyle} selectable>
-      {runs.map((run, idx) => {
-        if (run.kind === "plain") return run.text;
-        const extra = kindTextStyle(run.kind, baseFontSize);
-        const color = run.kind === "link" ? colors.accent : undefined;
-        const backgroundColor = run.kind === "code" ? colors.codeBg : undefined;
-        return (
-          <Text
-            key={idx}
-            style={[
-              extra,
-              color !== undefined ? { color } : undefined,
-              backgroundColor !== undefined ? { backgroundColor } : undefined,
-            ]}
-          >
-            {run.text}
-          </Text>
-        );
-      })}
-    </Text>
-  );
-}
+/**
+ * Stable-key Markdown block wrapper.
+ *
+ * - Settled blocks keep identical props and stay frozen behind `React.memo`
+ *   (zero re-renders and zero Markdown re-parsing as later tokens stream in).
+ * - Newly mounted live blocks stay at `opacity: 0` until `onLayout` reports
+ *   `height > 0` (covering iOS `EnrichedMarkdown` async first-frame blank),
+ *   then glide in on the native GPU driver in 280ms.
+ * - The trailing active block stays mounted on the exact same component type
+ *   and key when it transitions from active -> settled or streaming -> complete,
+ *   guaranteeing zero unmount/remount flicker.
+ */
+const MarkdownBlockItem = memo(function MarkdownBlockItem({
+  content,
+  animateEntrance,
+  staggerDelayMs,
+  mistActive,
+  streaming,
+  surfaceColor,
+}: MarkdownBlockItemProps) {
+  const web = isWebPlatform();
+  const nativeAnim = canUseNativeAnimated();
+  const initialAnimateRef = useRef<boolean>(animateEntrance);
+  const initialDelayRef = useRef<number>(staggerDelayMs);
+  const entranceStartedRef = useRef<boolean>(!initialAnimateRef.current);
+  const entranceAnimRef = useRef<Animated.CompositeAnimation | null>(null);
+  const opacityRef = useRef<InstanceType<typeof Animated.Value> | null>(null);
 
-function renderBloomingProseRuns(
-  runs: readonly InlineBloomRun[],
-  localProgress: number,
-  localSettledFloor: number,
-  baseStyle: TextStyle,
-  colors: BloomColors,
-  baseFontSize: number,
-) {
-  const segments = buildStyledBloomRuns(
-    runs,
-    localProgress,
-    ASSISTANT_BLOOM_WAVE_WIDTH,
-    localSettledFloor,
-    ASSISTANT_BLOOM_LOOKAHEAD_CHARS,
-    ASSISTANT_BLOOM_ALPHA_STEPS,
+  if (nativeAnim && initialAnimateRef.current && opacityRef.current === null) {
+    opacityRef.current = new Animated.Value(0);
+  }
+
+  const prevHeightRef = useRef<number>(0);
+  const prevLenRef = useRef<number>(content.length);
+  const lastPulseAtRef = useRef<number>(0);
+  const [mistPulse, setMistPulse] = useState<{ id: number; intensity: number }>({
+    id: 0,
+    intensity: 0.95,
+  });
+
+  const triggerEntrance = useCallback(() => {
+    if (entranceStartedRef.current) return;
+    entranceStartedRef.current = true;
+    if (!nativeAnim || !opacityRef.current) return;
+    const easing = easeOutCubic();
+    const anim = Animated.timing(opacityRef.current, {
+      toValue: 1,
+      duration: BLOCK_ENTRANCE_DURATION_MS,
+      delay: initialDelayRef.current,
+      useNativeDriver: true,
+      ...(easing !== undefined ? { easing } : {}),
+    });
+    entranceAnimRef.current = anim;
+    anim.start();
+  }, [nativeAnim]);
+
+  useIsomorphicLayoutEffect(() => {
+    if (web && initialAnimateRef.current) {
+      ensureWebBloomStyles();
+    }
+  }, [web]);
+
+  // Unconditional unmount cleanup so an entrance animation started directly from
+  // `onLayout` (before the fallback effect ran) is always stopped on unmount.
+  useEffect(() => {
+    return () => {
+      entranceAnimRef.current?.stop();
+    };
+  }, []);
+
+  // Safety net: ensure a newly mounted block can never stay invisible if a host
+  // or zero-height divider omits `onLayout`.
+  useEffect(() => {
+    if (!nativeAnim || !initialAnimateRef.current || entranceStartedRef.current) return;
+    const fallback = setTimeout(
+      triggerEntrance,
+      BLOCK_LAYOUT_FALLBACK_MS + initialDelayRef.current,
+    );
+    return () => {
+      clearTimeout(fallback);
+    };
+  }, [nativeAnim, triggerEntrance]);
+
+  const fireMistPulse = useCallback((intensity: number, force: boolean) => {
+    const now = Date.now();
+    if (!force && now - lastPulseAtRef.current < MIST_RETRIGGER_COOLDOWN_MS) return;
+    lastPulseAtRef.current = now;
+    setMistPulse((prev) => ({ id: prev.id + 1, intensity }));
+  }, []);
+
+  // Trigger a gentle mist pulse when active text grows meaningfully within a line.
+  useEffect(() => {
+    const delta = content.length - prevLenRef.current;
+    prevLenRef.current = content.length;
+    if (!mistActive || !streaming || delta < MIST_TEXT_GROWTH_THRESHOLD) return;
+    fireMistPulse(0.68, false);
+  }, [content.length, mistActive, streaming, fireMistPulse]);
+
+  const handleLayout = useCallback(
+    (event: LayoutChangeEvent) => {
+      const nextHeight = event?.nativeEvent?.layout?.height ?? 0;
+      if (nextHeight > 0 && !entranceStartedRef.current) {
+        triggerEntrance();
+      }
+      const prevHeight = prevHeightRef.current;
+      prevHeightRef.current = nextHeight;
+      if (mistActive && streaming && prevHeight > 0 && nextHeight > prevHeight + 2) {
+        fireMistPulse(0.95, true);
+      }
+    },
+    [triggerEntrance, mistActive, streaming, fireMistPulse],
   );
-  if (segments.length === 0) return null;
-  return (
-    <Text style={baseStyle} selectable>
-      {segments.map((seg, idx) => {
-        const extra = kindTextStyle(seg.kind, baseFontSize);
-        if (seg.alpha >= 0.995) {
-          if (seg.kind === "plain") return seg.text;
-          const color = seg.kind === "link" ? colors.accent : undefined;
-          const backgroundColor = seg.kind === "code" ? colors.codeBg : undefined;
-          return (
-            <Text
-              key={idx}
-              style={[
-                extra,
-                color !== undefined ? { color } : undefined,
-                backgroundColor !== undefined ? { backgroundColor } : undefined,
-              ]}
-            >
-              {seg.text}
-            </Text>
-          );
-        }
-        if (seg.alpha <= 0.005) {
-          return (
-            <Text key={idx} style={[extra, { color: "transparent" }]}>
-              {seg.text}
-            </Text>
-          );
-        }
-        const tinted = withAlpha(kindBaseColor(seg.kind, colors), seg.alpha);
-        const codeBgTinted =
-          seg.kind === "code" ? withAlpha(colors.codeBg, seg.alpha) : undefined;
-        return (
-          <Text
-            key={idx}
-            style={[
-              extra,
-              tinted !== "transparent" ? { color: tinted } : { opacity: seg.alpha },
-              codeBgTinted && codeBgTinted !== "transparent"
-                ? { backgroundColor: codeBgTinted }
-                : undefined,
-            ]}
-          >
-            {seg.text}
-          </Text>
-        );
-      })}
-    </Text>
+
+  const inner = (
+    <View style={mistActive ? { position: "relative", overflow: "hidden" } : undefined}>
+      <Markdown>{content}</Markdown>
+      {mistActive ? (
+        <MistVeilOverlay
+          surfaceColor={surfaceColor}
+          pulseId={mistPulse.id}
+          intensity={mistPulse.intensity}
+        />
+      ) : null}
+    </View>
   );
-}
+
+  if (nativeAnim && initialAnimateRef.current && opacityRef.current) {
+    const AnimatedView = Animated.View;
+    return (
+      <AnimatedView onLayout={handleLayout} style={{ opacity: opacityRef.current }}>
+        {inner}
+      </AnimatedView>
+    );
+  }
+
+  if (web && initialAnimateRef.current) {
+    const webDelayStyle =
+      initialDelayRef.current > 0
+        ? ({ animationDelay: `${initialDelayRef.current}ms` } as unknown as Record<string, string>)
+        : undefined;
+    return (
+      <View onLayout={handleLayout} testID={WEB_BLOCK_ENTER_TEST_ID} style={webDelayStyle}>
+        {inner}
+      </View>
+    );
+  }
+
+  return <View onLayout={mistActive ? handleLayout : undefined}>{inner}</View>;
+});
 
 export function AssistantMessageBloom({
   theme,
@@ -219,71 +541,39 @@ export function AssistantMessageBloom({
   item,
 }: PluginTimelineItemProps<AssistantBloomData>) {
   const { text, phase, bloomKey } = item.data;
-  const styleState = useSettings(timelineStyleSettings);
-  const timelineStyle = styleState.status === "ready" ? styleState.values : TIMELINE_STYLE_DEFAULTS;
-  const blockGap = Math.max(6, Math.min(14, 10 + Math.round(timelineStyle.rowMarginY * 0.5)));
+  // Match Paseo `density.blockGap = { xs: 12, md: 16 }` (`styles/density.ts:33`).
+  const blockGap = layout.compact ? 12 : 16;
   const agentStatus = useAgent(agentId ?? "", (snapshot) => snapshot.status);
-  const hasRaf =
-    typeof globalThis.requestAnimationFrame === "function" &&
-    typeof globalThis.cancelAnimationFrame === "function";
-
   const rowAt = normalizeRowTimestamp(timestamp);
   const rowIdentity = bloomKey ? `${agentId ?? ""}\0${bloomKey}` : `${agentId ?? ""}\0${rowAt}`;
 
-  const blocks = useMemo(() => splitAssistantMarkdownBlocks(text), [text]);
-  const { plans, totalCp } = useMemo(() => buildBlockPlans(blocks), [blocks]);
-
-  // Restore any in-flight progress persisted across Paseo's `liveHead -> history`
-  // remount when `turn_completed` moves the row from the live head slot into
-  // the virtualized history list — preventing the cursor from resetting and
-  // eliminating the completion flash.
-  const persisted = readBloomProgress(bloomKey);
-  const initialBloomFromZero =
+  const totalCp = useMemo(() => countCodePoints(text), [text]);
+  const persisted = readLiveBloomState(bloomKey);
+  const initialEverStreamed =
     persisted !== undefined
       ? persisted.everStreamed
-      : hasRaf &&
-        shouldStartAssistantBloomFromZero({
+      : shouldStartAssistantBloomFromZero({
           phase,
           totalCp,
           agentStatus,
         });
 
   const prevIdentityRef = useRef<string>(rowIdentity);
+  const instanceEpochRef = useRef<number>(0);
   const prevTextRef = useRef<string>(text);
-  const everStreamedRef = useRef<boolean>(initialBloomFromZero);
-  const [growing, setGrowing] = useState<boolean>(
-    persisted !== undefined ? persisted.everStreamed && phase === "streaming" : initialBloomFromZero,
+  const everStreamedRef = useRef<boolean>(initialEverStreamed);
+  const revealedBlocksRef = useRef<Set<number>>(
+    persisted !== undefined ? persisted.revealedBlocks : new Set<number>(),
   );
+  // Stable per-block entrance config so `React.memo` never invalidates settled blocks.
+  const blockEntranceMapRef = useRef<Map<number, { animate: boolean; delayMs: number }>>(
+    new Map(),
+  );
+  const lastCascadeReportAtRef = useRef<number>(0);
+  const lastLiveActivityAtRef = useRef<number>(0);
 
-  const totalCpRef = useRef<number>(totalCp);
-  const cursorRef = useRef<number>(
-    persisted !== undefined
-      ? persisted.cursor
-      : initialBloomFromZero
-        ? 0
-        : totalCp + ASSISTANT_BLOOM_WAVE_WIDTH,
-  );
-  const settledFloorRef = useRef<number>(
-    persisted !== undefined ? persisted.settledFloor : initialBloomFromZero ? 0 : totalCp,
-  );
-  const fadedRichBlocksRef = useRef<Set<number>>(
-    persisted !== undefined ? persisted.fadedRichBlocks : new Set<number>(),
-  );
-  const rafRef = useRef<number | null>(null);
-  const lastFrameRef = useRef<number>(0);
-  const handoffBoostRef = useRef<boolean>(false);
-  const [, setTick] = useState(0);
-
-  const syncProgress = () => {
-    if (!bloomKey) return;
-    const state: BloomProgressState = {
-      everStreamed: everStreamedRef.current,
-      cursor: cursorRef.current,
-      settledFloor: settledFloorRef.current,
-      fadedRichBlocks: fadedRichBlocksRef.current,
-    };
-    writeBloomProgress(bloomKey, state);
-  };
+  const [tailSettling, setTailSettling] = useState<boolean>(false);
+  const [unifiedReady, setUnifiedReady] = useState<boolean>(false);
 
   if (prevIdentityRef.current !== rowIdentity) {
     const isContinuation =
@@ -292,280 +582,225 @@ export function AssistantMessageBloom({
       text.startsWith(prevTextRef.current);
     prevIdentityRef.current = rowIdentity;
     if (!isContinuation) {
-      const nextPersisted = readBloomProgress(bloomKey);
+      instanceEpochRef.current += 1;
+      const nextPersisted = readLiveBloomState(bloomKey);
+      blockEntranceMapRef.current.clear();
       if (nextPersisted !== undefined) {
         everStreamedRef.current = nextPersisted.everStreamed;
-        handoffBoostRef.current = false;
-        totalCpRef.current = totalCp;
-        cursorRef.current = nextPersisted.cursor;
-        settledFloorRef.current = nextPersisted.settledFloor;
-        fadedRichBlocksRef.current = nextPersisted.fadedRichBlocks;
+        revealedBlocksRef.current = nextPersisted.revealedBlocks;
       } else {
-        const freshFromZero =
-          hasRaf &&
-          shouldStartAssistantBloomFromZero({
-            phase,
-            totalCp,
-            agentStatus,
-          });
-        everStreamedRef.current = freshFromZero;
-        handoffBoostRef.current = false;
-        totalCpRef.current = totalCp;
-        fadedRichBlocksRef.current = new Set<number>();
-        if (freshFromZero) {
-          cursorRef.current = 0;
-          settledFloorRef.current = 0;
-        } else {
-          cursorRef.current = totalCp + ASSISTANT_BLOOM_WAVE_WIDTH;
-          settledFloorRef.current = totalCp;
-        }
+        const fresh = shouldStartAssistantBloomFromZero({
+          phase,
+          totalCp,
+          agentStatus,
+        });
+        everStreamedRef.current = fresh;
+        revealedBlocksRef.current = new Set<number>();
       }
     }
-  } else if (text !== prevTextRef.current) {
-    const prevTotal = totalCpRef.current;
-    totalCpRef.current = totalCp;
-    if (phase === "streaming" || text.length > prevTextRef.current.length) {
-      if (!everStreamedRef.current) {
-        settledFloorRef.current = prevTotal;
-        cursorRef.current = prevTotal;
-      } else if (cursorRef.current > prevTotal) {
-        settledFloorRef.current = Math.max(settledFloorRef.current, prevTotal);
-        cursorRef.current = prevTotal;
-      }
+  } else if (
+    text !== prevTextRef.current &&
+    (phase === "streaming" || text.length > prevTextRef.current.length)
+  ) {
+    if (!everStreamedRef.current) {
       everStreamedRef.current = true;
-    } else if (!everStreamedRef.current) {
-      cursorRef.current = totalCp + ASSISTANT_BLOOM_WAVE_WIDTH;
-      settledFloorRef.current = totalCp;
     }
   }
   prevTextRef.current = text;
-  totalCpRef.current = totalCp;
-  syncProgress();
+  const everStreamed = everStreamedRef.current;
+
+  const syncState = useCallback(() => {
+    if (!bloomKey) return;
+    const state: LiveBloomState = {
+      everStreamed: everStreamedRef.current,
+      revealedBlocks: revealedBlocksRef.current,
+    };
+    writeLiveBloomState(bloomKey, state);
+  }, [bloomKey]);
 
   const yieldedPulseRowRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (phase === "streaming" && everStreamedRef.current) {
-      markAgentLiveActivity(agentId);
+    if (phase === "streaming" && everStreamed) {
+      const now = Date.now();
+      lastLiveActivityAtRef.current = now;
+      markAgentLiveActivity(agentId, now);
       if (yieldedPulseRowRef.current !== rowIdentity) {
         yieldedPulseRowRef.current = rowIdentity;
         yieldRowPulse(agentId);
       }
-      setGrowing(true);
+      setTailSettling(true);
+      setUnifiedReady(false);
       return;
     }
-    if (!everStreamedRef.current) {
-      setGrowing(false);
+    clearActiveBloom(agentId);
+    if (!everStreamed) {
+      setTailSettling(false);
       return;
     }
     const timer = setTimeout(() => {
-      setGrowing(false);
-    }, ASSISTANT_PHASE_SETTLE_MS);
+      setTailSettling(false);
+    }, MIST_TAIL_SETTLE_MS);
     return () => clearTimeout(timer);
-  }, [agentId, phase, text, rowIdentity]);
+  }, [agentId, phase, rowIdentity, everStreamed]);
 
-  const settledTarget = totalCp + ASSISTANT_BLOOM_WAVE_WIDTH;
-  const needsAnim =
-    hasRaf &&
-    everStreamedRef.current &&
-    totalCp > 0 &&
-    cursorRef.current < settledTarget - 0.05;
-  const activeLive = needsAnim || (hasRaf && everStreamedRef.current && (growing || phase === "streaming"));
-
-  const needsAnimRef = useRef<boolean>(needsAnim);
-  needsAnimRef.current = needsAnim;
-  const phaseRef = useRef<"streaming" | "complete">(phase);
-  phaseRef.current = phase;
-  const bloomKeyRef = useRef<string | undefined>(bloomKey);
-  bloomKeyRef.current = bloomKey;
-
-  // Release back to Paseo's native `assistant_message` renderer (restoring the
-  // native Copy / Fork / Turn Timing footer) as soon as the bloom wave settles,
-  // or immediately when an idle/reloaded row skipped bloom on mount.
   useEffect(() => {
-    if (!bloomKey) return;
-    if (!everStreamedRef.current) {
-      releaseAssistantBloom(bloomKey);
-      return;
-    }
-    if (phase === "complete" && !activeLive) {
-      releaseAssistantBloom(bloomKey);
-    }
-  }, [bloomKey, phase, activeLive]);
+    syncState();
+  }, [syncState, phase, text]);
 
   useEffect(() => {
     return () => {
-      if (rafRef.current !== null && typeof globalThis.cancelAnimationFrame === "function") {
-        globalThis.cancelAnimationFrame(rafRef.current);
-        rafRef.current = null;
-      }
-      lastFrameRef.current = 0;
-      handoffBoostRef.current = false;
       clearActiveBloom(agentId);
-      // Persist latest cursor on unmount so a `liveHead -> history` remount
-      // picks up seamlessly; release only if already settled in `complete`.
-      if (phaseRef.current === "complete" && !needsAnimRef.current && bloomKeyRef.current) {
-        releaseAssistantBloom(bloomKeyRef.current);
-      } else {
-        syncProgress();
-      }
+      syncState();
     };
-  }, [agentId, rowIdentity]);
+  }, [agentId, syncState]);
 
-  useEffect(() => {
-    if (!needsAnim) {
-      if (rafRef.current !== null && typeof globalThis.cancelAnimationFrame === "function") {
-        globalThis.cancelAnimationFrame(rafRef.current);
-        rafRef.current = null;
-      }
-      lastFrameRef.current = 0;
-      handoffBoostRef.current = false;
-      clearActiveBloom(agentId);
-      return;
-    }
-
-    const onSuccessorWaiting = () => {
-      handoffBoostRef.current = true;
-    };
-    const publishRemaining = () => {
-      const remChars = Math.max(0, totalCpRef.current + ASSISTANT_BLOOM_WAVE_WIDTH - cursorRef.current);
-      // Estimate remaining bloom duration against our responsive assistant wave pace.
-      const estMs = (remChars / 120) * 1000;
-      reportActiveBloom(agentId, estMs, onSuccessorWaiting);
-    };
-    publishRemaining();
-
-    if (rafRef.current !== null) return;
-
-    let lastEmitAt = 0;
-    const tick = (now: number) => {
-      rafRef.current = null;
-      if (!needsAnimRef.current) {
-        lastFrameRef.current = 0;
-        clearActiveBloom(agentId);
-        return;
-      }
-      const rawDt =
-        lastFrameRef.current === 0 ? STREAM_FRAME_INTERVAL_MS : Math.max(1, now - lastFrameRef.current);
-      lastFrameRef.current = now;
-      const dt = handoffBoostRef.current ? rawDt * BLOOM_HANDOFF_SPEED_BOOST : rawDt;
-      const target = totalCpRef.current;
-      const next = advanceAssistantBloomCursor(cursorRef.current, target, dt, ASSISTANT_BLOOM_WAVE_WIDTH);
-      cursorRef.current = next;
-      const done = next >= target + ASSISTANT_BLOOM_WAVE_WIDTH - 0.05;
-      if (done) {
-        cursorRef.current = target + ASSISTANT_BLOOM_WAVE_WIDTH;
-        settledFloorRef.current = target;
-        syncProgress();
-        lastFrameRef.current = 0;
-        handoffBoostRef.current = false;
-        clearActiveBloom(agentId);
-        setTick((v) => (v + 1) & 0x7fffffff);
-        return;
-      }
-      syncProgress();
-      publishRemaining();
-      if (lastEmitAt === 0 || now - lastEmitAt >= STREAM_FRAME_INTERVAL_MS) {
-        lastEmitAt = now;
-        setTick((v) => (v + 1) & 0x7fffffff);
-      }
-      rafRef.current = globalThis.requestAnimationFrame(tick);
-    };
-
-    lastFrameRef.current = 0;
-    rafRef.current = globalThis.requestAnimationFrame(tick);
-  }, [agentId, needsAnim, text, rowIdentity]);
-
-  const baseFontSize = layout.compact ? 14 : 15;
-  const baseLineHeight = Math.round(baseFontSize * 1.4);
-  const proseStyle = useMemo<TextStyle>(
-    () => ({
-      color: theme.colors.foreground,
-      fontSize: baseFontSize,
-      lineHeight: baseLineHeight,
-    }),
-    [theme.colors.foreground, baseFontSize, baseLineHeight],
+  const rawSplit = useMemo(() => splitStableMarkdownBlocks(text), [text]);
+  const committedActiveBlock = useThrottledActiveBlock(
+    rawSplit.activeBlock,
+    rawSplit.settledBlocks.length,
+    phase,
+    everStreamed,
   );
 
-  // Cache completely settled earlier prose/rich blocks so only the actively
-  // emerging block re-renders at 60fps.
-  const settledCacheRef = useRef<
-    Map<number, { raw: string; node: ReturnType<typeof renderStaticProseRuns> }>
-  >(new Map());
-  if (!activeLive && settledCacheRef.current.size > 0) {
-    settledCacheRef.current.clear();
-  }
-
-  // When a `bloomKey` is active and we streamed this row, keep rendering our
-  // settled prose/rich layout right up until `releaseAssistantBloom(bloomKey)`
-  // hands the row back to Paseo's native `<AssistantMessage>` in one step —
-  // avoiding a redundant intermediate `<Markdown>` mount/measure flash on iOS.
-  if (plans.length === 0 || (!activeLive && (!bloomKey || !everStreamedRef.current))) {
-    return <Markdown>{text}</Markdown>;
-  }
-
-  const cursor = cursorRef.current;
-  const settledFloor = settledFloorRef.current;
-  const colors: BloomColors = {
-    foreground: theme.colors.foreground,
-    accent: theme.colors.accent,
-    codeBg: theme.colors.surface2,
-  };
-  const rendered: Array<ReturnType<typeof renderStaticProseRuns>> = [];
-
-  for (let i = 0; i < plans.length; i += 1) {
-    const plan = plans[i]!;
-    // Don't mount blocks far beyond the lookahead window yet.
-    if (plan.startCp > cursor + 1 && i > 0) break;
-
-    if (plan.rich) {
-      const alreadyFaded = fadedRichBlocksRef.current.has(i);
-      if (!alreadyFaded) {
-        fadedRichBlocksRef.current.add(i);
-        syncProgress();
-      }
-      const node = (
-        <AnimatedBodyParagraph key={`rich:${i}`} animate={!alreadyFaded} fromOpacity={0} durationMs={320}>
-          <Markdown>{plan.raw}</Markdown>
-        </AnimatedBodyParagraph>
-      );
-      rendered.push(node);
-      continue;
+  // Throttled cascade handoff hint (A-3) + 5s live-activity heartbeat (A-4)
+  // while streaming so downstream tool rows cascade smoothly even on >15s replies.
+  useEffect(() => {
+    if (phase !== "streaming" || !everStreamed) return;
+    const now = Date.now();
+    if (now - lastCascadeReportAtRef.current >= CASCADE_REPORT_THROTTLE_MS) {
+      lastCascadeReportAtRef.current = now;
+      reportActiveBloom(agentId, CASCADE_REPORT_REMAINING_MS, undefined, now);
     }
-
-    const blockEnd = plan.startCp + plan.cpCount;
-    const isBlockSettled =
-      cursor >= blockEnd + ASSISTANT_BLOOM_WAVE_WIDTH || settledFloor >= blockEnd;
-    if (isBlockSettled) {
-      const hit = settledCacheRef.current.get(i);
-      if (hit !== undefined && hit.raw === plan.raw) {
-        rendered.push(hit.node);
-      } else {
-        const node = (
-          <View key={`prose:${i}`}>
-            {renderStaticProseRuns(plan.runs, proseStyle, colors, baseFontSize)}
-          </View>
-        );
-        settledCacheRef.current.set(i, { raw: plan.raw, node });
-        rendered.push(node);
-      }
-      continue;
+    if (now - lastLiveActivityAtRef.current >= LIVE_ACTIVITY_HEARTBEAT_MS) {
+      lastLiveActivityAtRef.current = now;
+      markAgentLiveActivity(agentId, now);
     }
+  }, [agentId, phase, everStreamed, rawSplit.settledBlocks.length, committedActiveBlock]);
 
-    const localProgress = Math.max(0, cursor - plan.startCp);
-    const localSettledFloor = Math.max(0, settledFloor - plan.startCp);
-    const blooming = renderBloomingProseRuns(
-      plan.runs,
-      localProgress,
-      localSettledFloor,
-      proseStyle,
-      colors,
-      baseFontSize,
+  const totalBlocks = rawSplit.settledBlocks.length + (committedActiveBlock !== "" ? 1 : 0);
+  const needsUnifiedMerge =
+    everStreamed &&
+    shouldMergeToUnifiedMarkdown({
+      phase,
+      tailSettling,
+      blockCount: totalBlocks,
+    });
+
+  useEffect(() => {
+    setUnifiedReady(false);
+  }, [rowIdentity]);
+
+  // Reset double-buffer readiness whenever merge preconditions change (e.g. row
+  // identity changes, text updates, or streaming resumes).
+  useEffect(() => {
+    if (!needsUnifiedMerge) {
+      setUnifiedReady(false);
+      return;
+    }
+    if (unifiedReady) return;
+    const fallback = setTimeout(() => {
+      setUnifiedReady(true);
+    }, UNIFIED_MERGE_FALLBACK_MS);
+    return () => clearTimeout(fallback);
+  }, [needsUnifiedMerge, unifiedReady, rowIdentity, text]);
+
+  const handleUnifiedLayout = useCallback((event: LayoutChangeEvent) => {
+    const height = event?.nativeEvent?.layout?.height ?? 0;
+    if (height > 0) {
+      setUnifiedReady(true);
+    }
+  }, []);
+
+  // Idle / reopened / non-live row: render a single native `<Markdown>` on frame 0
+  // with zero animation wrappers and zero timers.
+  if (!everStreamed) {
+    return (
+      <View style={ROOT_STYLE}>
+        <Markdown>{text}</Markdown>
+      </View>
     );
-    if (blooming !== null) {
-      rendered.push(<View key={`prose:${i}`}>{blooming}</View>);
-    }
   }
 
-  return <View style={{ gap: blockGap }}>{rendered}</View>;
+  if (totalBlocks === 0) {
+    return <View style={ROOT_STYLE} />;
+  }
+
+  const showMist = phase === "streaming" || tailSettling;
+  const epoch = instanceEpochRef.current;
+
+  let batchNewIdx = 0;
+  const entranceConfigFor = (index: number): { animate: boolean; delayMs: number } => {
+    const existing = blockEntranceMapRef.current.get(index);
+    if (existing !== undefined) return existing;
+    const alreadyRevealed = revealedBlocksRef.current.has(index);
+    const config = alreadyRevealed
+      ? { animate: false, delayMs: 0 }
+      : {
+          animate: true,
+          delayMs: Math.min(BLOCK_STAGGER_MAX_MS, batchNewIdx * BLOCK_STAGGER_STEP_MS),
+        };
+    if (!alreadyRevealed) {
+      batchNewIdx += 1;
+      revealedBlocksRef.current.add(index);
+    }
+    blockEntranceMapRef.current.set(index, config);
+    return config;
+  };
+
+  const renderedBlocks = !unifiedReady
+    ? (() => {
+        const list = [];
+        for (let i = 0; i < rawSplit.settledBlocks.length; i += 1) {
+          const cfg = entranceConfigFor(i);
+          list.push(
+            <MarkdownBlockItem
+              key={`${epoch}:${i}`}
+              content={rawSplit.settledBlocks[i]!}
+              animateEntrance={cfg.animate}
+              staggerDelayMs={cfg.delayMs}
+              mistActive={false}
+              streaming={false}
+              surfaceColor={theme.colors.surface0}
+            />,
+          );
+        }
+        if (committedActiveBlock !== "") {
+          const activeIndex = rawSplit.settledBlocks.length;
+          const cfg = entranceConfigFor(activeIndex);
+          list.push(
+            <MarkdownBlockItem
+              key={`${epoch}:${activeIndex}`}
+              content={committedActiveBlock}
+              animateEntrance={cfg.animate}
+              staggerDelayMs={cfg.delayMs}
+              mistActive={showMist}
+              streaming={phase === "streaming"}
+              surfaceColor={theme.colors.surface0}
+            />,
+          );
+        }
+        return list;
+      })()
+    : null;
+
+  return (
+    <View style={ROOT_STYLE}>
+      {renderedBlocks !== null ? (
+        <View key={`${epoch}:blocks`} style={{ gap: blockGap }}>
+          {renderedBlocks}
+        </View>
+      ) : null}
+      {needsUnifiedMerge ? (
+        <View
+          key={`${epoch}:unified`}
+          onLayout={unifiedReady ? undefined : handleUnifiedLayout}
+          pointerEvents={unifiedReady ? "auto" : "none"}
+          style={unifiedReady ? undefined : UNIFIED_PREWARM_STYLE}
+        >
+          <Markdown>{text}</Markdown>
+        </View>
+      ) : null}
+    </View>
+  );
 }
