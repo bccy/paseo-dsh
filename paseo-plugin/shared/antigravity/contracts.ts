@@ -794,6 +794,23 @@ export function matchAntigravityCommandSummary(summaries: ToolSummaries | undefi
 export const SUBAGENT_TIMELINE_KIND = "antigravity-subagent";
 export const SUBAGENT_LIST_TIMELINE_KIND = "antigravity-subagents-check";
 export const ASK_QUESTION_TIMELINE_KIND = "antigravity-ask-question";
+export const STEPS_TIMELINE_KIND = "antigravity-steps";
+
+export const stepStatusSchema = z.enum(["pending", "in_progress", "done", "skipped", "failed"]);
+export type StepStatus = z.infer<typeof stepStatusSchema>;
+
+export const stepEntrySchema = z.object({
+  title: z.string(),
+  status: stepStatusSchema,
+});
+export type StepEntry = z.infer<typeof stepEntrySchema>;
+
+export const stepsCardSchema = z.object({
+  callId: z.string(),
+  steps: z.array(stepEntrySchema),
+  status: z.enum(["running", "completed", "failed", "canceled"]),
+});
+export type StepsCard = z.infer<typeof stepsCardSchema>;
 
 export const subagentCardSchema = z.object({
   id: z.string(),

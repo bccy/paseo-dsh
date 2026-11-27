@@ -50,6 +50,8 @@ function readKinds(source) {
         if (name === './messages') return { errorMessage: String, messages: { message: (k) => ({ key: k }) } };
         if (name === './questions') return { AskQuestionRow: () => null };
         if (name === './sidebar') return { QuotaSidebarItem: () => null };
+        if (name === './steps') return { createStepsViews: () => ({ StepsTimelineRow: () => null, makePopover: () => () => null }) };
+        if (name === './stepsModel') return fromBuild(path.join(build, 'client/antigravity/stepsModel.js'));
         if (name === './subagents') return { SUBAGENT_PANEL_ID: 'subagents', SUBAGENT_SCREEN_ID: 'antigravity-subagents', createSubagentViews: () => ({ open: noop, makePopover: () => () => null, SubagentCardRow: () => null, SubagentCheckRow: () => null, SubagentsPanel: () => null, SubagentsScreen: () => null }) };
         if (name === './timeline') return { FallbackNote: () => null };
         if (name === './transform') {
@@ -141,6 +143,7 @@ assert.deepEqual(
     'antigravity-subagent',
     'antigravity-subagents-check',
     'antigravity-ask-question',
+    'antigravity-steps',
   ].sort(),
 );
 assert(entrySource.includes('dsh-thinking'), 'mutation must reach the actual renderer registration');

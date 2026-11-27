@@ -771,6 +771,7 @@ test("index.client.tsx dsh-inline-tool runs Antigravity transformToolCall BEFORE
     assert.ok(renderers.has(agContracts.SUBAGENT_TIMELINE_KIND));
     assert.ok(renderers.has(agContracts.SUBAGENT_LIST_TIMELINE_KIND));
     assert.ok(renderers.has(agContracts.ASK_QUESTION_TIMELINE_KIND));
+    assert.ok(renderers.has(agContracts.STEPS_TIMELINE_KIND));
     assert.ok(renderers.has(agContracts.FALLBACK_TIMELINE_KIND));
 
     // Antigravity tool call takes precedence over dsh-tool
@@ -2230,7 +2231,7 @@ test("Antigravity built-in tool names and mcp_paseo_* prefixes localize cleanly 
     ["read_url_content", "网页获取", "Fetch", { type: "fetch" }, "Eye"],
     ["manage_task", "管理后台任务", "Manage task", { type: "unknown" }, "Timer"],
     ["schedule", "定时任务", "Schedule", { type: "unknown" }, "CalendarClock"],
-    ["update_steps", "更新步骤清单", "Update steps", { type: "unknown" }, "ListChecks"],
+    ["update_steps", "更新任务清单", "Update tasks", { type: "unknown" }, "ListChecks"],
     ["ask_question", "提问", "Ask question", { type: "unknown" }, "MessageCircleQuestion"],
     ["invoke_subagent", "调用子智能体", "Invoke subagent", { type: "unknown" }, "Bot"],
     ["swarm", "管理蜂群", "Manage swarm", { type: "unknown" }, "Users"],
@@ -3484,4 +3485,140 @@ test("Antigravity UsageSource uses dedicated antigravity-icon.svg packaged at pl
 
   const pkg = JSON.parse(fs.readFileSync(path.join(pluginRoot, "package.json"), "utf8"));
   assert.equal(Array.isArray(pkg.files) && pkg.files.includes("antigravity-icon.svg"), true);
+});
+
+test("Antigravity update_steps model, chronological StepsStore, and tool_call transform", () => {
+  const {
+    parseUpdateSteps,
+    summarizeSteps,
+    windowSteps,
+    stepsAllDoneSignature,
+    extractStepsFromTimelineEntries,
+    createStepsStore,
+  } = require("../client/antigravity/stepsModel.ts");
+  const { createAntigravityTimelineTransforms } = require("../client/antigravity/transform.ts");
+
+  assert.equal(parseUpdateSteps(null), null);
+  assert.equal(parseUpdateSteps({ steps: [] }), null);
+  const parsed = parseUpdateSteps({
+    steps: [
+      { title: "预演合并并分析冲突", status: "done" },
+      { title: "跳过旧脚本", status: "skipped" },
+      { title: "检查失败项", status: "failed" },
+      { title: "运行测试", status: "in_progress" },
+      { title: "待推送", status: "pending" },
+      { title: "   ", status: "pending" },
+    ],
+  });
+  assert.equal(parsed?.length, 5);
+  const summary = summarizeSteps(parsed);
+  assert.equal(summary.total, 5);
+  assert.equal(summary.done, 1);
+  assert.equal(summary.skipped, 1);
+  assert.equal(summary.failed, 1);
+  assert.equal(summary.inProgress.length, 1);
+  assert.equal(summary.pending, 1);
+  assert.equal(summary.allDone, false);
+  assert.equal(summary.pillState, "failed");
+  assert.equal(stepsAllDoneSignature(parsed), undefined);
+
+  const allDoneSteps = parseUpdateSteps({
+    steps: [
+      { title: "任务 1", status: "done" },
+      { title: "任务 2", status: "skipped" },
+    ],
+  });
+  const doneSummary = summarizeSteps(allDoneSteps);
+  assert.equal(doneSummary.allDone, true);
+  assert.equal(doneSummary.pillState, "complete");
+  assert.equal(stepsAllDoneSignature(allDoneSteps), "done:任务 1\nskipped:任务 2");
+
+  // Windowing focuses around the active step with at most 7 visible items
+  const nineSteps = Array.from({ length: 9 }, (_, i) => ({
+    title: `任务 ${i + 1}`,
+    status: i < 5 ? "done" : i === 5 ? "in_progress" : "pending",
+  }));
+  const win = windowSteps(nineSteps, 7);
+  assert.equal(win.earlier, 2);
+  assert.equal(win.slice.length, 7);
+  assert.equal(win.more, 0);
+  assert.equal(win.slice[0].title, "任务 3");
+
+  // StepsStore keeps chronologically newest call even if an older row remounts during scroll-up
+  const store = createStepsStore();
+  const events = [];
+  const unsub = store.subscribe((agentId) => events.push(agentId));
+  store.observe("agent-1", "call-2", [{ title: "新任务", status: "in_progress" }], 2000);
+  assert.equal(store.getLatest("agent-1")?.callId, "call-2");
+  assert.equal(store.isLatestCall("agent-1", "call-2"), true);
+  assert.equal(events.length, 1);
+
+  // Scroll-up remounts older call-1 (timestamp 1000) -> must NOT overwrite call-2 or notify
+  store.observe("agent-1", "call-1", [{ title: "旧任务", status: "done" }], 1000);
+  assert.equal(store.getLatest("agent-1")?.callId, "call-2");
+  assert.equal(store.isLatestCall("agent-1", "call-1"), false);
+  assert.equal(events.length, 1);
+
+  // Updating call-2 in place publishes the new steps
+  store.observe("agent-1", "call-2", [{ title: "新任务", status: "done" }], 2000);
+  assert.equal(store.getLatest("agent-1")?.steps[0]?.status, "done");
+  assert.equal(events.length, 2);
+  unsub();
+
+  // transformToolCall maps update_steps to antigravity-steps and validates against stepsCardSchema
+  const transforms = createAntigravityTimelineTransforms();
+  const tx = transforms.transformToolCall({
+    type: "tool_call",
+    callId: "call-steps-1",
+    name: "update_steps",
+    status: "completed",
+    detail: {
+      type: "unknown",
+      input: {
+        steps: [
+          { title: "预演合并并分析冲突", status: "done" },
+          { title: "验证代码检查与相关测试", status: "in_progress" },
+        ],
+      },
+      output: "OK",
+    },
+  });
+  assert.equal(tx?.items.length, 1);
+  assert.equal(tx?.items[0].kind, agContracts.STEPS_TIMELINE_KIND);
+  const validated = agContracts.stepsCardSchema.parse(tx.items[0].data);
+  assert.equal(validated.steps.length, 2);
+  assert.equal(validated.steps[1].status, "in_progress");
+
+  // Authoritative daemon seq ordering + timeline entry extraction
+  const extracted = extractStepsFromTimelineEntries([
+    {
+      seq: 10,
+      timestamp: "2026-11-28T03:41:27.000Z",
+      item: {
+        type: "tool_call",
+        callId: "c-early",
+        name: "update_steps",
+        status: "completed",
+        detail: { type: "unknown", input: { steps: [{ title: "任务 1", status: "in_progress" }] } },
+      },
+    },
+    {
+      seq: 42,
+      timestamp: "2026-11-28T03:41:27.000Z",
+      item: {
+        type: "tool_call",
+        callId: "c-final",
+        name: "update_steps",
+        status: "completed",
+        detail: { type: "unknown", input: { steps: [{ title: "任务 1", status: "done" }] } },
+      },
+    },
+  ]);
+  assert.equal(extracted.length, 2);
+  const seqStore = createStepsStore();
+  // Even if c-final arrives first and c-early arrives later with identical timestamp, higher seq wins
+  seqStore.observe("agent-seq", extracted[1].callId, extracted[1].steps, extracted[1].timestampMs, extracted[1].seq);
+  seqStore.observe("agent-seq", extracted[0].callId, extracted[0].steps, extracted[0].timestampMs, extracted[0].seq);
+  assert.equal(seqStore.getLatest("agent-seq")?.callId, "c-final");
+  assert.equal(seqStore.getLatest("agent-seq")?.steps[0]?.status, "done");
 });

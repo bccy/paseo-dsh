@@ -24,12 +24,22 @@ import {
   type AccountSummary,
   type ModelFamily,
   type OrchestratorState,
+  type StepEntry,
 } from "../../shared/antigravity/contracts";
+import { STEPS_SEEN_METADATA_KEY } from "../../shared/pill-metadata";
 import { CornerRingIcon } from "../corner-ring";
 import { subscribeLocale } from "../locale";
+import { createSeenMetadataStore } from "../seen-metadata";
 import { displayLabel } from "./labels";
 import { errorMessage, translateAntigravity } from "./messages";
 import { resolvePresets, shortModelLabel } from "./orchestrator";
+import {
+  extractStepsFromTimelineEntries,
+  stepsAllDoneSignature,
+  summarizeSteps,
+  type StepsPillIconState,
+  type StepsStore,
+} from "./stepsModel";
 
 type AgentRow = {
   id: string;
@@ -61,6 +71,16 @@ type MakeSubagentPopover = (
   agentId: string,
   workspaceId: string | null | undefined,
 ) => ComponentType<PluginButtonContentProps>;
+type MakeStepsPopover = (
+  agentId: string,
+  onClosed: (steps: readonly StepEntry[] | null) => void,
+  onOpen?: () => void,
+) => ComponentType<PluginButtonContentProps>;
+
+export interface ObserveAgentsSteps {
+  readonly store: StepsStore;
+  readonly makePopover: MakeStepsPopover;
+}
 
 type SubagentPillIconState = "running" | "failed" | "idle";
 type SubagentCount = { total: number; running: number; failed: number };
@@ -68,6 +88,13 @@ type SubagentCount = { total: number; running: number; failed: number };
 interface SubagentPillEntry {
   readonly registration: PluginButtonRegistration<PluginText>;
   iconState: SubagentPillIconState;
+  label: string;
+  title: string;
+}
+
+interface StepsPillEntry {
+  readonly registration: PluginButtonRegistration<PluginText>;
+  iconState: StepsPillIconState;
   label: string;
   title: string;
 }
@@ -113,6 +140,53 @@ const SUBAGENT_PILL_ICONS: Record<SubagentPillIconState, ComponentType<PluginBut
   idle: SubagentIdleIcon,
 };
 
+function StepsRunningIcon({ size, theme }: PluginButtonIconProps) {
+  return createElement(CornerRingIcon, {
+    name: "ListChecks",
+    size,
+    color: theme.colors.foregroundMuted,
+    running: true,
+    theme,
+  });
+}
+
+function StepsFailedIcon({ size, theme }: PluginButtonIconProps) {
+  return createElement(CornerRingIcon, {
+    name: "ListChecks",
+    size,
+    color: theme.colors.statusDanger,
+    running: false,
+    theme,
+  });
+}
+
+function StepsCompleteIcon({ size, theme }: PluginButtonIconProps) {
+  return createElement(CornerRingIcon, {
+    name: "CircleCheck",
+    size,
+    color: theme.colors.statusSuccess,
+    running: false,
+    theme,
+  });
+}
+
+function StepsIdleIcon({ size, theme }: PluginButtonIconProps) {
+  return createElement(CornerRingIcon, {
+    name: "ListChecks",
+    size,
+    color: theme.colors.foregroundMuted,
+    running: false,
+    theme,
+  });
+}
+
+const STEPS_PILL_ICONS: Record<StepsPillIconState, ComponentType<PluginButtonIconProps>> = {
+  running: StepsRunningIcon,
+  failed: StepsFailedIcon,
+  complete: StepsCompleteIcon,
+  idle: StepsIdleIcon,
+};
+
 /** An empty icon that keeps menu labels aligned with the checked one. */
 const BLANK_ICON = {
   svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M0 0h24v24H0z" fill="none"/></svg>',
@@ -139,14 +213,26 @@ export function observeAgents(
   openSubagents: OpenSubagents,
   makeSubagentPopover?: MakeSubagentPopover,
   navigation?: ObserveAgentsNavigation,
+  steps?: ObserveAgentsSteps,
 ) {
   const lifetime = new AbortController();
   const agents = new Map<string, ObservedAgent>();
   const accountPills = new Map<string, PluginButtonRegistration<PluginText>>();
   const subagentPills = new Map<string, SubagentPillEntry>();
+  const stepsPills = new Map<string, StepsPillEntry>();
   const orchestratorPills = new Map<string, PluginButtonRegistration<PluginText>>();
   const subagentCounts = new Map<string, SubagentCount>();
   const lastPolledAt = new Map<string, number>();
+  const stepsSeen = createSeenMetadataStore(
+    {
+      write: (agentId, signature) =>
+        client.paseo.agents.ref(agentId).setMetadata({ [STEPS_SEEN_METADATA_KEY]: signature }),
+      onError: (message, error) => {
+        console.warn(`[dsh-paseo:antigravity] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+      },
+    },
+    STEPS_SEEN_METADATA_KEY,
+  );
   let orchestrator: OrchestratorState | undefined;
   const listeners = new Set<() => void>();
   const presenters = new Map<symbol, ToastApi>();
@@ -325,6 +411,110 @@ export function observeAgents(
     });
     subagentPills.set(agent.id, { registration, iconState, label, title });
   }
+
+  // ---- Tasks (`update_steps`) pill ----------------------------------------------------------
+
+  const syncingSteps = new Set<string>();
+  async function syncStepsFromTimeline(agentId: string) {
+    if (!steps || lifetime.signal.aborted || syncingSteps.has(agentId)) return;
+    const agentsApi = client.paseo?.agents;
+    if (!agentsApi || typeof agentsApi.ref !== "function") return;
+    syncingSteps.add(agentId);
+    try {
+      const result = await agentsApi.ref(agentId).timeline.refetch({ direction: "tail", limit: 80 });
+      if (lifetime.signal.aborted || !Array.isArray(result?.entries)) return;
+      const found = extractStepsFromTimelineEntries(result.entries);
+      for (const entry of found) {
+        steps.store.observe(agentId, entry.callId, entry.steps, entry.timestampMs, entry.seq);
+      }
+    } catch {
+      /* timeline refetch can fail while reconnecting or on older hosts; mounted rows still feed the store */
+    } finally {
+      syncingSteps.delete(agentId);
+    }
+  }
+
+  function renderStepsPill(agent: ObservedAgent) {
+    if (!steps || !agent.workspace) {
+      stepsPills.get(agent.id)?.registration.remove();
+      stepsPills.delete(agent.id);
+      return;
+    }
+    const snapshot = steps.store.getLatest(agent.id);
+    if (!snapshot || snapshot.steps.length === 0) {
+      stepsPills.get(agent.id)?.registration.remove();
+      stepsPills.delete(agent.id);
+      return;
+    }
+    const summary = summarizeSteps(snapshot.steps);
+    const doneSig = stepsAllDoneSignature(snapshot.steps);
+    if (doneSig !== undefined && stepsSeen.get(agent.id) === doneSig) {
+      stepsPills.get(agent.id)?.registration.remove();
+      stepsPills.delete(agent.id);
+      return;
+    }
+    const iconState = summary.pillState;
+    const title = translateAntigravity("tasks.title");
+    const label =
+      summary.failed > 0
+        ? translateAntigravity("tasks.pillFailed", {
+            done: summary.done,
+            total: summary.total,
+            failed: summary.failed,
+          })
+        : translateAntigravity("tasks.pillProgress", {
+            done: summary.done,
+            total: summary.total,
+          });
+    const entry = stepsPills.get(agent.id);
+    if (entry) {
+      if (entry.iconState === iconState && entry.label === label && entry.title === title) {
+        return;
+      }
+      const patch: Partial<PluginButton<PluginText>> = { label, title };
+      if (entry.iconState !== iconState) patch.icon = STEPS_PILL_ICONS[iconState];
+      entry.registration.update(patch);
+      entry.iconState = iconState;
+      entry.label = label;
+      entry.title = title;
+      return;
+    }
+    const registration = client.addComposerPill({
+      id: "tasks",
+      agentId: agent.id,
+      workspaceId: agent.workspace,
+      button: {
+        icon: STEPS_PILL_ICONS[iconState],
+        title,
+        label,
+        behavior: {
+          kind: "popover",
+          Content: steps.makePopover(
+            agent.id,
+            (closedSteps) => {
+              if (stepsPills.get(agent.id)?.registration !== registration) return;
+              if (!closedSteps) return;
+              const closedSig = stepsAllDoneSignature(closedSteps);
+              if (closedSig === undefined) return;
+              stepsSeen.remember(agent.id, closedSig);
+              const latestAgent = agents.get(agent.id);
+              if (latestAgent) renderStepsPill(latestAgent);
+            },
+            () => {
+              void syncStepsFromTimeline(agent.id);
+            },
+          ),
+        },
+      },
+    });
+    stepsPills.set(agent.id, { registration, iconState, label, title });
+  }
+
+  const unsubscribeSteps = steps?.store.subscribe((agentId) => {
+    if (lifetime.signal.aborted) return;
+    const agent = agents.get(agentId);
+    if (agent) renderStepsPill(agent);
+  });
 
   // ---- Orchestrator pill --------------------------------------------------------------------
 
@@ -596,15 +786,19 @@ export function observeAgents(
     accountPills.delete(id);
     subagentPills.get(id)?.registration.remove();
     subagentPills.delete(id);
+    stepsPills.get(id)?.registration.remove();
+    stepsPills.delete(id);
     orchestratorPills.get(id)?.remove();
     orchestratorPills.delete(id);
     subagentCounts.delete(id);
     lastPolledAt.delete(id);
+    steps?.store.deleteAgent(id);
     agents.delete(id);
   }
 
   function upsert(row: AgentRow) {
     if (row.archivedAt || !isAntigravityProvider(row.provider)) return remove(row.id);
+    const seenChanged = stepsSeen.observe({ id: row.id, metadata: row.metadata ?? undefined });
     const member: ObservedAgent = {
       id: row.id,
       workspace: row.workspaceId ?? null,
@@ -614,10 +808,11 @@ export function observeAgents(
       title: row.title ?? null,
     };
     const old = agents.get(row.id);
-    // A status change usually means a turn started or ended: subagent counts may change then.
+    // A status change usually means a turn started or ended: subagent counts and task checklists may change then.
     if (!old || old.running !== member.running) {
       lastPolledAt.delete(row.id);
       pollSoon();
+      void syncStepsFromTimeline(row.id);
     }
     if (
       old &&
@@ -627,12 +822,14 @@ export function observeAgents(
       old.model === member.model &&
       old.title === member.title
     ) {
+      if (seenChanged) renderStepsPill(member);
       return;
     }
     if (old && old.workspace !== member.workspace) remove(row.id);
     agents.set(row.id, member);
     renderAccountPill(member);
     renderSubagentPill(member);
+    renderStepsPill(member);
     renderOrchestratorPill(member);
   }
 
@@ -801,6 +998,7 @@ export function observeAgents(
     agents.forEach((agent) => {
       renderAccountPill(agent);
       renderSubagentPill(agent);
+      renderStepsPill(agent);
       renderOrchestratorPill(agent);
     });
     const prevAccount = slashAccount;
@@ -834,6 +1032,7 @@ export function observeAgents(
     stop() {
       lifetime.abort();
       unsubscribeLocale();
+      unsubscribeSteps?.();
       clearTimeout(retry);
       clearTimeout(reconnect);
       clearTimeout(soon);
@@ -843,9 +1042,11 @@ export function observeAgents(
       void slashOrchestrator();
       accountPills.forEach((pill) => pill.remove());
       subagentPills.forEach((entry) => entry.registration.remove());
+      stepsPills.forEach((entry) => entry.registration.remove());
       orchestratorPills.forEach((pill) => pill.remove());
       accountPills.clear();
       subagentPills.clear();
+      stepsPills.clear();
       orchestratorPills.clear();
       subagentCounts.clear();
       lastPolledAt.clear();

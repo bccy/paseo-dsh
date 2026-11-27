@@ -48,6 +48,12 @@ export const GOAL_SEEN_METADATA_KEY = "dsh.goalSeen";
  */
 export const TEAM_SEEN_METADATA_KEY = "dsh.teamSeen";
 
+/**
+ * The Antigravity tasks pill's key: the all-done checklist signature whose panel
+ * the user opened and confirmed closed (`client/antigravity/stepsModel`).
+ */
+export const STEPS_SEEN_METADATA_KEY = "dsh.agStepsSeen";
+
 /** The metadata patch that stores one signature, ready for `setMetadata`. */
 export function seenMetadataPatch(key: string, signature: string): Record<string, string> {
   return { [key]: signature };

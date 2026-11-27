@@ -5,9 +5,11 @@ import type {
 } from "@getpaseo/plugin/client";
 import {
   ASK_QUESTION_TIMELINE_KIND,
+  STEPS_TIMELINE_KIND,
   SUBAGENT_LIST_TIMELINE_KIND,
   SUBAGENT_TIMELINE_KIND,
   type AskQuestionCard,
+  type StepsCard,
   type SubagentCard,
   type SubagentCheck,
 } from "../../shared/antigravity/contracts";
@@ -17,6 +19,7 @@ import {
   normalizeEchoText,
   parseAskQuestions,
 } from "./questionModel";
+import { parseUpdateSteps } from "./stepsModel";
 
 export type ToolCallTimelineItem = Parameters<
   PluginTimelineTransformerContribution<"tool_call">["transform"]
@@ -456,6 +459,16 @@ export function createAntigravityTimelineTransforms(): AntigravityTimelineTransf
         status,
       };
       return { items: [{ type: "plugin", kind: ASK_QUESTION_TIMELINE_KIND, version: 1, data }] };
+    }
+    if (item.name === "update_steps" && item.detail.type === "unknown") {
+      const steps = parseUpdateSteps(item.detail.input);
+      if (!steps) return undefined;
+      const data: StepsCard = {
+        callId: item.callId,
+        steps,
+        status,
+      };
+      return { items: [{ type: "plugin", kind: STEPS_TIMELINE_KIND, version: 1, data }] };
     }
     return undefined;
   }

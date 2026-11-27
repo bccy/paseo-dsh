@@ -8,11 +8,13 @@ import { createElement, useSyncExternalStore, type ComponentType } from "react";
 import {
   ASK_QUESTION_TIMELINE_KIND,
   FALLBACK_TIMELINE_KIND,
+  STEPS_TIMELINE_KIND,
   SUBAGENT_LIST_TIMELINE_KIND,
   SUBAGENT_TIMELINE_KIND,
   askQuestionCardSchema,
   fallbackEventSchema,
   refreshAccountsRpc,
+  stepsCardSchema,
   subagentCardSchema,
   subagentCheckSchema,
 } from "../../shared/antigravity/contracts";
@@ -23,6 +25,8 @@ import { ComposerAccount } from "./composer";
 import { errorMessage, translateAntigravity, useAntigravityTranslation } from "./messages";
 import { AskQuestionRow } from "./questions";
 import { QuotaSidebarItem } from "./sidebar";
+import { createStepsViews } from "./steps";
+import { createStepsStore } from "./stepsModel";
 import { SUBAGENT_PANEL_ID, SUBAGENT_SCREEN_ID, createSubagentViews } from "./subagents";
 import { FallbackNote } from "./timeline";
 import {
@@ -138,10 +142,21 @@ export function contributeAntigravityClient(
   }
 
   const subagents = createSubagentViews(client);
-  const observation = observeAgents(client, subagents.open, subagents.makePopover, {
-    consoleScreenId: opts.consoleScreenId,
-    onOpenAntigravityTab: onOpenAntigravity,
-  });
+  const stepsStore = createStepsStore();
+  const stepsViews = createStepsViews(stepsStore);
+  const observation = observeAgents(
+    client,
+    subagents.open,
+    subagents.makePopover,
+    {
+      consoleScreenId: opts.consoleScreenId,
+      onOpenAntigravityTab: onOpenAntigravity,
+    },
+    {
+      store: stepsStore,
+      makePopover: stepsViews.makePopover,
+    },
+  );
   const transforms = createAntigravityTimelineTransforms();
 
   function AntigravityTab(props: AntigravityTabProps) {
@@ -244,6 +259,12 @@ export function contributeAntigravityClient(
       schema: askQuestionCardSchema,
       Component: AskQuestionRow,
     }),
+    client.addTimelineRenderer({
+      kind: STEPS_TIMELINE_KIND,
+      version: 1,
+      schema: stepsCardSchema,
+      Component: stepsViews.StepsTimelineRow,
+    }),
     transforms.registerEchoTransform(client),
     registerLiveTitle(
       "antigravity subagents screen title refresh",
@@ -259,6 +280,7 @@ export function contributeAntigravityClient(
 
   function dispose() {
     observation.stop();
+    stepsStore.clear();
     visibilityListeners.clear();
     for (const remove of cleanups) {
       void remove();
