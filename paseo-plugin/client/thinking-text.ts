@@ -222,8 +222,40 @@ export function countCodePoints(text: string): number {
 
 /** Width (code points) of the soft front-to-back emergence wave in expanded thinking body. */
 export const EXPANDED_BLOOM_WAVE_WIDTH = 24;
+/** Soft front-to-back wave width (code points) for live assistant reply emergence. */
+export const ASSISTANT_BLOOM_WAVE_WIDTH = 16;
 /** Transparent lookahead characters pre-placed in layout so whole sentences/paragraphs emerge without wrap jitter. */
 export const EXPANDED_BLOOM_LOOKAHEAD_CHARS = 48;
+/** Maximum age (ms) of a row timestamp to still be considered a freshly opening live reply. */
+export const ASSISTANT_BLOOM_FRESH_MOUNT_MS = 5000;
+/**
+ * Maximum initial code-point count on mount that still blooms from char 0.
+ * A live streaming reply's opening delta is typically 1–80 chars, whereas a
+ * replayed/reloaded full reply arrives as hundreds of characters on mount.
+ */
+export const ASSISTANT_BLOOM_FRESH_MOUNT_MAX_CP = 96;
+
+/**
+ * Decides whether a mounting `AssistantMessageBloom` row represents a freshly
+ * opening live stream (bloom from char 0) versus an already-populated reply
+ * arriving on conversation reload / session replay (render settled immediately
+ * and only bloom newly appended tokens thereafter).
+ */
+export function shouldStartAssistantBloomFromZero(input: {
+  readonly phase: "streaming" | "complete";
+  readonly totalCp: number;
+  readonly rowTimestampMs: number;
+  readonly nowMs?: number;
+}): boolean {
+  if (input.phase !== "streaming" || input.totalCp <= 0) return false;
+  if (input.totalCp > ASSISTANT_BLOOM_FRESH_MOUNT_MAX_CP) return false;
+  const now = input.nowMs ?? Date.now();
+  if (Number.isFinite(input.rowTimestampMs) && input.rowTimestampMs > 0) {
+    const ageMs = now - input.rowTimestampMs;
+    if (ageMs > ASSISTANT_BLOOM_FRESH_MOUNT_MS) return false;
+  }
+  return true;
+}
 
 /**
  * Advance the floating-point code-point wave front for expanded thinking body
@@ -247,6 +279,35 @@ export function advanceExpandedInkCursor(
     unread > 0
       ? Math.min(42, 14 + unread * 0.28)
       : Math.max(18, waveWidth / 0.78);
+  return Math.min(settledTarget, current + (charsPerSec * clampedDt) / 1000);
+}
+
+/**
+ * Responsive backlog-adaptive emergence cursor for live assistant replies.
+ *
+ * Unlike `advanceExpandedInkCursor` (capped at 42 chars/sec for calm thinking),
+ * assistant replies stream at 80–260+ chars/sec. Draining backlog over a short
+ * ~260ms horizon (38–280 chars/sec) keeps the soft 16-char mist frontier
+ * visibly flowing while tracking the model's real pace closely, so handoff to
+ * native `<Markdown>` at turn completion never jumps hundreds of characters.
+ */
+export function advanceAssistantBloomCursor(
+  current: number,
+  target: number,
+  dtMs: number,
+  waveWidth = ASSISTANT_BLOOM_WAVE_WIDTH,
+): number {
+  if (!Number.isFinite(target) || target <= 0) return 0;
+  const settledTarget = target + waveWidth;
+  if (!Number.isFinite(current) || current < 0) return 0;
+  if (current >= settledTarget) return settledTarget;
+  if (!Number.isFinite(dtMs) || dtMs <= 0) return current;
+  const clampedDt = Math.min(dtMs, 40);
+  const unread = Math.max(0, target - current);
+  const charsPerSec =
+    unread > 0
+      ? Math.min(280, Math.max(38, 38 + unread / 0.26))
+      : Math.max(48, waveWidth / 0.28);
   return Math.min(settledTarget, current + (charsPerSec * clampedDt) / 1000);
 }
 

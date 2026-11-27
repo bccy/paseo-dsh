@@ -928,4 +928,35 @@ test("client/thinking-text.ts left-scroll stream normalizer and adaptive cursor 
   );
   assert.ok(styledBloom.some((s) => s.kind === "bold" && s.alpha > 0 && s.alpha < 1));
   assert.ok(styledBloom.some((s) => s.alpha === 0), "upcoming glyphs pre-placed invisibly");
+
+  // Responsive assistant bloom velocity & reload/replay fresh-mount guard
+  const {
+    ASSISTANT_BLOOM_WAVE_WIDTH,
+    advanceAssistantBloomCursor,
+    shouldStartAssistantBloomFromZero,
+  } = require("../client/thinking-text.ts");
+  const nowMs = 1_700_000_000_000;
+  assert.equal(
+    shouldStartAssistantBloomFromZero({ phase: "streaming", totalCp: 24, rowTimestampMs: nowMs - 800, nowMs }),
+    true,
+    "fresh opening streaming delta blooms from char 0",
+  );
+  assert.equal(
+    shouldStartAssistantBloomFromZero({ phase: "streaming", totalCp: 420, rowTimestampMs: nowMs - 500, nowMs }),
+    false,
+    "large pre-filled reply on reload renders settled immediately",
+  );
+  assert.equal(
+    shouldStartAssistantBloomFromZero({ phase: "streaming", totalCp: 30, rowTimestampMs: nowMs - 12_000, nowMs }),
+    false,
+    "replayed reply with stale timestamp renders settled immediately",
+  );
+  assert.equal(
+    shouldStartAssistantBloomFromZero({ phase: "complete", totalCp: 24, rowTimestampMs: nowMs - 200, nowMs }),
+    false,
+  );
+  const replyTrickle = advanceAssistantBloomCursor(0, 10, 16, ASSISTANT_BLOOM_WAVE_WIDTH);
+  const replyBurst = advanceAssistantBloomCursor(0, 300, 16, ASSISTANT_BLOOM_WAVE_WIDTH);
+  assert.ok(replyTrickle > 0.5 && replyTrickle < 2.0, `expected smooth trickle step, got ${replyTrickle}`);
+  assert.ok(replyBurst > 3.5 && replyBurst <= 4.6, `expected responsive burst drain ~280 chars/sec, got ${replyBurst}`);
 });

@@ -277,7 +277,11 @@ function buildContributions(client: PluginClientContext): () => void {
     Component: InlineThinking,
   });
 
-  // Global smooth block-emergence for live assistant replies across all providers.
+  // Global smooth block-emergence for live streaming assistant replies across
+  // all providers. Only transforms `phase === "streaming"`: once settled
+  // (`phase === "complete"`), returning `undefined` hands the row back to
+  // Paseo's native `assistant_message` renderer so the completed-turn footer
+  // (Copy result, Fork to new tab, turn timing), ChatFind, and 32k cap stay intact.
   // Registered after `antigravity-ask-question-echo` so echo suppression keeps
   // first precedence, and skips standalone markdown image messages so Paseo's
   // built-in image renderer handles tool-emitted images untouched.
@@ -285,6 +289,7 @@ function buildContributions(client: PluginClientContext): () => void {
     id: "dsh-assistant-bloom",
     query: { itemType: "assistant_message" },
     transform: ({ item, phase }) => {
+      if (phase !== "streaming") return undefined;
       if (isStandaloneMarkdownImage(item.text)) return undefined;
       return {
         items: [

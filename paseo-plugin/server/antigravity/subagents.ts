@@ -1130,16 +1130,28 @@ export class SubagentReader {
   async counts(
     paseo: PaseoApi,
     agentIds: readonly string[],
-  ): Promise<Record<string, { total: number; running: number; failed: number }>> {
-    const result: Record<string, { total: number; running: number; failed: number }> = {};
+  ): Promise<
+    Record<
+      string,
+      { total: number; running: number; failed: number; settledIds: string[]; failedIds: string[] }
+    >
+  > {
+    const result: Record<
+      string,
+      { total: number; running: number; failed: number; settledIds: string[]; failedIds: string[] }
+    > = {};
     await Promise.all(
       [...new Set(agentIds)].map(async (agentId) => {
         const list = await this.list(paseo, agentId).catch(() => null);
         if (!list) return;
+        const settled = list.subagents.filter((subagent) => subagent.state !== "running");
+        const failed = settled.filter((subagent) => subagent.state === "failed");
         result[agentId] = {
           total: list.subagents.length,
-          running: list.subagents.filter((subagent) => subagent.state === "running").length,
-          failed: list.subagents.filter((subagent) => subagent.state === "failed").length,
+          running: list.subagents.length - settled.length,
+          failed: failed.length,
+          settledIds: settled.map((subagent) => subagent.id),
+          failedIds: failed.map((subagent) => subagent.id),
         };
       }),
     );

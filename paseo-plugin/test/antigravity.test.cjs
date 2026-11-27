@@ -809,6 +809,20 @@ test("index.client.tsx dsh-inline-tool runs Antigravity transformToolCall BEFORE
     });
     assert.equal(dshResult.items[0].kind, "dsh-tool");
     assert.equal(dshResult.items[0].data.name, "bash");
+
+    // Assistant bloom only intercepts streaming replies so completed turns keep Paseo's native Copy/Fork footer
+    const bloomTx = transformers.get("dsh-assistant-bloom");
+    assert.ok(bloomTx, "dsh-assistant-bloom transformer registered");
+    const streamingBloom = bloomTx.transform({
+      phase: "streaming",
+      item: { type: "assistant_message", text: "Hello streaming" },
+    });
+    assert.equal(streamingBloom?.items[0]?.kind, "dsh-assistant-bloom");
+    const completedBloom = bloomTx.transform({
+      phase: "complete",
+      item: { type: "assistant_message", text: "Hello completed" },
+    });
+    assert.equal(completedBloom, undefined);
   } finally {
     cleanup?.();
     Module._load = originalLoad;
@@ -1630,14 +1644,14 @@ test("SubagentReader discovers swarm workers + subagents from members.json, suba
   agContracts.subagentDetailSchema.parse(uiDetail);
   assert.equal(uiDetail.report, "@coordinator [done] Popover ready and tested");
 
-  // Counts include total, running, and failed
+  // Counts include total, running, failed, settledIds, and failedIds
   const counts = await reader.counts({}, ["agent-1"]);
   agContracts.subagentCountsRpc.output.parse({ counts });
-  assert.deepEqual(counts["agent-1"], {
-    total: 9,
-    running: 1,
-    failed: 1,
-  });
+  assert.equal(counts["agent-1"].total, 9);
+  assert.equal(counts["agent-1"].running, 1);
+  assert.equal(counts["agent-1"].failed, 1);
+  assert.equal(counts["agent-1"].settledIds.length, 8);
+  assert.deepEqual(counts["agent-1"].failedIds, ["66666666-6666-4666-8666-666666666666"]);
 
   // Backward-compatibility check: counts schema defaults missing `failed` to 0
   const parsedLegacyCounts = agContracts.subagentCountsRpc.output.parse({
@@ -1943,6 +1957,7 @@ test("translateAntigravity syncs with setLanguageOverride, pluralizes _zero/_one
   assert.equal(translateAntigravity("subagents.steps", { count: 1 }), "1 步");
   assert.equal(translateAntigravity("subagents.steps", { count: 5 }), "5 步");
   assert.equal(translateAntigravity("switched", { label: "工作" }), "已切换到「工作」");
+  assert.equal(translateAntigravity("switchingNow", { label: "工作" }), "已切换账号为「工作」，正在重载对话…");
 
   // en override
   setLanguageOverride("en");
@@ -1957,6 +1972,7 @@ test("translateAntigravity syncs with setLanguageOverride, pluralizes _zero/_one
   assert.equal(translateAntigravity("subagents.steps", { count: 1 }), "1 step");
   assert.equal(translateAntigravity("subagents.steps", { count: 5 }), "5 steps");
   assert.equal(translateAntigravity("switched", { label: "Work" }), "Switched to “Work”");
+  assert.equal(translateAntigravity("switchingNow", { label: "Work" }), "Switched to “Work”, reloading conversation…");
 
   // Explicit localeOverride parameter + missing param placeholder preservation + missing key fallback
   assert.equal(translateAntigravity("subagents.pill", undefined, "zh-CN"), "智能体");
@@ -3621,4 +3637,162 @@ test("Antigravity update_steps model, chronological StepsStore, and tool_call tr
   seqStore.observe("agent-seq", extracted[0].callId, extracted[0].steps, extracted[0].timestampMs, extracted[0].seq);
   assert.equal(seqStore.getLatest("agent-seq")?.callId, "c-final");
   assert.equal(seqStore.getLatest("agent-seq")?.steps[0]?.status, "done");
+});
+
+test("extractGeminiQuota returns only Gemini 5h and weekly active buckets", () => {
+  const { extractGeminiQuota } = require("../client/antigravity/accountQuota.ts");
+
+  assert.equal(extractGeminiQuota(null), null);
+  assert.equal(extractGeminiQuota([]), null);
+  // Non-Gemini groups (e.g. Claude/GPT or Argon) must NOT be returned
+  assert.equal(
+    extractGeminiQuota([
+      {
+        name: "Claude and GPT models",
+        buckets: [
+          { id: "c5", name: "5h", window: "5h", remainingFraction: 0.9, resetTime: null, disabled: false },
+          { id: "cw", name: "weekly", window: "weekly", remainingFraction: 0.7, resetTime: null, disabled: false },
+        ],
+      },
+      {
+        name: "Gemini Argon",
+        buckets: [
+          { id: "a5", name: "5h", window: "5h", remainingFraction: 0.5, resetTime: null, disabled: false },
+        ],
+      },
+    ]),
+    null,
+  );
+
+  // Picks Gemini 5h and weekly while skipping disabled buckets
+  const res = extractGeminiQuota([
+    {
+      name: "Claude and GPT models",
+      buckets: [{ id: "c5", name: "5h", window: "5h", remainingFraction: 0.1, resetTime: null, disabled: false }],
+    },
+    {
+      name: "Gemini models",
+      buckets: [
+        { id: "g5-off", name: "5h", window: "5h", remainingFraction: 0.2, resetTime: null, disabled: true },
+        { id: "g5", name: "5h", window: "5h", remainingFraction: 0.82, resetTime: null, disabled: false },
+        { id: "gw", name: "weekly", window: "weekly", remainingFraction: 0.64, resetTime: null, disabled: false },
+      ],
+    },
+  ]);
+  assert.equal(res?.fiveHour?.id, "g5");
+  assert.equal(res?.fiveHour?.remainingFraction, 0.82);
+  assert.equal(res?.weekly?.id, "gw");
+  assert.equal(res?.weekly?.remainingFraction, 0.64);
+});
+
+test("subagentsArchive persists non-destructively, never hides running workers, bounds size, and updates effective counts", async () => {
+  const { SUBAGENTS_ARCHIVED_METADATA_KEY } = require("../shared/pill-metadata.ts");
+  const {
+    MAX_ARCHIVED_SUBAGENT_IDS,
+    archivedSubagentsFromMetadata,
+    archiveSubagentIds,
+    createSubagentsArchiveStore,
+    effectiveSubagentCount,
+    isSubagentArchived,
+    partitionSubagents,
+    serializeArchivedSubagents,
+    unarchiveSubagentId,
+  } = require("../client/antigravity/subagentsArchive.ts");
+
+  // Parsing untrusted metadata
+  assert.equal(archivedSubagentsFromMetadata(null).size, 0);
+  assert.equal(archivedSubagentsFromMetadata({ [SUBAGENTS_ARCHIVED_METADATA_KEY]: 123 }).size, 0);
+  assert.deepEqual(
+    [...archivedSubagentsFromMetadata({ [SUBAGENTS_ARCHIVED_METADATA_KEY]: " a1 , a2, , a1 " })],
+    ["a1", "a2"],
+  );
+
+  // Deduplication and bounding to latest MAX_ARCHIVED_SUBAGENT_IDS
+  const many = Array.from({ length: MAX_ARCHIVED_SUBAGENT_IDS + 5 }, (_, i) => `id-${i}`);
+  const serialized = serializeArchivedSubagents(many);
+  const parts = serialized.split(",");
+  assert.equal(parts.length, MAX_ARCHIVED_SUBAGENT_IDS);
+  assert.equal(parts[0], "id-5");
+  assert.equal(parts[parts.length - 1], `id-${MAX_ARCHIVED_SUBAGENT_IDS + 4}`);
+
+  // Running subagents/swarm workers are never treated as archived
+  const archivedSet = new Set(["s-run", "s-done", "s-fail"]);
+  assert.equal(isSubagentArchived({ id: "s-run", state: "running" }, archivedSet), false);
+  assert.equal(isSubagentArchived({ id: "s-done", state: "done" }, archivedSet), true);
+  assert.equal(isSubagentArchived({ id: "s-fail", state: "failed" }, archivedSet), true);
+
+  const parted = partitionSubagents(
+    [
+      { id: "s-run", state: "running" },
+      { id: "s-done", state: "done" },
+      { id: "s-fail", state: "failed" },
+      { id: "s-keep", state: "done" },
+    ],
+    archivedSet,
+  );
+  assert.deepEqual(parted.live.map((s) => s.id), ["s-run"]);
+  assert.deepEqual(parted.settled.map((s) => s.id), ["s-keep"]);
+  assert.deepEqual(parted.archivedList.map((s) => s.id), ["s-done", "s-fail"]);
+
+  // Effective pill counts hide archived settled/failed items and drop to 0 when all settled are archived
+  assert.deepEqual(
+    effectiveSubagentCount(
+      { total: 3, running: 0, failed: 1, settledIds: ["s-done", "s-fail", "s-keep"], failedIds: ["s-fail"] },
+      new Set(["s-done", "s-fail"]),
+    ),
+    { total: 1, running: 0, failed: 0 },
+  );
+  assert.deepEqual(
+    effectiveSubagentCount(
+      { total: 2, running: 0, failed: 1, settledIds: ["s-done", "s-fail"], failedIds: ["s-fail"] },
+      new Set(["s-done", "s-fail"]),
+    ),
+    { total: 0, running: 0, failed: 0 },
+  );
+  // Running items keep pill visible even if settled are all archived
+  assert.deepEqual(
+    effectiveSubagentCount(
+      { total: 2, running: 1, failed: 0, settledIds: ["s-done"], failedIds: [] },
+      new Set(["s-done"]),
+    ),
+    { total: 1, running: 1, failed: 0 },
+  );
+
+  // Store optimistic archive/unarchive + remote observe without clobbering optimistic state
+  const writes = [];
+  const store = createSubagentsArchiveStore({
+    write: async (agentId, raw) => {
+      writes.push({ agentId, raw });
+    },
+  });
+  let notifications = 0;
+  const unsub = store.subscribe(() => {
+    notifications += 1;
+  });
+  store.observe("ag-1", { [SUBAGENTS_ARCHIVED_METADATA_KEY]: "old-1" });
+  assert.deepEqual([...store.get("ag-1")], ["old-1"]);
+
+  const afterArchive = store.archive("ag-1", ["old-2", "old-3"]);
+  assert.equal(afterArchive, "old-1,old-2,old-3");
+  assert.deepEqual([...store.get("ag-1")], ["old-1", "old-2", "old-3"]);
+
+  // Stale snapshot repeating last remote value must not overwrite optimistic state
+  assert.equal(store.observe("ag-1", { [SUBAGENTS_ARCHIVED_METADATA_KEY]: "old-1" }), false);
+  assert.deepEqual([...store.get("ag-1")], ["old-1", "old-2", "old-3"]);
+
+  const afterUnarchive = store.unarchive("ag-1", "old-2");
+  assert.equal(afterUnarchive, "old-1,old-3");
+  assert.deepEqual([...store.get("ag-1")], ["old-1", "old-3"]);
+
+  await Promise.resolve();
+  assert.deepEqual(writes, [
+    { agentId: "ag-1", raw: "old-1,old-2,old-3" },
+    { agentId: "ag-1", raw: "old-1,old-3" },
+  ]);
+  assert.ok(notifications >= 3);
+  unsub();
+
+  // Direct pure helpers
+  assert.equal(archiveSubagentIds(new Set(["a"]), ["b", "a"]), "b,a");
+  assert.equal(unarchiveSubagentId(new Set(["a", "b"]), "a"), "b");
 });

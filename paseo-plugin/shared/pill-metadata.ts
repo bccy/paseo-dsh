@@ -54,6 +54,13 @@ export const TEAM_SEEN_METADATA_KEY = "dsh.teamSeen";
  */
 export const STEPS_SEEN_METADATA_KEY = "dsh.agStepsSeen";
 
+/**
+ * The Antigravity subagents archive key: comma-separated conversation IDs of
+ * finished subagents and swarm workers manually archived by the user
+ * (`client/antigravity/subagentsArchive`).
+ */
+export const SUBAGENTS_ARCHIVED_METADATA_KEY = "dsh.agArchivedSubagents";
+
 /** The metadata patch that stores one signature, ready for `setMetadata`. */
 export function seenMetadataPatch(key: string, signature: string): Record<string, string> {
   return { [key]: signature };

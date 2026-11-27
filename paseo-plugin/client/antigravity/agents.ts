@@ -7,7 +7,7 @@ import type {
   PluginClientContext,
   PluginText,
 } from "@getpaseo/plugin/client";
-import { useToast, type ToastApi } from "@getpaseo/plugin/client/ui";
+import { useToast, type ToastApi, type ToastOptions } from "@getpaseo/plugin/client/ui";
 import { createElement, useEffect, type ComponentType } from "react";
 import {
   SYSTEM_ACCOUNT_ID,
@@ -26,10 +26,11 @@ import {
   type OrchestratorState,
   type StepEntry,
 } from "../../shared/antigravity/contracts";
-import { STEPS_SEEN_METADATA_KEY } from "../../shared/pill-metadata";
+import { STEPS_SEEN_METADATA_KEY, SUBAGENTS_ARCHIVED_METADATA_KEY } from "../../shared/pill-metadata";
 import { CornerRingIcon } from "../corner-ring";
 import { subscribeLocale } from "../locale";
 import { createSeenMetadataStore } from "../seen-metadata";
+import { makeAccountPopover } from "./accountPopover";
 import { displayLabel } from "./labels";
 import { errorMessage, translateAntigravity } from "./messages";
 import { resolvePresets, shortModelLabel } from "./orchestrator";
@@ -40,6 +41,12 @@ import {
   type StepsPillIconState,
   type StepsStore,
 } from "./stepsModel";
+import {
+  createSubagentsArchiveStore,
+  effectiveSubagentCount,
+  type RawSubagentCount,
+  type SubagentsArchiveStore,
+} from "./subagentsArchive";
 
 type AgentRow = {
   id: string;
@@ -83,7 +90,14 @@ export interface ObserveAgentsSteps {
 }
 
 type SubagentPillIconState = "running" | "failed" | "idle";
-type SubagentCount = { total: number; running: number; failed: number };
+type SubagentCount = RawSubagentCount;
+
+interface AccountPillEntry {
+  readonly registration: PluginButtonRegistration<PluginText>;
+  icon: "UserRound" | "UserX";
+  label: string;
+  title: string;
+}
 
 interface SubagentPillEntry {
   readonly registration: PluginButtonRegistration<PluginText>;
@@ -214,15 +228,25 @@ export function observeAgents(
   makeSubagentPopover?: MakeSubagentPopover,
   navigation?: ObserveAgentsNavigation,
   steps?: ObserveAgentsSteps,
+  subagentsArchive?: SubagentsArchiveStore,
 ) {
   const lifetime = new AbortController();
   const agents = new Map<string, ObservedAgent>();
-  const accountPills = new Map<string, PluginButtonRegistration<PluginText>>();
+  const accountPills = new Map<string, AccountPillEntry>();
   const subagentPills = new Map<string, SubagentPillEntry>();
   const stepsPills = new Map<string, StepsPillEntry>();
   const orchestratorPills = new Map<string, PluginButtonRegistration<PluginText>>();
   const subagentCounts = new Map<string, SubagentCount>();
   const lastPolledAt = new Map<string, number>();
+  const archiveStore =
+    subagentsArchive ??
+    createSubagentsArchiveStore({
+      write: (agentId, raw) =>
+        client.paseo.agents.ref(agentId).setMetadata({ [SUBAGENTS_ARCHIVED_METADATA_KEY]: raw }),
+      onError: (message, error) => {
+        console.warn(`[dsh-paseo:antigravity] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+      },
+    });
   const stepsSeen = createSeenMetadataStore(
     {
       write: (agentId, signature) =>
@@ -236,7 +260,8 @@ export function observeAgents(
   let orchestrator: OrchestratorState | undefined;
   const listeners = new Set<() => void>();
   const presenters = new Map<symbol, ToastApi>();
-  let pendingNotice: string | undefined;
+  type PendingNotice = { message: string; options?: ToastOptions; isError?: boolean };
+  let pendingNotice: PendingNotice | undefined;
   let counts: Counts | null = null;
   let memberSnapshot: readonly ObservedAgent[] = [];
   let workspaceSubagents: WorkspaceSubagents = new Map();
@@ -252,11 +277,18 @@ export function observeAgents(
   };
 
   // Commands have no toast API of their own; mounted plugin surfaces lend theirs.
-  function notify(message: string) {
+  function notify(
+    message: string,
+    opts?: { toast?: ToastApi; options?: ToastOptions; isError?: boolean },
+  ) {
     if (lifetime.signal.aborted) return;
-    const presenter = presenters.values().next().value;
-    if (presenter) presenter.show(message, { durationMs: 5000 });
-    else pendingNotice = message;
+    const presenter = opts?.toast ?? presenters.values().next().value;
+    if (presenter) {
+      if (opts?.isError) presenter.error(message);
+      else presenter.show(message, opts?.options);
+    } else {
+      pendingNotice = { message, options: opts?.options, isError: opts?.isError };
+    }
   }
 
   function useNotifications() {
@@ -265,8 +297,9 @@ export function observeAgents(
       const key = Symbol();
       presenters.set(key, toast);
       if (pendingNotice) {
-        notify(pendingNotice);
+        const queued = pendingNotice;
         pendingNotice = undefined;
+        notify(queued.message, { toast, options: queued.options, isError: queued.isError });
       }
       return () => {
         presenters.delete(key);
@@ -298,12 +331,27 @@ export function observeAgents(
     emit();
   }
 
-  async function switchTo(agentId: string, account: AccountSummary, when: "now" | "after-turn") {
+  async function switchTo(
+    agentId: string,
+    account: AccountSummary,
+    when: "now" | "after-turn",
+    toast?: ToastApi,
+  ) {
+    if (when === "now") {
+      notify(translateAntigravity("switchingNow", { label: nameOf(account.label, account.kind) }), {
+        toast,
+        options: { variant: "info", durationMs: 6000 },
+      });
+    }
     try {
       const result = await client.rpc(switchAgentAccountRpc, { agentId, accountId: account.id, when });
-      notify(translateAntigravity(result.result, { label: nameOf(result.accountLabel, account.kind) }));
+      const variant = result.result === "unchanged" ? "info" : "success";
+      notify(translateAntigravity(result.result, { label: nameOf(result.accountLabel, account.kind) }), {
+        toast,
+        options: { variant },
+      });
     } catch (error) {
-      notify(errorMessage(error));
+      notify(errorMessage(error), { toast, isError: true });
     }
   }
 
@@ -313,65 +361,63 @@ export function observeAgents(
     if (!agent.workspace) return;
     const current = accounts?.accounts.find((account) => account.id === agent.account);
     const healthy = !current || (current.usable && current.status !== "signed-out");
-    const choices: PluginButtonMenuEntry<PluginText>[] = (accounts?.accounts ?? []).map((account) => {
-      const selected = account.id === agent.account;
-      const unavailable = !account.usable || account.status === "signed-out";
-      const action = (when: "now" | "after-turn") => ({
-        kind: "action" as const,
-        onPress: () => switchTo(agent.id, account, when),
-      });
-      return {
-        kind: "item",
-        id: account.id,
-        title: [
-          nameOf(account.label, account.kind),
-          account.kind === "profile" && account.status === "signed-out" ? null : account.email,
-          account.plan,
-        ]
-          .filter(Boolean)
-          .join(" · "),
-        icon: selected ? "Check" : unavailable ? "UserX" : "UserRound",
-        disabled: selected || unavailable,
-        behavior: agent.running
-          ? {
-              kind: "menu",
-              items: [
-                { kind: "item", id: "now", title: translateAntigravity("now"), icon: "Zap", behavior: action("now") },
-                { kind: "item", id: "after", title: translateAntigravity("after"), icon: "Clock", behavior: action("after-turn") },
-              ],
-            }
-          : action("now"),
-      };
-    });
-    if (choices.length) choices.push({ kind: "separator", id: "separator" });
-    choices.push({
-      kind: "item",
-      id: "manage",
-      title: translateAntigravity("manage"),
-      icon: "Settings2",
-      behavior: { kind: "action", onPress: openAntigravityConsole },
-    });
-    const button: PluginButton<PluginText> = {
-      icon: healthy ? "UserRound" : "UserX",
-      title: healthy ? translateAntigravity("pill") : translateAntigravity("pillSignedOut"),
-      label: current ? nameOf(current.label, current.kind) : agent.account,
-      behavior: { kind: "menu", items: choices },
-    };
-    const pill = accountPills.get(agent.id);
-    if (pill) pill.update(button);
-    else {
-      accountPills.set(
-        agent.id,
-        client.addComposerPill({ id: "account", agentId: agent.id, workspaceId: agent.workspace, button }),
-      );
+    const icon: "UserRound" | "UserX" = healthy ? "UserRound" : "UserX";
+    const title = healthy ? translateAntigravity("pill") : translateAntigravity("pillSignedOut");
+    const label = current ? nameOf(current.label, current.kind) : agent.account;
+    const entry = accountPills.get(agent.id);
+    if (entry) {
+      if (entry.icon === icon && entry.title === title && entry.label === label) {
+        return;
+      }
+      entry.registration.update({ icon, title, label });
+      entry.icon = icon;
+      entry.title = title;
+      entry.label = label;
+      return;
     }
+    const agentId = agent.id;
+    const registration = client.addComposerPill({
+      id: "account",
+      agentId,
+      workspaceId: agent.workspace,
+      button: {
+        icon,
+        title,
+        label,
+        behavior: {
+          kind: "popover",
+          Content: makeAccountPopover({
+            agentId,
+            read: () => {
+              const live = agents.get(agentId);
+              return {
+                accounts: accounts?.accounts ?? [],
+                currentAccountId: live?.account ?? agent.account,
+                running: live?.running ?? false,
+              };
+            },
+            subscribe: (listener) => {
+              listeners.add(listener);
+              return () => {
+                listeners.delete(listener);
+              };
+            },
+            onSwitch: (targetAccount, when, toast) => {
+              void switchTo(agentId, targetAccount, when, toast);
+            },
+            onManage: openAntigravityConsole,
+          }),
+        },
+      },
+    });
+    accountPills.set(agent.id, { registration, icon, title, label });
   }
 
   // ---- Subagent pill ------------------------------------------------------------------------
 
   function renderSubagentPill(agent: ObservedAgent) {
-    const count = subagentCounts.get(agent.id);
-    if (!agent.workspace || !count?.total) {
+    const count = effectiveSubagentCount(subagentCounts.get(agent.id), archiveStore.get(agent.id));
+    if (!agent.workspace || !count.total) {
       subagentPills.get(agent.id)?.registration.remove();
       subagentPills.delete(agent.id);
       return;
@@ -700,6 +746,8 @@ export function observeAgents(
               total: found.total,
               running: found.running,
               failed: (found as { failed?: number }).failed ?? 0,
+              settledIds: found.settledIds,
+              failedIds: found.failedIds,
             });
           } else {
             subagentCounts.delete(id);
@@ -731,6 +779,7 @@ export function observeAgents(
     if (lifetime.signal.aborted || (accounts && accounts.revision > next.revision)) return;
     accounts = next;
     agents.forEach(renderAccountPill);
+    emit();
     // Refresh Orchestrator model lists whenever account membership, sign-in state, or overrides change.
     const nextSignature = next.accounts
       .map((a) => `${a.id}:${a.status}:${a.email ?? ""}:${JSON.stringify(a.orchestratorOverride)}`)
@@ -782,7 +831,7 @@ export function observeAgents(
   }
 
   function remove(id: string) {
-    accountPills.get(id)?.remove();
+    accountPills.get(id)?.registration.remove();
     accountPills.delete(id);
     subagentPills.get(id)?.registration.remove();
     subagentPills.delete(id);
@@ -793,12 +842,14 @@ export function observeAgents(
     subagentCounts.delete(id);
     lastPolledAt.delete(id);
     steps?.store.deleteAgent(id);
+    archiveStore.deleteAgent(id);
     agents.delete(id);
   }
 
   function upsert(row: AgentRow) {
     if (row.archivedAt || !isAntigravityProvider(row.provider)) return remove(row.id);
     const seenChanged = stepsSeen.observe({ id: row.id, metadata: row.metadata ?? undefined });
+    const archiveChanged = archiveStore.observe(row.id, row.metadata);
     const member: ObservedAgent = {
       id: row.id,
       workspace: row.workspaceId ?? null,
@@ -823,6 +874,7 @@ export function observeAgents(
       old.title === member.title
     ) {
       if (seenChanged) renderStepsPill(member);
+      if (archiveChanged) renderSubagentPill(member);
       return;
     }
     if (old && old.workspace !== member.workspace) remove(row.id);
@@ -1011,6 +1063,11 @@ export function observeAgents(
     slashOrchestrator = registerSlashOrchestrator();
   });
 
+  const unsubscribeArchive = archiveStore.subscribe(() => {
+    if (lifetime.signal.aborted) return;
+    agents.forEach(renderSubagentPill);
+  });
+
   return {
     useNotifications,
     notify,
@@ -1033,6 +1090,7 @@ export function observeAgents(
       lifetime.abort();
       unsubscribeLocale();
       unsubscribeSteps?.();
+      unsubscribeArchive();
       clearTimeout(retry);
       clearTimeout(reconnect);
       clearTimeout(soon);
@@ -1040,7 +1098,7 @@ export function observeAgents(
       clearInterval(orchestratorTimer);
       void slashAccount();
       void slashOrchestrator();
-      accountPills.forEach((pill) => pill.remove());
+      accountPills.forEach((entry) => entry.registration.remove());
       subagentPills.forEach((entry) => entry.registration.remove());
       stepsPills.forEach((entry) => entry.registration.remove());
       orchestratorPills.forEach((pill) => pill.remove());

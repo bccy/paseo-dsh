@@ -8,7 +8,7 @@ import {
 } from "@getpaseo/plugin/client";
 import { Icon, Markdown, ScrollView, TextInput, copyText, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ComponentType, type ReactNode } from "react";
 import {
   Platform,
   Pressable,
@@ -69,16 +69,23 @@ import {
   type PopoverTheme,
 } from "../popover-ui";
 import { StatusRingMark } from "../status-ring";
+import { SUBAGENTS_ARCHIVED_METADATA_KEY } from "../../shared/pill-metadata";
 import { clockTime, duration, money, tokens, upper } from "./format";
 import { antigravityLogoSvg } from "./logo";
 import { errorMessage, useAntigravityTranslation } from "./messages";
+import {
+  createSubagentsArchiveStore,
+  isSubagentArchived,
+  partitionSubagents,
+  type SubagentsArchiveStore,
+} from "./subagentsArchive";
 import { font, mono, radius, space, tabular, tint, toneColor, type Colors, type Tone } from "./theme";
 
 export const SUBAGENT_PANEL_ID = "subagents";
 export const SUBAGENT_SCREEN_ID = "antigravity-subagents";
 
 type ShownState = SubagentState | "starting";
-type ListFilter = "all" | "running" | "failed";
+type ListFilter = "all" | "running" | "failed" | "archived";
 type ActivityFilter = "all" | "tools" | "errors";
 type HoverState = PressableStateCallbackType & { hovered?: boolean };
 
@@ -404,7 +411,28 @@ function FilterChip({
   );
 }
 
-export function createSubagentViews(client: PluginClientContext) {
+export function createSubagentViews(
+  client: PluginClientContext,
+  subagentsArchive?: SubagentsArchiveStore,
+) {
+  const archiveStore =
+    subagentsArchive ??
+    createSubagentsArchiveStore({
+      write: (agentId, raw) =>
+        client.paseo.agents.ref(agentId).setMetadata({ [SUBAGENTS_ARCHIVED_METADATA_KEY]: raw }),
+      onError: (message, error) => {
+        console.warn(`[dsh-paseo:antigravity] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+      },
+    });
+
+  function useArchivedSubagents(agentId: string): ReadonlySet<string> {
+    const metadata = useAgent(agentId, (snapshot) => snapshot.metadata);
+    useEffect(() => {
+      if (agentId) archiveStore.observe(agentId, metadata);
+    }, [agentId, metadata]);
+    return useSyncExternalStore(archiveStore.subscribe, () => archiveStore.get(agentId));
+  }
+
   function open(agentId: string, _workspaceId?: string | null, subagentId?: string) {
     if (!agentId) return;
     if (subagentId) requested.set(agentId, subagentId);
@@ -821,15 +849,18 @@ export function createSubagentViews(client: PluginClientContext) {
       const { t, locale } = useAntigravityTranslation();
       const query = useSubagents(agentId);
       const pricing = useUnifiedPricing();
+      const archived = useArchivedSubagents(agentId);
       const [selectedId, setSelectedId] = useState<string | null>(null);
       const [settledOpen, setSettledOpen] = useState<boolean | undefined>(undefined);
       const compact = layout.compact;
       const subagents = query.data?.subagents ?? [];
+      const { active, archivedList, live, settled } = useMemo(
+        () => partitionSubagents(subagents, archived),
+        [subagents, archived],
+      );
       const selected = selectedId ? subagents.find((subagent) => subagent.id === selectedId) : undefined;
-      const live = subagents.filter((subagent) => subagent.state === "running");
-      const settled = subagents.filter((subagent) => subagent.state !== "running");
-      const failedCount = subagents.filter((subagent) => subagent.state === "failed").length;
-      const doneCount = subagents.filter((subagent) => subagent.state === "done").length;
+      const failedCount = active.filter((subagent) => subagent.state === "failed").length;
+      const doneCount = active.filter((subagent) => subagent.state === "done").length;
       const headlineTitle = query.data?.swarmTitle?.trim() || t("subagents.title");
       const expanded = settledOpen ?? live.length === 0;
       const root = { ...popoverRootBox(), paddingBottom: 6 };
@@ -839,7 +870,19 @@ export function createSubagentViews(client: PluginClientContext) {
         open(agentId, workspaceId, subagentId);
       };
 
+      const handleArchiveFinished = () => {
+        if (settled.length === 0) return;
+        archiveStore.archive(
+          agentId,
+          settled.map((subagent) => subagent.id),
+        );
+        if (live.length === 0) {
+          close();
+        }
+      };
+
       if (selected) {
+        const selectedArchived = isSubagentArchived(selected, archived);
         return (
           <PopoverSubagentDetail
             theme={theme}
@@ -847,8 +890,22 @@ export function createSubagentViews(client: PluginClientContext) {
             agentId={agentId}
             summary={selected}
             pricing={pricing.data}
+            archived={selectedArchived}
             onBack={() => setSelectedId(null)}
             onOpenInTab={workspaceId ? () => handleOpenInTab(selected.id) : undefined}
+            onToggleArchive={
+              selected.state !== "running"
+                ? () => {
+                    if (selectedArchived) {
+                      archiveStore.unarchive(agentId, selected.id);
+                    } else {
+                      archiveStore.archive(agentId, [selected.id]);
+                      if (active.length <= 1) close();
+                      else setSelectedId(null);
+                    }
+                  }
+                : undefined
+            }
             onInsertReport={(text) => {
               const ok = insertIntoComposer(agentId, text);
               if (ok) close();
@@ -981,6 +1038,12 @@ export function createSubagentViews(client: PluginClientContext) {
                 {t("subagents.empty")}
               </Text>
             </View>
+          ) : active.length === 0 ? (
+            <View style={rowBox({ compact })}>
+              <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
+                {t("subagents.allArchived")}
+              </Text>
+            </View>
           ) : (
             <>
               {live.length > 0 ? (
@@ -1015,6 +1078,41 @@ export function createSubagentViews(client: PluginClientContext) {
 
           <PopoverHairline theme={theme} marginVertical={4} />
 
+          {settled.length > 0 ? (
+            <Pressable
+              onPress={handleArchiveFinished}
+              accessibilityRole="button"
+              accessibilityLabel={t("subagents.archiveFinishedCount", { count: settled.length })}
+              style={({ hovered = false, pressed }: HoverState) => {
+                const fill = rowActiveFill(hovered, pressed);
+                return [rowBox({ compact }), fill === undefined ? undefined : { backgroundColor: theme.colors[fill] }];
+              }}
+            >
+              {({ hovered = false, pressed }: HoverState) => (
+                <>
+                  <View style={{ width: MARK_BOX, height: MARK_BOX, alignItems: "center", justifyContent: "center" }}>
+                    <Icon
+                      name="Archive"
+                      size={MARK_BOX}
+                      color={theme.colors[chevronColorToken(hovered, pressed)]}
+                    />
+                  </View>
+                  <Text
+                    numberOfLines={1}
+                    style={{
+                      ...rowTextColumn(),
+                      fontSize: TITLE_FONT_SIZE,
+                      fontWeight: "500",
+                      color: theme.colors.foreground,
+                    }}
+                  >
+                    {t("subagents.archiveFinishedCount", { count: settled.length })}
+                  </Text>
+                </>
+              )}
+            </Pressable>
+          ) : null}
+
           <Pressable
             onPress={() => handleOpenInTab()}
             accessibilityRole="button"
@@ -1044,6 +1142,19 @@ export function createSubagentViews(client: PluginClientContext) {
                 >
                   {t("subagents.openPanel")}
                 </Text>
+                {archivedList.length > 0 ? (
+                  <Text
+                    numberOfLines={1}
+                    style={{
+                      ...tabular,
+                      fontSize: FACTS_FONT_SIZE,
+                      color: theme.colors.foregroundMuted,
+                      flexShrink: 0,
+                    }}
+                  >
+                    {t("subagents.archivedCount", { count: archivedList.length })}
+                  </Text>
+                ) : null}
                 <View style={{ width: CHEVRON_BOX, height: CHEVRON_BOX, alignItems: "center", justifyContent: "center" }}>
                   <Icon
                     name="ChevronRight"
@@ -1071,7 +1182,12 @@ export function createSubagentViews(client: PluginClientContext) {
     const agent = useAgent(agentId, (snapshot) => ({ provider: snapshot.provider, title: snapshot.title }));
     const antigravity = Boolean(agentId) && isAntigravityProvider(agent?.provider);
     const query = useSubagents(agentId, antigravity);
+    const archived = useArchivedSubagents(agentId);
     const list = query.data?.subagents ?? [];
+    const { active, archivedList, live, settled } = useMemo(
+      () => partitionSubagents(list, archived),
+      [list, archived],
+    );
     const swarmTitle = query.data?.swarmTitle?.trim() || null;
     const [selected, setSelected] = useState<string | null>(() => {
       if (!agentId) return null;
@@ -1096,28 +1212,36 @@ export function createSubagentViews(client: PluginClientContext) {
       setSearch("");
     }, [agentId, paramSubagentId]);
 
+    const effectiveFilter: ListFilter =
+      filter === "archived" && archivedList.length === 0
+        ? "all"
+        : filter === "all" && active.length === 0 && archivedList.length > 0
+          ? "archived"
+          : filter;
+
     const filtered = useMemo(() => {
       const q = search.trim().toLowerCase();
-      return list.filter((subagent) => {
-        if (filter === "running" && subagent.state !== "running") return false;
-        if (filter === "failed" && subagent.state !== "failed") return false;
+      const base = effectiveFilter === "archived" ? archivedList : active;
+      return base.filter((subagent) => {
+        if (effectiveFilter === "running" && subagent.state !== "running") return false;
+        if (effectiveFilter === "failed" && subagent.state !== "failed") return false;
         if (!q) return true;
         return (
           (subagent.displayName ?? "").toLowerCase().includes(q) ||
-        (subagent.role ?? "").toLowerCase().includes(q) ||
+          (subagent.role ?? "").toLowerCase().includes(q) ||
           (subagent.type ?? "").toLowerCase().includes(q) ||
           (subagentTypeLabel(subagent.type, t) ?? "").toLowerCase().includes(q) ||
           subagent.task.toLowerCase().includes(q)
         );
       });
-    }, [list, filter, search, t]);
+    }, [active, archivedList, effectiveFilter, search, t]);
 
     const current =
       filtered.find((subagent) => subagent.id === selected) ??
       list.find((subagent) => subagent.id === selected) ??
-      (layout.compact ? undefined : filtered[0] ?? list[0]);
-    const running = list.filter((subagent) => subagent.state === "running").length;
-    const failedCount = list.filter((subagent) => subagent.state === "failed").length;
+      (layout.compact ? undefined : filtered[0] ?? active[0] ?? list[0]);
+    const running = live.length;
+    const failedCount = active.filter((subagent) => subagent.state === "failed").length;
 
     const backFab = backToAgent ? (
       <Pressable
@@ -1215,18 +1339,25 @@ export function createSubagentViews(client: PluginClientContext) {
             {swarmTitle ?? t("subagents.title")}
           </Text>
           <Text style={{ ...font.small, ...tabular, color: colors.foregroundMuted, flexShrink: 0 }}>
-            {running ? t("subagents.summary", { total: list.length, running }) : t("subagents.summaryIdle", { total: list.length })}
+            {running
+              ? t("subagents.summary", { total: active.length, running })
+              : t("subagents.summaryIdle", { total: active.length })}
           </Text>
         </View>
-        {list.length > 1 ? (
+        {list.length > 1 || archivedList.length > 0 || settled.length > 0 ? (
           <>
-            <View style={{ flexDirection: "row", gap: space.xs, flexWrap: "wrap" }}>
-              <FilterChip colors={colors} label={t("subagents.filter.all")} active={filter === "all"} onPress={() => setFilter("all")} />
+            <View style={{ flexDirection: "row", alignItems: "center", gap: space.xs, flexWrap: "wrap" }}>
+              <FilterChip
+                colors={colors}
+                label={archivedList.length > 0 ? `${t("subagents.filter.all")} (${active.length})` : t("subagents.filter.all")}
+                active={effectiveFilter === "all"}
+                onPress={() => setFilter("all")}
+              />
               {running > 0 ? (
                 <FilterChip
                   colors={colors}
                   label={`${t("subagents.filter.running")} (${running})`}
-                  active={filter === "running"}
+                  active={effectiveFilter === "running"}
                   onPress={() => setFilter("running")}
                 />
               ) : null}
@@ -1234,28 +1365,66 @@ export function createSubagentViews(client: PluginClientContext) {
                 <FilterChip
                   colors={colors}
                   label={`${t("subagents.filter.failed")} (${failedCount})`}
-                  active={filter === "failed"}
+                  active={effectiveFilter === "failed"}
                   onPress={() => setFilter("failed")}
                 />
               ) : null}
+              {archivedList.length > 0 ? (
+                <FilterChip
+                  colors={colors}
+                  label={`${t("subagents.filter.archived")} (${archivedList.length})`}
+                  active={effectiveFilter === "archived"}
+                  onPress={() => setFilter("archived")}
+                />
+              ) : null}
+              {settled.length > 0 ? (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={t("subagents.archiveFinished")}
+                  onPress={() =>
+                    archiveStore.archive(
+                      agentId,
+                      settled.map((subagent) => subagent.id),
+                    )
+                  }
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 4,
+                    minHeight: 28,
+                    paddingHorizontal: space.sm,
+                    borderRadius: radius.pill,
+                    borderWidth: 1,
+                    borderColor: colors.border,
+                    backgroundColor: colors.surface1,
+                  }}
+                >
+                  <Icon name="Archive" size={12} color={colors.foregroundMuted} />
+                  <Text style={{ ...font.caption, fontWeight: "500", color: colors.foregroundMuted }}>
+                    {t("subagents.archiveFinished")}
+                  </Text>
+                </Pressable>
+              ) : null}
             </View>
-            <TextInput
-              accessibilityLabel={t("subagents.searchPlaceholder")}
-              value={search}
-              onChangeText={setSearch}
-              placeholder={t("subagents.searchPlaceholder")}
-              placeholderTextColor={tint(colors.foregroundMuted, 0.7)}
-              style={{
-                ...font.caption,
-                color: colors.foreground,
-                backgroundColor: colors.surface1,
-                borderWidth: 1,
-                borderColor: colors.border,
-                borderRadius: radius.md,
-                paddingHorizontal: space.sm + 2,
-                paddingVertical: space.xs + 2,
-              }}
-            />
+            {list.length > 1 ? (
+              <TextInput
+                accessibilityLabel={t("subagents.searchPlaceholder")}
+                value={search}
+                onChangeText={setSearch}
+                placeholder={t("subagents.searchPlaceholder")}
+                placeholderTextColor={tint(colors.foregroundMuted, 0.7)}
+                style={{
+                  ...font.caption,
+                  color: colors.foreground,
+                  backgroundColor: colors.surface1,
+                  borderWidth: 1,
+                  borderColor: colors.border,
+                  borderRadius: radius.md,
+                  paddingHorizontal: space.sm + 2,
+                  paddingVertical: space.xs + 2,
+                }}
+              />
+            ) : null}
           </>
         ) : null}
       </View>
@@ -1283,6 +1452,18 @@ export function createSubagentViews(client: PluginClientContext) {
       </ScrollView>
     );
 
+    const currentArchived = current ? isSubagentArchived(current, archived) : false;
+    const toggleCurrentArchive =
+      current && current.state !== "running"
+        ? () => {
+            if (currentArchived) {
+              archiveStore.unarchive(agentId, current.id);
+            } else {
+              archiveStore.archive(agentId, [current.id]);
+            }
+          }
+        : undefined;
+
     if (layout.compact) {
       if (current) {
         return (
@@ -1301,6 +1482,8 @@ export function createSubagentViews(client: PluginClientContext) {
               agentId={agentId}
               summary={current}
               compact
+              archived={currentArchived}
+              onToggleArchive={toggleCurrentArchive}
               onInsertReport={(text) => insertIntoComposer(agentId, text)}
             />
             {backFab}
@@ -1330,6 +1513,8 @@ export function createSubagentViews(client: PluginClientContext) {
               agentId={agentId}
               summary={current}
               compact={false}
+              archived={currentArchived}
+              onToggleArchive={toggleCurrentArchive}
               onInsertReport={(text) => insertIntoComposer(agentId, text)}
             />
           ) : (
@@ -1700,12 +1885,16 @@ function Detail({
   agentId,
   summary,
   compact,
+  archived,
+  onToggleArchive,
   onInsertReport,
 }: {
   colors: Colors;
   agentId: string;
   summary: SubagentSummary;
   compact: boolean;
+  archived?: boolean;
+  onToggleArchive?: () => void;
   onInsertReport(text: string): boolean;
 }) {
   const { t, locale } = useAntigravityTranslation();
@@ -1798,6 +1987,23 @@ function Detail({
             icon={statusBadgeIcon(summary.state, toneColor(colors, STATE_TONE[summary.state]))}
           />
           <View style={{ flex: 1 }} />
+          {onToggleArchive ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={archived ? t("subagents.unarchive") : t("subagents.archive")}
+              onPress={onToggleArchive}
+              style={{ flexDirection: "row", alignItems: "center", gap: 4, padding: space.xs }}
+            >
+              <Icon
+                name={archived ? "Undo2" : "Archive"}
+                size={14}
+                color={archived ? colors.accent : colors.foregroundMuted}
+              />
+              <Text style={{ ...font.caption, color: archived ? colors.accent : colors.foregroundMuted }}>
+                {archived ? t("subagents.unarchive") : t("subagents.archive")}
+              </Text>
+            </Pressable>
+          ) : null}
           {entries.length > 0 ? (
             <Pressable
               accessibilityRole="button"
@@ -2247,8 +2453,10 @@ function PopoverSubagentDetail({
   agentId,
   summary,
   pricing,
+  archived,
   onBack,
   onOpenInTab,
+  onToggleArchive,
   onInsertReport,
 }: {
   theme: PopoverTheme;
@@ -2256,8 +2464,10 @@ function PopoverSubagentDetail({
   agentId: string;
   summary: SubagentSummary;
   pricing?: PricingState;
+  archived?: boolean;
   onBack: () => void;
   onOpenInTab?: () => void;
+  onToggleArchive?: () => void;
   onInsertReport: (text: string) => boolean;
 }) {
   const { colors } = theme;
@@ -2358,33 +2568,74 @@ function PopoverSubagentDetail({
           )}
         </Pressable>
 
-        {onOpenInTab ? (
-          <Pressable
-            onPress={onOpenInTab}
-            accessibilityRole="button"
-            accessibilityLabel={t("subagents.openInTab")}
-            style={({ hovered = false, pressed }: HoverState) => {
-              const fill = rowActiveFill(hovered, pressed);
-              return [
-                {
-                  flexDirection: "row",
-                  alignItems: "center",
-                  gap: 4,
-                  minHeight: compact ? 36 : 28,
-                  paddingHorizontal: 8,
-                  paddingVertical: compact ? 6 : 4,
-                  borderRadius: 6,
-                },
-                fill === undefined ? undefined : { backgroundColor: theme.colors[fill] },
-              ];
-            }}
-          >
-            <Icon name="PanelRightOpen" size={13} color={colors.accent} />
-            <Text numberOfLines={1} style={{ fontSize: 12, fontWeight: "500", color: colors.accent }}>
-              {t("subagents.openInTab")}
-            </Text>
-          </Pressable>
-        ) : null}
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
+          {onToggleArchive ? (
+            <Pressable
+              onPress={onToggleArchive}
+              accessibilityRole="button"
+              accessibilityLabel={archived ? t("subagents.unarchive") : t("subagents.archive")}
+              style={({ hovered = false, pressed }: HoverState) => {
+                const fill = rowActiveFill(hovered, pressed);
+                return [
+                  {
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 4,
+                    minHeight: compact ? 36 : 28,
+                    paddingHorizontal: 8,
+                    paddingVertical: compact ? 6 : 4,
+                    borderRadius: 6,
+                  },
+                  fill === undefined ? undefined : { backgroundColor: theme.colors[fill] },
+                ];
+              }}
+            >
+              <Icon
+                name={archived ? "Undo2" : "Archive"}
+                size={13}
+                color={archived ? colors.accent : colors.foregroundMuted}
+              />
+              <Text
+                numberOfLines={1}
+                style={{
+                  fontSize: 12,
+                  fontWeight: "500",
+                  color: archived ? colors.accent : colors.foregroundMuted,
+                }}
+              >
+                {archived ? t("subagents.unarchive") : t("subagents.archive")}
+              </Text>
+            </Pressable>
+          ) : null}
+
+          {onOpenInTab ? (
+            <Pressable
+              onPress={onOpenInTab}
+              accessibilityRole="button"
+              accessibilityLabel={t("subagents.openInTab")}
+              style={({ hovered = false, pressed }: HoverState) => {
+                const fill = rowActiveFill(hovered, pressed);
+                return [
+                  {
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 4,
+                    minHeight: compact ? 36 : 28,
+                    paddingHorizontal: 8,
+                    paddingVertical: compact ? 6 : 4,
+                    borderRadius: 6,
+                  },
+                  fill === undefined ? undefined : { backgroundColor: theme.colors[fill] },
+                ];
+              }}
+            >
+              <Icon name="PanelRightOpen" size={13} color={colors.accent} />
+              <Text numberOfLines={1} style={{ fontSize: 12, fontWeight: "500", color: colors.accent }}>
+                {t("subagents.openInTab")}
+              </Text>
+            </Pressable>
+          ) : null}
+        </View>
       </View>
 
       <View style={{ paddingHorizontal: 12, paddingTop: 6, gap: 8 }}>

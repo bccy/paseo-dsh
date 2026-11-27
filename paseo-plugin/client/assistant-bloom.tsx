@@ -16,10 +16,11 @@
  *
  * @module dsh-paseo/client/assistant-bloom
  */
-import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
+import { useSettings, type PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import { Markdown } from "@getpaseo/plugin/client/ui";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Platform, Text, View, type TextStyle } from "react-native";
+import { TIMELINE_STYLE_DEFAULTS, timelineStyleSettings } from "../shared/settings";
 import { normalizeRowTimestamp, yieldRowPulse } from "./newest";
 import {
   BLOOM_HANDOFF_SPEED_BOOST,
@@ -30,14 +31,15 @@ import {
 import { AnimatedBodyParagraph } from "./row-entrance";
 import { STREAM_FRAME_INTERVAL_MS } from "./stream-reveal";
 import {
-  EXPANDED_BLOOM_WAVE_WIDTH,
+  ASSISTANT_BLOOM_WAVE_WIDTH,
   type InlineBloomKind,
   type InlineBloomRun,
-  advanceExpandedInkCursor,
+  advanceAssistantBloomCursor,
   buildStyledBloomRuns,
   countCodePoints,
   isRichMarkdownBlock,
   parseInlineMarkdownRuns,
+  shouldStartAssistantBloomFromZero,
   splitAssistantMarkdownBlocks,
 } from "./thinking-text";
 import { withAlpha } from "./tokens";
@@ -80,24 +82,33 @@ function buildBlockPlans(blocks: readonly string[]): { plans: BlockPlan[]; total
   return { plans, totalCp: offset };
 }
 
-function kindBaseColor(
-  kind: InlineBloomKind,
-  colors: { foreground: string; accent: string },
-): string {
+interface BloomColors {
+  readonly foreground: string;
+  readonly accent: string;
+  readonly codeBg: string;
+}
+
+function kindBaseColor(kind: InlineBloomKind, colors: BloomColors): string {
   return kind === "link" ? colors.accent : colors.foreground;
 }
 
 function kindTextStyle(kind: InlineBloomKind, baseFontSize: number): TextStyle | undefined {
   if (kind === "bold") return { fontWeight: "600" };
-  if (kind === "heading") return { fontWeight: "600", fontSize: baseFontSize + 1 };
-  if (kind === "code") return { fontFamily: MONO_FONT, fontSize: Math.max(12, baseFontSize - 1) };
+  if (kind === "heading") {
+    return {
+      fontWeight: "700",
+      fontSize: Math.round(baseFontSize * 1.2),
+      lineHeight: Math.round(baseFontSize * 1.2 * 1.3),
+    };
+  }
+  if (kind === "code") return { fontFamily: MONO_FONT, fontSize: 12 };
   return undefined;
 }
 
 function renderStaticProseRuns(
   runs: readonly InlineBloomRun[],
   baseStyle: TextStyle,
-  colors: { foreground: string; accent: string },
+  colors: BloomColors,
   baseFontSize: number,
 ) {
   return (
@@ -106,8 +117,16 @@ function renderStaticProseRuns(
         if (run.kind === "plain") return run.text;
         const extra = kindTextStyle(run.kind, baseFontSize);
         const color = run.kind === "link" ? colors.accent : undefined;
+        const backgroundColor = run.kind === "code" ? colors.codeBg : undefined;
         return (
-          <Text key={idx} style={[extra, color !== undefined ? { color } : undefined]}>
+          <Text
+            key={idx}
+            style={[
+              extra,
+              color !== undefined ? { color } : undefined,
+              backgroundColor !== undefined ? { backgroundColor } : undefined,
+            ]}
+          >
             {run.text}
           </Text>
         );
@@ -121,13 +140,13 @@ function renderBloomingProseRuns(
   localProgress: number,
   localSettledFloor: number,
   baseStyle: TextStyle,
-  colors: { foreground: string; accent: string },
+  colors: BloomColors,
   baseFontSize: number,
 ) {
   const segments = buildStyledBloomRuns(
     runs,
     localProgress,
-    EXPANDED_BLOOM_WAVE_WIDTH,
+    ASSISTANT_BLOOM_WAVE_WIDTH,
     localSettledFloor,
   );
   if (segments.length === 0) return null;
@@ -138,8 +157,16 @@ function renderBloomingProseRuns(
         if (seg.alpha >= 0.995) {
           if (seg.kind === "plain") return seg.text;
           const color = seg.kind === "link" ? colors.accent : undefined;
+          const backgroundColor = seg.kind === "code" ? colors.codeBg : undefined;
           return (
-            <Text key={idx} style={[extra, color !== undefined ? { color } : undefined]}>
+            <Text
+              key={idx}
+              style={[
+                extra,
+                color !== undefined ? { color } : undefined,
+                backgroundColor !== undefined ? { backgroundColor } : undefined,
+              ]}
+            >
               {seg.text}
             </Text>
           );
@@ -152,12 +179,17 @@ function renderBloomingProseRuns(
           );
         }
         const tinted = withAlpha(kindBaseColor(seg.kind, colors), seg.alpha);
+        const codeBgTinted =
+          seg.kind === "code" ? withAlpha(colors.codeBg, seg.alpha) : undefined;
         return (
           <Text
             key={idx}
             style={[
               extra,
               tinted !== "transparent" ? { color: tinted } : { opacity: seg.alpha },
+              codeBgTinted && codeBgTinted !== "transparent"
+                ? { backgroundColor: codeBgTinted }
+                : undefined,
             ]}
           >
             {seg.text}
@@ -176,6 +208,9 @@ export function AssistantMessageBloom({
   item,
 }: PluginTimelineItemProps<AssistantBloomData>) {
   const { text, phase } = item.data;
+  const styleState = useSettings(timelineStyleSettings);
+  const timelineStyle = styleState.status === "ready" ? styleState.values : TIMELINE_STYLE_DEFAULTS;
+  const blockGap = Math.max(6, Math.min(14, 10 + Math.round(timelineStyle.rowMarginY * 0.5)));
   const hasRaf =
     typeof globalThis.requestAnimationFrame === "function" &&
     typeof globalThis.cancelAnimationFrame === "function";
@@ -183,19 +218,27 @@ export function AssistantMessageBloom({
   const rowAt = normalizeRowTimestamp(timestamp);
   const rowIdentity = `${agentId ?? ""}\0${rowAt}`;
 
-  const prevIdentityRef = useRef<string>(rowIdentity);
-  const prevTextRef = useRef<string>(text);
-  const everStreamedRef = useRef<boolean>(phase === "streaming");
-  const [growing, setGrowing] = useState<boolean>(phase === "streaming");
-
   const blocks = useMemo(() => splitAssistantMarkdownBlocks(text), [text]);
   const { plans, totalCp } = useMemo(() => buildBlockPlans(blocks), [blocks]);
 
+  const initialBloomFromZero =
+    hasRaf &&
+    shouldStartAssistantBloomFromZero({
+      phase,
+      totalCp,
+      rowTimestampMs: rowAt,
+    });
+
+  const prevIdentityRef = useRef<string>(rowIdentity);
+  const prevTextRef = useRef<string>(text);
+  const everStreamedRef = useRef<boolean>(initialBloomFromZero);
+  const [growing, setGrowing] = useState<boolean>(initialBloomFromZero);
+
   const totalCpRef = useRef<number>(totalCp);
   const cursorRef = useRef<number>(
-    phase === "streaming" && hasRaf ? 0 : totalCp + EXPANDED_BLOOM_WAVE_WIDTH,
+    initialBloomFromZero ? 0 : totalCp + ASSISTANT_BLOOM_WAVE_WIDTH,
   );
-  const settledFloorRef = useRef<number>(phase === "streaming" && hasRaf ? 0 : totalCp);
+  const settledFloorRef = useRef<number>(initialBloomFromZero ? 0 : totalCp);
   const rafRef = useRef<number | null>(null);
   const lastFrameRef = useRef<number>(0);
   const handoffBoostRef = useRef<boolean>(false);
@@ -208,14 +251,21 @@ export function AssistantMessageBloom({
       text.startsWith(prevTextRef.current);
     prevIdentityRef.current = rowIdentity;
     if (!isContinuation) {
-      everStreamedRef.current = phase === "streaming";
+      const freshFromZero =
+        hasRaf &&
+        shouldStartAssistantBloomFromZero({
+          phase,
+          totalCp,
+          rowTimestampMs: rowAt,
+        });
+      everStreamedRef.current = freshFromZero;
       handoffBoostRef.current = false;
       totalCpRef.current = totalCp;
-      if (phase === "streaming" && hasRaf) {
+      if (freshFromZero) {
         cursorRef.current = 0;
         settledFloorRef.current = 0;
       } else {
-        cursorRef.current = totalCp + EXPANDED_BLOOM_WAVE_WIDTH;
+        cursorRef.current = totalCp + ASSISTANT_BLOOM_WAVE_WIDTH;
         settledFloorRef.current = totalCp;
       }
     }
@@ -232,7 +282,7 @@ export function AssistantMessageBloom({
       }
       everStreamedRef.current = true;
     } else if (!everStreamedRef.current) {
-      cursorRef.current = totalCp + EXPANDED_BLOOM_WAVE_WIDTH;
+      cursorRef.current = totalCp + ASSISTANT_BLOOM_WAVE_WIDTH;
       settledFloorRef.current = totalCp;
     }
   }
@@ -242,7 +292,7 @@ export function AssistantMessageBloom({
   const yieldedPulseRowRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (phase === "streaming") {
+    if (phase === "streaming" && everStreamedRef.current) {
       markAgentLiveActivity(agentId);
       if (yieldedPulseRowRef.current !== rowIdentity) {
         yieldedPulseRowRef.current = rowIdentity;
@@ -261,7 +311,7 @@ export function AssistantMessageBloom({
     return () => clearTimeout(timer);
   }, [agentId, phase, text, rowIdentity]);
 
-  const settledTarget = totalCp + EXPANDED_BLOOM_WAVE_WIDTH;
+  const settledTarget = totalCp + ASSISTANT_BLOOM_WAVE_WIDTH;
   const needsAnim =
     hasRaf &&
     everStreamedRef.current &&
@@ -300,9 +350,9 @@ export function AssistantMessageBloom({
       handoffBoostRef.current = true;
     };
     const publishRemaining = () => {
-      const remChars = Math.max(0, totalCpRef.current + EXPANDED_BLOOM_WAVE_WIDTH - cursorRef.current);
-      // Estimate remaining bloom duration against our average 28 chars/sec wave speed.
-      const estMs = (remChars / 28) * 1000;
+      const remChars = Math.max(0, totalCpRef.current + ASSISTANT_BLOOM_WAVE_WIDTH - cursorRef.current);
+      // Estimate remaining bloom duration against our responsive assistant wave pace.
+      const estMs = (remChars / 120) * 1000;
       reportActiveBloom(agentId, estMs, onSuccessorWaiting);
     };
     publishRemaining();
@@ -322,11 +372,11 @@ export function AssistantMessageBloom({
       lastFrameRef.current = now;
       const dt = handoffBoostRef.current ? rawDt * BLOOM_HANDOFF_SPEED_BOOST : rawDt;
       const target = totalCpRef.current;
-      const next = advanceExpandedInkCursor(cursorRef.current, target, dt, EXPANDED_BLOOM_WAVE_WIDTH);
+      const next = advanceAssistantBloomCursor(cursorRef.current, target, dt, ASSISTANT_BLOOM_WAVE_WIDTH);
       cursorRef.current = next;
-      const done = next >= target + EXPANDED_BLOOM_WAVE_WIDTH - 0.05;
+      const done = next >= target + ASSISTANT_BLOOM_WAVE_WIDTH - 0.05;
       if (done) {
-        cursorRef.current = target + EXPANDED_BLOOM_WAVE_WIDTH;
+        cursorRef.current = target + ASSISTANT_BLOOM_WAVE_WIDTH;
         settledFloorRef.current = target;
         lastFrameRef.current = 0;
         handoffBoostRef.current = false;
@@ -347,7 +397,7 @@ export function AssistantMessageBloom({
   }, [agentId, needsAnim, text, rowIdentity]);
 
   const baseFontSize = layout.compact ? 14 : 15;
-  const baseLineHeight = layout.compact ? 21 : 23;
+  const baseLineHeight = Math.round(baseFontSize * 1.4);
   const proseStyle = useMemo<TextStyle>(
     () => ({
       color: theme.colors.foreground,
@@ -372,7 +422,11 @@ export function AssistantMessageBloom({
 
   const cursor = cursorRef.current;
   const settledFloor = settledFloorRef.current;
-  const colors = { foreground: theme.colors.foreground, accent: theme.colors.accent };
+  const colors: BloomColors = {
+    foreground: theme.colors.foreground,
+    accent: theme.colors.accent,
+    codeBg: theme.colors.surface2,
+  };
   const rendered: Array<ReturnType<typeof renderStaticProseRuns>> = [];
 
   for (let i = 0; i < plans.length; i += 1) {
@@ -382,7 +436,7 @@ export function AssistantMessageBloom({
 
     if (plan.rich) {
       const node = (
-        <AnimatedBodyParagraph key={`rich:${i}`} animate fromOpacity={0} durationMs={480}>
+        <AnimatedBodyParagraph key={`rich:${i}`} animate fromOpacity={0} durationMs={320}>
           <Markdown>{plan.raw}</Markdown>
         </AnimatedBodyParagraph>
       );
@@ -392,7 +446,7 @@ export function AssistantMessageBloom({
 
     const blockEnd = plan.startCp + plan.cpCount;
     const isBlockSettled =
-      cursor >= blockEnd + EXPANDED_BLOOM_WAVE_WIDTH || settledFloor >= blockEnd;
+      cursor >= blockEnd + ASSISTANT_BLOOM_WAVE_WIDTH || settledFloor >= blockEnd;
     if (isBlockSettled) {
       const hit = settledCacheRef.current.get(i);
       if (hit !== undefined && hit.raw === plan.raw) {
@@ -424,5 +478,5 @@ export function AssistantMessageBloom({
     }
   }
 
-  return <View style={{ gap: 8 }}>{rendered}</View>;
+  return <View style={{ gap: blockGap }}>{rendered}</View>;
 }

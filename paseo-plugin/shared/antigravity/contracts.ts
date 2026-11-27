@@ -674,6 +674,8 @@ export const subagentCountsRpc = defineRpc({
         total: z.number().int(),
         running: z.number().int(),
         failed: z.number().int().default(0),
+        settledIds: z.array(z.string()).optional(),
+        failedIds: z.array(z.string()).optional(),
       }),
     ),
   }),

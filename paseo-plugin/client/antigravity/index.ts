@@ -18,6 +18,7 @@ import {
   subagentCardSchema,
   subagentCheckSchema,
 } from "../../shared/antigravity/contracts";
+import { SUBAGENTS_ARCHIVED_METADATA_KEY } from "../../shared/pill-metadata";
 import { subscribeLocale } from "../locale";
 import { AntigravityTabContent, type AntigravityTabProps } from "./AntigravityTab";
 import { observeAgents, type AgentObservation } from "./agents";
@@ -28,6 +29,7 @@ import { QuotaSidebarItem } from "./sidebar";
 import { createStepsViews } from "./steps";
 import { createStepsStore } from "./stepsModel";
 import { SUBAGENT_PANEL_ID, SUBAGENT_SCREEN_ID, createSubagentViews } from "./subagents";
+import { createSubagentsArchiveStore } from "./subagentsArchive";
 import { FallbackNote } from "./timeline";
 import {
   createAntigravityTimelineTransforms,
@@ -141,7 +143,14 @@ export function contributeAntigravityClient(
     };
   }
 
-  const subagents = createSubagentViews(client);
+  const subagentsArchive = createSubagentsArchiveStore({
+    write: (agentId, raw) =>
+      client.paseo.agents.ref(agentId).setMetadata({ [SUBAGENTS_ARCHIVED_METADATA_KEY]: raw }),
+    onError: (message, error) => {
+      console.warn(`[dsh-paseo:antigravity] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+    },
+  });
+  const subagents = createSubagentViews(client, subagentsArchive);
   const stepsStore = createStepsStore();
   const stepsViews = createStepsViews(stepsStore);
   const observation = observeAgents(
@@ -156,6 +165,7 @@ export function contributeAntigravityClient(
       store: stepsStore,
       makePopover: stepsViews.makePopover,
     },
+    subagentsArchive,
   );
   const transforms = createAntigravityTimelineTransforms();
 
