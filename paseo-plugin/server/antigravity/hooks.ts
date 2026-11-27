@@ -97,6 +97,11 @@ export interface SwitchInput {
   when: "now" | "after-turn";
   /** True when the user explicitly chose the account (bypasses automatic open redirect). */
   manual?: boolean;
+  /**
+   * Optional CAS guard for automatic fallback: abort with `"unchanged"` if the agent has
+   * already moved away from this account (e.g. the user manually switched it meanwhile).
+   */
+  expectedCurrentAccountId?: string;
 }
 
 export interface SwitchOutcome {
@@ -116,9 +121,18 @@ export async function switchAgentAccount(
   const accountLabel = service.labelOf(input.accountId);
   if (target) {
     // Moving an agent onto an account that cannot run would strand it there.
-    const status = await service.quotaFor(input.accountId, 5 * 60_000);
-    if (status.status === "signed-out") {
-      throw new Error(`Sign in to "${accountLabel}" in Antigravity accounts before moving an agent to it.`);
+    // Only block on a live probe when the account has never been checked or was
+    // last seen signed-out/error; when already known signed-in, switch at once
+    // and refresh stale quota in the background so failover/manual switches never
+    // stall 10+ seconds waiting on `agy -p /usage`.
+    const known = typeof service.knownStatus === "function" ? service.knownStatus(input.accountId) : "unknown";
+    if (known === "signed-in") {
+      void Promise.resolve(service.quotaFor(input.accountId, 5 * 60_000)).catch(() => undefined);
+    } else {
+      const status = await service.quotaFor(input.accountId, 5 * 60_000);
+      if (status.status === "signed-out") {
+        throw new Error(`Sign in to "${accountLabel}" in Antigravity accounts before moving an agent to it.`);
+      }
     }
   }
   const handle = paseo.agents.ref(input.agentId);
@@ -130,6 +144,9 @@ export async function switchAgentAccount(
   }
   if (agent.archivedAt) throw new Error("That agent is archived.");
   const current = accountIdFromMetadata(agent.metadata);
+  if (input.expectedCurrentAccountId !== undefined && current !== input.expectedCurrentAccountId) {
+    return { result: "unchanged", accountLabel: service.labelOf(current) };
+  }
   if (current === input.accountId) {
     pending.delete(input.agentId);
     return { result: "unchanged", accountLabel };

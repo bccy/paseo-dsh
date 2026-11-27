@@ -3927,3 +3927,160 @@ test("Paseo 0.18 notifications dispatcher formats bilingual payloads, routes tap
   assert.deepEqual(pluginDone.open, { type: "screen", screenId: "dsh-console", params: { tab: "plugins" } });
   assert.deepEqual(pluginDone.data, { kind: "dsh-plugin-job", jobId: "j-1" });
 });
+
+test("FallbackController switches immediately without blocking on refreshOne/quotaFor and never overwrites a manual switch", async () => {
+  const { FallbackController } = require("../server/antigravity/fallback.ts");
+  const { PendingSwitches } = require("../server/antigravity/hooks.ts");
+
+  // 1. Slow/hanging refreshOne(current) and quotaFor(next) must NOT stall automatic switch.
+  let resolveSlowRefresh;
+  let resolveSlowTargetQuota;
+  const neverSettledRefresh = new Promise((r) => {
+    resolveSlowRefresh = r;
+  });
+  const neverSettledTargetQuota = new Promise((r) => {
+    resolveSlowTargetQuota = r;
+  });
+
+  const metadata = { [agContracts.ACCOUNT_METADATA_KEY]: "acc-gm" };
+  let reloads = 0;
+  const notes = [];
+  const prompts = [];
+  let refreshCalledWith = null;
+
+  const fakeService = {
+    init: async () => {},
+    setCooldownProvider: () => {},
+    onStatusUpdated: () => () => {},
+    notifyChange: () => {},
+    fallbackSettings: () => ({ enabled: true, retries: 2, strategy: "reset" }),
+    labelOf: (id) => (id === "acc-gm" ? "GM" : id === "acc-ywdh" ? "ywdh" : "mon"),
+    requireAccount: (id) => ({ id, label: id, unsafeDetail: null }),
+    knownStatus: () => "signed-in",
+    quotaFor: () => neverSettledTargetQuota,
+    refreshOne: (id) => {
+      refreshCalledWith = id;
+      return neverSettledRefresh;
+    },
+    knownQuota: (id) =>
+      id === "acc-gm"
+        ? [{ name: "Gemini Models", buckets: [{ id: "gemini-5h", name: "5h", window: "5h", remainingFraction: 0.05, resetTime: null, disabled: false }] }]
+        : [{ name: "Gemini Models", buckets: [{ id: "gemini-5h", name: "5h", window: "5h", remainingFraction: 0.9, resetTime: "2026-11-27T23:08:10Z", disabled: false }] }],
+    state: async () => ({
+      defaultAccountId: "default",
+      accounts: [
+        { id: "acc-gm", label: "GM", kind: "profile", status: "signed-in", usable: true, fallbackEnabled: true },
+        { id: "acc-ywdh", label: "ywdh", kind: "profile", status: "signed-in", usable: true, fallbackEnabled: true },
+      ],
+    }),
+  };
+
+  const controller = new FallbackController(fakeService, new PendingSwitches());
+  const { server, hooks } = createFakeServer();
+  const unregister = controller.register(server);
+  try {
+    const turnAfter = hooks.find((h) => h.name === "agent.turn.after");
+    const fakeAgentRef = {
+      refresh: async () => ({
+        agent: {
+          id: "agent-fast-fb",
+          provider: "antigravity",
+          model: "gemini-4-neon",
+          status: "idle",
+          archivedAt: null,
+          metadata: { ...metadata },
+        },
+      }),
+      setMetadata: async (patch) => Object.assign(metadata, patch),
+      reload: async () => {
+        reloads += 1;
+      },
+      send: async (text) => prompts.push(text),
+      timeline: {
+        refetch: async () => ({
+          agent: { id: "agent-fast-fb", provider: "antigravity", model: "gemini-4-neon", metadata: { ...metadata } },
+          entries: [
+            { turnId: "t1", item: { type: "user_message", text: "hi" } },
+            { turnId: "t1", item: { type: "assistant_message", text: "⚠ Individual quota reached. Resets in 1h22m25s." } },
+          ],
+        }),
+        append: async (item) => notes.push(item),
+      },
+    };
+    const fakePaseo = { agents: { ref: () => fakeAgentRef } };
+
+    // Must resolve immediately even though both refreshOne and quotaFor are still pending!
+    await turnAfter.handler(
+      {
+        agent: { id: "agent-fast-fb", provider: "antigravity", metadata: { ...metadata } },
+        turnId: "t1",
+        outcome: { kind: "completed" },
+      },
+      { paseo: fakePaseo, signal: new AbortController().signal },
+    );
+
+    assert.equal(refreshCalledWith, "acc-gm", "background refreshOne still fires for exhausted account");
+    assert.equal(metadata[agContracts.ACCOUNT_METADATA_KEY], "acc-ywdh", "switched immediately without waiting on agy /usage");
+    assert.equal(reloads, 1);
+    assert.deepEqual(prompts, ["Continue."]);
+    assert.equal(notes.length, 1);
+    assert.equal(notes[0].data.event, "switch");
+    assert.equal(controller.cooldownsOf("acc-gm").length, 1, "cooldown applied immediately from Resets in delay");
+
+    // 2. If user already switched agent to `acc-mon` before switchAgentAccount runs, fallback must abort cleanly
+    const raceMetadata = { [agContracts.ACCOUNT_METADATA_KEY]: "acc-mon" };
+    let raceReloads = 0;
+    const raceNotes = [];
+    const racePrompts = [];
+    const raceRef = {
+      refresh: async () => ({
+        agent: {
+          id: "agent-race",
+          provider: "antigravity",
+          model: "gemini-4-neon",
+          status: "idle",
+          archivedAt: null,
+          metadata: { ...raceMetadata },
+        },
+      }),
+      setMetadata: async (patch) => Object.assign(raceMetadata, patch),
+      reload: async () => {
+        raceReloads += 1;
+      },
+      send: async (text) => racePrompts.push(text),
+      timeline: {
+        refetch: async () => ({
+          agent: {
+            id: "agent-race",
+            provider: "antigravity",
+            model: "gemini-4-neon",
+            metadata: { [agContracts.ACCOUNT_METADATA_KEY]: "acc-gm" },
+          },
+          entries: [
+            { turnId: "t2", item: { type: "user_message", text: "hi" } },
+            { turnId: "t2", item: { type: "assistant_message", text: "⚠ Individual quota reached. Resets in 10m." } },
+          ],
+        }),
+        append: async (item) => raceNotes.push(item),
+      },
+    };
+    await turnAfter.handler(
+      {
+        agent: { id: "agent-race", provider: "antigravity", metadata: { [agContracts.ACCOUNT_METADATA_KEY]: "acc-gm" } },
+        turnId: "t2",
+        outcome: { kind: "completed" },
+      },
+      { paseo: { agents: { ref: () => raceRef } }, signal: new AbortController().signal },
+    );
+
+    assert.equal(raceMetadata[agContracts.ACCOUNT_METADATA_KEY], "acc-mon", "must preserve user's manual account switch");
+    assert.equal(raceReloads, 0, "must not trigger a second reload after manual switch");
+    assert.equal(raceNotes.length, 0, "must not append misleading switch note");
+    assert.equal(racePrompts.length, 0, "must not double-send Continue.");
+  } finally {
+    resolveSlowRefresh?.();
+    resolveSlowTargetQuota?.({ status: "signed-in" });
+    unregister();
+    controller.dispose();
+  }
+});

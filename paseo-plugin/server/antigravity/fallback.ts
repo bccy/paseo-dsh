@@ -447,8 +447,21 @@ export class FallbackController {
     chain.tried.add(current);
     const fromLabel = this.service.labelOf(current);
     const message = error.message.slice(0, 400);
-    // The failure may have changed the quota; the sidebar and the next choice should see it.
-    await this.service.refreshOne(current).catch(() => undefined);
+    const now = Date.now();
+    const cooldownPool: QuotaPool = reason === "auth" ? "all" : pool;
+    const resetDelayMs = reason === "quota" ? parseResetDelayMs(error.message) : null;
+
+    // Refresh the failed account's quota in the background so the sidebar updates and
+    // cooldown timing refines without stalling failover for 10+ seconds on `agy -p /usage`.
+    void Promise.resolve(this.service.refreshOne(current))
+      .then(() => {
+        if (reason !== "quota") return;
+        const freshUntil = resetOfExhausted(this.service.knownQuota(current), pool, Date.now());
+        if (freshUntil !== null && this.activeCooldown(current, pool)?.reason === "quota") {
+          this.setCooldown(current, cooldownPool, freshUntil, reason);
+        }
+      })
+      .catch(() => undefined);
 
     if ((reason === "transient" || reason === "error") && chain.attempts < retries) {
       chain.attempts += 1;
@@ -458,9 +471,6 @@ export class FallbackController {
       return;
     }
 
-    const now = Date.now();
-    const cooldownPool: QuotaPool = reason === "auth" ? "all" : pool;
-    const resetDelayMs = reason === "quota" ? parseResetDelayMs(error.message) : null;
     const until =
       reason === "quota"
         ? (resetOfExhausted(this.service.knownQuota(current), pool, now) ??
@@ -472,6 +482,10 @@ export class FallbackController {
 
     // Keep trying candidates when one fails to open (e.g. an account that lacks the agent's model).
     for (;;) {
+      if (this.pending.hasPendingOrActive(agentId) || this.pending.isManual(agentId)) {
+        this.chains.delete(agentId);
+        return;
+      }
       const next = await this.pickNext(current, chain.tried, model, strategy);
       if (!next) {
         this.chains.delete(agentId);
@@ -487,12 +501,14 @@ export class FallbackController {
         return;
       }
       chain.tried.add(next);
+      let switchOutcome;
       try {
-        await switchAgentAccount(paseo, this.service, this.pending, {
+        switchOutcome = await switchAgentAccount(paseo, this.service, this.pending, {
           agentId,
           accountId: next,
           when: "now",
           manual: true,
+          expectedCurrentAccountId: current,
         });
       } catch (switchError) {
         console.warn(
@@ -500,6 +516,11 @@ export class FallbackController {
           switchError instanceof Error ? switchError.message : String(switchError),
         );
         continue;
+      }
+      if (switchOutcome.result === "unchanged") {
+        // The user already moved this agent to another account while fallback was in flight.
+        this.chains.delete(agentId);
+        return;
       }
       chain.attempts = 0;
       await this.note(paseo, agentId, {
