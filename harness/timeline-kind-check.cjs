@@ -28,10 +28,38 @@ function readKinds(source) {
     // need to be accepted so the entry body runs to the renderer registrations.
     addScreen() { return noop; },
     addSidebarHeaderItem() { return noop; },
+    addSidebarFooterItem() { return noop; },
+    addWorkspaceRowBadgeItem() { return noop; },
+    addCommandCenterItem() { return noop; },
+    addComposerItem() { return noop; },
+    addAgentPanel() { return noop; },
     rpc() { return Promise.resolve({ status: 'ready', values: {} }); },
+    i18n: { locale: 'en', t: (_m, key) => key },
     paseo: {},
   };
   const requireClient = (id) => {
+    if (id === './client/antigravity') {
+      const file = path.join(build, 'client/antigravity/index.js');
+      const requireAg = (name) => {
+        if (name === '@getpaseo/plugin/client') return { useTranslation: () => ({ t: (k) => k }) };
+        if (name === '@getpaseo/plugin/client/ui') return { WorkspaceRowBadge: () => null };
+        if (name === 'react-native') return {};
+        if (name === './AntigravityTab') return { AntigravityTabContent: () => null };
+        if (name === './agents') return { observeAgents: () => ({ stop: noop, useNotifications: noop, subscribe: () => noop, workspaceRunningSubagents: () => new Map(), notify: noop }) };
+        if (name === './composer') return { ComposerAccount: () => null };
+        if (name === './messages') return { errorMessage: String, messages: { message: (k) => ({ key: k }) } };
+        if (name === './questions') return { AskQuestionRow: () => null };
+        if (name === './sidebar') return { QuotaSidebarItem: () => null };
+        if (name === './subagents') return { SUBAGENT_PANEL_ID: 'subagents', createSubagentViews: () => ({ open: noop, SubagentCardRow: () => null, SubagentCheckRow: () => null, SubagentsPanel: () => null }) };
+        if (name === './timeline') return { FallbackNote: () => null };
+        if (name === './transform') {
+          const txFile = path.join(build, 'client/antigravity/transform.js');
+          return fromBuild(txFile);
+        }
+        return createRequire(file)(name);
+      };
+      return evaluate(fs.readFileSync(file, 'utf8'), file, requireAg);
+    }
     if (id === './client/stream-stats') {
       const file = path.join(build, 'client/stream-stats.js');
       return evaluate(fs.readFileSync(file, 'utf8'), file, (name) => name === 'react-native' ? {} : fromBuild(name));
@@ -46,6 +74,7 @@ function readKinds(source) {
       return {
         CONSOLE_SCREEN_ID: 'dsh-console',
         DshConsoleScreen: () => null,
+        defaultConsoleTab: () => 'usage',
         requestConsoleTab: noop,
       };
     }
@@ -95,7 +124,19 @@ function readKinds(source) {
   cleanup();
   return kinds;
 }
-assert.deepEqual(readKinds(entrySource).sort(), ['dsh-thinking', 'dsh-tool', 'dsh-rewind-notice', 'dsh-stream-stats'].sort());
+assert.deepEqual(
+  readKinds(entrySource).sort(),
+  [
+    'dsh-thinking',
+    'dsh-tool',
+    'dsh-rewind-notice',
+    'dsh-stream-stats',
+    'antigravity-fallback',
+    'antigravity-subagent',
+    'antigravity-subagents-check',
+    'antigravity-ask-question',
+  ].sort(),
+);
 assert(entrySource.includes('dsh-thinking'), 'mutation must reach the actual renderer registration');
 assert.throws(() => readKinds(entrySource.replaceAll('dsh-thinking', 'Invalid-kind')), /invalid timeline kind/, 'an invalid registered kind must be rejected');
 console.log('timeline kinds: real registrations and invalid-kind mutation passed');

@@ -56,13 +56,13 @@ export function guardCleanup(label: string, run: () => () => void): () => void {
  * the fallback costs one component and keeps the rest of the app usable.
  */
 export class PluginsBoundary extends Component<
-  { fallback: ReactNode; children: ReactNode },
-  { failed: boolean }
+  { fallback: ReactNode | ((error: Error | null) => ReactNode); children: ReactNode },
+  { failed: boolean; error: Error | null }
 > {
-  state = { failed: false };
+  state: { failed: boolean; error: Error | null } = { failed: false, error: null };
 
-  static getDerivedStateFromError(): { failed: boolean } {
-    return { failed: true };
+  static getDerivedStateFromError(error: Error): { failed: boolean; error: Error | null } {
+    return { failed: true, error };
   }
 
   componentDidCatch(error: Error): void {
@@ -70,23 +70,59 @@ export class PluginsBoundary extends Component<
   }
 
   render(): ReactNode {
-    return this.state.failed ? this.props.fallback : this.props.children;
+    if (!this.state.failed) return this.props.children;
+    return typeof this.props.fallback === "function"
+      ? this.props.fallback(this.state.error)
+      : this.props.fallback;
   }
 }
 
-/** The one-line card the fallback draws. */
+/** Format an error into a short diagnostic snippet for the fallback card. */
+export function formatBoundaryError(error: Error | null): string | undefined {
+  if (!error) return undefined;
+  const header = error.name && error.message
+    ? `${error.name}: ${error.message}`
+    : error.message || error.name || String(error);
+  const stackLines = typeof error.stack === "string"
+    ? error.stack
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && line !== header)
+      .slice(0, 4)
+    : [];
+  return stackLines.length > 0 ? `${header}\n${stackLines.join("\n")}` : header;
+}
+
+/** The fallback card drawn when a plugin screen throws during render. */
 export function PluginsFailedCard({
   message,
   color,
   background,
+  detail,
+  detailColor,
 }: {
   message: string;
   color: string;
   background: string;
+  detail?: string;
+  detailColor?: string;
 }) {
   return (
-    <View style={{ flex: 1, padding: 24, backgroundColor: background }}>
+    <View style={{ flex: 1, padding: 24, gap: 12, backgroundColor: background }}>
       <Text style={{ color, fontSize: 13, lineHeight: 19 }}>{message}</Text>
+      {detail ? (
+        <Text
+          selectable
+          style={{
+            color: detailColor ?? color,
+            fontSize: 11,
+            lineHeight: 16,
+            opacity: 0.85,
+          }}
+        >
+          {detail}
+        </Text>
+      ) : null}
     </View>
   );
 }

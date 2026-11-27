@@ -45,6 +45,7 @@ import {
   PRICING_CATALOG_SCHEMA_VERSION,
   convertCurrency,
   exchangeRateSchema,
+  matchAntigravityReferenceEntry,
   matchReferenceEntry,
   modelRatesSchema,
   normalizeModelKey,
@@ -281,7 +282,7 @@ const COPY: Record<"en" | "zh-CN", CopyTable> = {
     filterCatalog: "Official catalog",
     showAllModels: (total) => `Show all ${total} models`,
     emptyMatches: "No matching model entries.",
-    emptyConnectedHint: "No DSH models configured or used yet.",
+    emptyConnectedHint: "No models configured or used yet.",
     emptySearchConnectedHint: (query, catalogMatches) =>
       `No connected models match "${query}". Found ${catalogMatches} in the official catalog.`,
     searchInCatalogCta: (count) => `View ${count} in official catalog`,
@@ -406,7 +407,7 @@ const COPY: Record<"en" | "zh-CN", CopyTable> = {
     filterCatalog: "官方价格库",
     showAllModels: (total) => `展开全部 ${total} 个模型`,
     emptyMatches: "没有匹配的模型条目。",
-    emptyConnectedHint: "当前尚未接入或使用任何 DSH 模型。",
+    emptyConnectedHint: "当前尚未接入或使用任何模型。",
     emptySearchConnectedHint: (query, catalogMatches) =>
       `已接入模型中未找到「${query}」，官方价格库中有 ${catalogMatches} 项匹配。`,
     searchInCatalogCta: (count) => `在官方价格库中查看 (${count})`,
@@ -783,7 +784,7 @@ function resolveFocusTarget(
   ).slice(0, MAX_MODEL_KEY_LENGTH);
   if (!syntheticKey) return { key: null, syntheticRow: null };
 
-  const matchedRef = matchReferenceEntry(raw);
+  const matchedRef = matchReferenceEntry(raw) ?? matchAntigravityReferenceEntry(raw);
   const suggestions = suggestClosestPricing(raw, syncedCatalog, 3);
   const syntheticRow: PricingModelRow = {
     key: syntheticKey,

@@ -57,6 +57,7 @@ const pluginTests = [
   'test/paseo-0171.test.cjs',
   'test/paseo-0173.test.cjs',
   'test/timeline-spacing.test.cjs',
+  'test/antigravity.test.cjs',
 ];
 const inventory = [
   'typecheck', 'bridge syntax', ...sourceChecks, ...compiledChecks,

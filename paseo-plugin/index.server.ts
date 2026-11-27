@@ -1,12 +1,18 @@
+import { accessSync, constants, statSync } from "node:fs";
+import { readdir } from "node:fs/promises";
+import { delimiter, extname, join, resolve } from "node:path";
 import type { PluginHandlerContext, PluginServerContext } from "@getpaseo/plugin/server";
+import { buildCapabilitiesSnapshot, capabilitiesGetRpc } from "./shared/capabilities";
 import { goalControl, goalSnapshot, isTerminalGoalErrorCode, type GoalAnswer } from "./shared/goal";
 import { isTerminalJobsErrorCode, jobsSnapshot, jobsStop, type JobsAnswer } from "./shared/jobs";
 import { isTerminalTeamErrorCode, teamSnapshot, type TeamAnswer } from "./shared/team";
 import { subagentLiveSnapshot } from "./shared/subagent-live";
 import { rewindNoticeArm } from "./shared/rewind-notice";
 import { languageSettings, timelineStyleSettings } from "./shared/settings";
-import { ensurePaseoProfile } from "./server/bootstrap";
+import { registerAntigravityServer } from "./server/antigravity";
+import { dshHome, ensurePaseoProfile } from "./server/bootstrap";
 import { DiagnosticsService, registerDiagnosticsRpc } from "./server/diagnostics";
+import { resolveDshCommand } from "./server/dsh-command.mjs";
 import { DshPlugins } from "./server/dsh-plugins";
 import { registerDshPluginsRpc } from "./server/dsh-plugins-rpc";
 import { createPillFeed } from "./server/pill-feed";
@@ -22,6 +28,106 @@ import {
   stopAgentJob,
   subscribeAgentSubagents,
 } from "./server/provider";
+
+function isExecutableFile(candidate: string, isWin: boolean): boolean {
+  try {
+    if (!statSync(candidate).isFile()) return false;
+    if (!isWin) accessSync(candidate, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Fast, zero-subprocess check for whether the configured `dsh` binary can be
+ * resolved from `DSH_BINARY` or `PATH`.
+ */
+export function isDshBinaryResolvable(options?: {
+  env?: Readonly<Record<string, string | undefined>>;
+  cwd?: string;
+  platform?: NodeJS.Platform;
+}): boolean {
+  const env = options?.env ?? process.env;
+  const cwd = options?.cwd ?? process.cwd();
+  const platform = options?.platform ?? process.platform;
+  const isWin = platform === "win32";
+  const raw = env["DSH_BINARY"]?.trim();
+  const command = raw && raw !== "" ? raw : "dsh";
+
+  const launch = resolveDshCommand(command, env, cwd);
+  if (launch.args.length > 0) return true;
+
+  if (command.includes("/") || command.includes("\\")) {
+    return isExecutableFile(resolve(cwd, command), isWin);
+  }
+
+  const pathKey = Object.keys(env).sort().find((key) => key.toLowerCase() === "path");
+  const rawPath = pathKey === undefined ? "" : (env[pathKey] ?? "");
+  if (rawPath === "") return false;
+
+  const dirs = rawPath
+    .split(isWin ? ";" : delimiter)
+    .map((entry) => entry.replace(/^"|"$/g, ""))
+    .filter((entry) => entry !== "")
+    .map((entry) => resolve(cwd, entry));
+
+  let exts: string[] = [""];
+  if (isWin) {
+    const pathextKey = Object.keys(env).sort().find((key) => key.toLowerCase() === "pathext");
+    const rawExt = pathextKey === undefined ? "" : (env[pathextKey] ?? "");
+    const configured = (rawExt || ".COM;.EXE;.BAT;.CMD")
+      .split(";")
+      .map((ext) => ext.trim())
+      .filter((ext) => ext !== "");
+    exts = extname(command) !== "" ? ["", ...configured] : configured;
+  }
+
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      if (isExecutableFile(join(dir, `${command}${ext}`), isWin)) return true;
+    }
+  }
+  return false;
+}
+
+async function hasDshSessionFiles(dir: string, depth = 0): Promise<boolean> {
+  if (depth > 4) return false;
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    if (entry.isFile() && (entry.name.endsWith(".v4.jsonl.zstd") || entry.name.endsWith(".jsonl"))) {
+      return true;
+    }
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory() && await hasDshSessionFiles(join(dir, entry.name), depth + 1)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export interface DshPresence {
+  dshInstalled: boolean;
+  hasDshSessions: boolean;
+}
+
+/** Detect whether DSH CLI is installed and whether `$DSH_HOME/sessions` contains session logs. */
+export async function detectDshPresence(options?: {
+  env?: Readonly<Record<string, string | undefined>>;
+  cwd?: string;
+  platform?: NodeJS.Platform;
+}): Promise<DshPresence> {
+  const env = options?.env ?? process.env;
+  const dshInstalled = isDshBinaryResolvable(options);
+  const hasDshSessions = await hasDshSessionFiles(join(dshHome(env), "sessions"));
+  return { dshInstalled, hasDshSessions };
+}
 
 /**
  * The lifecycle events the server half listens on **only** to capture the Paseo
@@ -118,13 +224,24 @@ export default function contribute(server: PluginServerContext) {
   const dshPlugins = new DshPlugins();
   const disposeDshPlugins = registerDshPluginsRpc(server, dshPlugins);
 
-  // Environment & Route Overview + on-demand full Doctor RPCs for Console Tab 3.
+  // Integrated Antigravity Console server half: multi-account management,
+  // fallback, subagents, orchestrator, usage source, and conditional
+  // `agent.open.before` hook registration (gated inside `server/antigravity/hooks.ts`
+  // by `shouldRegisterAntigravityOpenHookSync()` so pure-DSH hosts never register it).
+  const antigravity = registerAntigravityServer(server, { onContext: capture });
+
+  // Environment & Route Overview + on-demand full Doctor RPCs for Console Settings tab.
   const diagnostics = new DiagnosticsService();
   const disposeDiagnostics = registerDiagnosticsRpc(server, diagnostics, { onCall: capture });
 
-  // Dual-currency pricing store & incremental DSH session usage analytics for Console Tab 1 & Tab 3.
-  const pricingStore = new PricingStore();
-  const usageEngine = new UsageStatsEngine({ pricer: pricingStore });
+  // Dual-currency pricing store & unified DSH + Antigravity usage analytics.
+  const pricingStore = new PricingStore({
+    legacyAntigravityPricingPath: antigravity.legacyPricingPath,
+  });
+  const usageEngine = new UsageStatsEngine({
+    pricer: pricingStore,
+    antigravityStats: antigravity.stats,
+  });
   const disposePricing = registerPricingRpc(server, pricingStore, {
     getSeenModels: () => usageEngine.seenPricingModels({ waitMs: 0 }),
     getConfiguredModels: async () => {
@@ -257,7 +374,23 @@ export default function contribute(server: PluginServerContext) {
     return {};
   });
 
+  server.handle(capabilitiesGetRpc, async (_input, context) => {
+    capture(context);
+    const [dshPresence, agyPresence] = await Promise.all([
+      detectDshPresence(),
+      antigravity.detectPresence(),
+    ]);
+    return buildCapabilitiesSnapshot({
+      dshInstalled: dshPresence.dshInstalled,
+      hasDshSessions: dshPresence.hasDshSessions,
+      agyInstalled: agyPresence.agyInstalled,
+      hasAntigravityData: agyPresence.hasAntigravityData,
+      hasAntigravityAccounts: agyPresence.hasAntigravityAccounts,
+    });
+  });
+
   return () => {
+    antigravity.dispose();
     disposeUsageStats();
     disposePricing();
     disposeDiagnostics();

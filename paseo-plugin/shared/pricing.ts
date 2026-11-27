@@ -14,6 +14,14 @@
  */
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
+import {
+  ANTIGRAVITY_DEFAULT_PRICING,
+  defaultPricingEntry as getAntigravityDefaultPricingEntry,
+  officialRatesAt as antigravityOfficialRatesAt,
+  resolvePricingKey as resolveAntigravityPricingKey,
+  toUsdDualCurrencyRates,
+  type AntigravityDefaultPricingEntry,
+} from "./antigravity/pricing-defaults";
 
 export const PRICING_SCHEMA_VERSION = 1 as const;
 export const PRICING_CATALOG_SCHEMA_VERSION = 1 as const;
@@ -204,6 +212,8 @@ export const pricingConfigSchema = z
     overrides: z
       .record(z.string().trim().min(1).max(MODEL_KEY_MAX_LENGTH), modelRatesSchema)
       .default({}),
+    /** Set to true once legacy `antigravity-accounts/pricing.json` overrides have been imported. */
+    legacyAntigravityImported: z.boolean().optional(),
   })
   .strict();
 
@@ -254,6 +264,8 @@ export interface ReferencePricingEntry {
   readonly rates: ModelRates;
   /** Optional short note (for example long-context tier pricing). */
   readonly note?: string;
+  /** Whether this entry is included in closest-official suggestions (defaults to `true`). */
+  readonly suggestable?: boolean;
 }
 
 /**
@@ -491,8 +503,76 @@ export const REFERENCE_PRICING: readonly ReferencePricingEntry[] = [
   },
 ];
 
+function antigravityProviderToFamily(provider: AntigravityDefaultPricingEntry["provider"]): ModelFamily {
+  if (provider === "Anthropic") return "Claude";
+  if (provider === "OpenAI") return "OpenAI";
+  return "Gemini";
+}
+
+function antigravityPrefixesForKey(key: string): string[] {
+  const prefixes = [key];
+  const dotsToHyphens = key.replace(/(\d)\.(\d)/g, "$1-$2");
+  if (dotsToHyphens !== key) prefixes.push(dotsToHyphens);
+  const hyphensToDots = key.replace(/(\d)-(\d)/g, "$1.$2");
+  if (hyphensToDots !== key && !prefixes.includes(hyphensToDots)) prefixes.push(hyphensToDots);
+  return prefixes;
+}
+
+function toReferenceEntryFromAntigravity(
+  entry: AntigravityDefaultPricingEntry,
+  at?: number,
+): ReferencePricingEntry {
+  const activeRates = at !== undefined ? antigravityOfficialRatesAt(entry, at) : entry.rates;
+  return {
+    key: entry.key,
+    label: entry.label,
+    family: antigravityProviderToFamily(entry.provider),
+    prefixes: antigravityPrefixesForKey(entry.key),
+    rates: toUsdDualCurrencyRates(activeRates),
+    ...(entry.note !== undefined ? { note: entry.note } : {}),
+    suggestable: false,
+  };
+}
+
+/**
+ * Antigravity built-in reference entries converted to dual-currency USD
+ * {@link ReferencePricingEntry} shape (sourced from `shared/antigravity/pricing-defaults.ts`).
+ */
+export const ANTIGRAVITY_REFERENCE_PRICING: readonly ReferencePricingEntry[] =
+  ANTIGRAVITY_DEFAULT_PRICING.map((entry) => toReferenceEntryFromAntigravity(entry));
+
+/**
+ * Keys that remain exclusively in the Antigravity reference layer so existing
+ * DSH non-standard model matching (`gemini-3.8-flash` proxy/relay fixture and
+ * `gemini-3.1-pro` -> `gemini-3-pro` canonical family key) stays unchanged.
+ */
+const ANTIGRAVITY_SCOPED_ONLY_KEYS = new Set<string>([
+  "gemini-3.1-pro",
+  "gemini-3.8-flash",
+]);
+
+const BASE_REFERENCE_KEYS = new Set<string>(REFERENCE_PRICING.map((entry) => entry.key));
+
+/**
+ * Extra Antigravity built-in models incorporated directly into the unified
+ * reference catalog (`gemini-4-neon/carbon/argon/hydrogen`, `claude-opus-5-5`,
+ * `claude-sonnet-5-5`, `gpt-oss-120b`, `gemini-3.6-flash`, `gemini-3.5-flash-lite`,
+ * `gemini-3.1-flash-lite`).
+ */
+const EXTRA_ANTIGRAVITY_REFERENCE_ENTRIES: readonly ReferencePricingEntry[] =
+  ANTIGRAVITY_REFERENCE_PRICING.filter(
+    (entry) => !BASE_REFERENCE_KEYS.has(entry.key) && !ANTIGRAVITY_SCOPED_ONLY_KEYS.has(entry.key),
+  );
+
+// Append non-conflicting Antigravity entries into the unified reference table.
+(REFERENCE_PRICING as ReferencePricingEntry[]).push(...EXTRA_ANTIGRAVITY_REFERENCE_ENTRIES);
+
 const REFERENCE_BY_KEY = new Map<string, ReferencePricingEntry>(
   REFERENCE_PRICING.map((entry) => [entry.key, entry]),
+);
+
+const ANTIGRAVITY_REFERENCE_BY_KEY = new Map<string, AntigravityDefaultPricingEntry>(
+  ANTIGRAVITY_DEFAULT_PRICING.map((entry) => [entry.key, entry]),
 );
 
 /** Flattened `(prefix, entry)` list sorted longest-prefix-first for unambiguous matching. */
@@ -550,14 +630,37 @@ function matchesPrefixWithBoundary(candidate: string, prefix: string): boolean {
 }
 
 /**
+ * Matches an Antigravity model ID, display label, or orchestrator/worker alias
+ * against `ANTIGRAVITY_DEFAULT_PRICING`, evaluating scheduled rate changes at
+ * timestamp `at` when provided.
+ */
+export function matchAntigravityReferenceEntry(
+  model: string,
+  at?: number,
+): ReferencePricingEntry | null {
+  const trimmed = model.trim();
+  if (!trimmed) return null;
+  const canonicalKey = resolveAntigravityPricingKey(trimmed);
+  const rawEntry = ANTIGRAVITY_REFERENCE_BY_KEY.get(canonicalKey) ?? getAntigravityDefaultPricingEntry(canonicalKey);
+  if (!rawEntry) return null;
+  return toReferenceEntryFromAntigravity(rawEntry, at);
+}
+
+/**
  * Matches a raw model ID (with or without `provider/` prefix) against the built-in
  * generic public model family reference table. Longest boundary-aligned prefix wins.
  */
-export function matchReferenceEntry(model: string): ReferencePricingEntry | null {
+export function matchReferenceEntry(model: string, at?: number): ReferencePricingEntry | null {
   const bare = stripProviderPrefix(model);
   if (!bare) return null;
   for (const item of SORTED_PREFIX_INDEX) {
     if (matchesPrefixWithBoundary(bare, item.prefix)) {
+      if (at !== undefined) {
+        const scheduledSource = ANTIGRAVITY_REFERENCE_BY_KEY.get(item.entry.key);
+        if (scheduledSource?.scheduled?.length) {
+          return toReferenceEntryFromAntigravity(scheduledSource, at);
+        }
+      }
       return item.entry;
     }
   }
@@ -1354,6 +1457,7 @@ function buildSuggestionCandidatePool(
   }
 
   for (const entry of REFERENCE_PRICING) {
+    if (entry.suggestable === false) continue;
     const id = normalizeModelKey(entry.key);
     if (!id || id.length > MODEL_KEY_MAX_LENGTH || seenIds.has(id)) continue;
     seenIds.add(id);
@@ -1637,6 +1741,8 @@ export interface PricingCallInput {
   model: string;
   provider?: string | null;
   tokens: TokenUsageInput;
+  /** Optional call timestamp (ms since epoch) used for scheduled official rate changes. */
+  at?: number;
 }
 
 export interface CallCostResult {
@@ -1679,7 +1785,7 @@ export interface PricingResolver {
   readonly usdToCnyRate: number;
   readonly hasCustomPricing: boolean;
   resolveKey(model: string, provider?: string | null): string;
-  resolveRates(model: string, provider?: string | null): ResolvedModelRates | null;
+  resolveRates(model: string, provider?: string | null, at?: number): ResolvedModelRates | null;
   priceCall(input: PricingCallInput): CallCostResult;
 }
 
@@ -1698,12 +1804,17 @@ function buildOverrideMap(
   return map;
 }
 
+function isAntigravityRequest(normModel: string, normProvider: string): boolean {
+  return normProvider === "antigravity" || normModel.startsWith("antigravity/");
+}
+
 function candidateOverrideKeys(
   normModel: string,
   bare: string,
   normProvider: string,
   synced: SyncedCatalogEntry | null,
   ref: ReferencePricingEntry | null,
+  extraCanonicalKeys?: readonly string[],
 ): string[] {
   const keys: string[] = [];
   const push = (candidate: string): void => {
@@ -1720,6 +1831,11 @@ function candidateOverrideKeys(
   if (bare && bare !== normModel) {
     push(bare);
   }
+  if (extraCanonicalKeys) {
+    for (const extra of extraCanonicalKeys) {
+      push(extra);
+    }
+  }
   if (synced) {
     push(synced.id);
   }
@@ -1734,15 +1850,22 @@ function resolveWithIndexes(
   provider: string | null | undefined,
   overrideMap: ReadonlyMap<string, ModelRates>,
   syncedIndex: SyncedCatalogIndex,
+  at?: number,
 ): ResolvedModelRates | null {
   const normModel = normalizeModelKey(model);
   if (!normModel) return null;
   const normProvider = provider ? normalizeModelKey(provider) : "";
   const bare = stripProviderPrefix(normModel);
-  const synced = matchSyncedWithIndex(normModel, normProvider, syncedIndex);
-  const ref = matchReferenceEntry(bare);
+  const antigravity = isAntigravityRequest(normModel, normProvider);
+  const agRef = antigravity ? matchAntigravityReferenceEntry(normModel, at) : null;
+  const genericRef = matchReferenceEntry(bare, at);
+  const ref = agRef ?? genericRef;
+  const synced = matchSyncedWithIndex(agRef ? agRef.key : normModel, normProvider, syncedIndex);
+  const extraKeys: string[] = [];
+  if (agRef) extraKeys.push(agRef.key);
+  if (genericRef && genericRef.key !== agRef?.key) extraKeys.push(genericRef.key);
 
-  for (const key of candidateOverrideKeys(normModel, bare, normProvider, synced, ref)) {
+  for (const key of candidateOverrideKeys(normModel, bare, normProvider, synced, ref, extraKeys)) {
     const override = overrideMap.get(key);
     if (override) {
       return {
@@ -1785,14 +1908,24 @@ function resolveKeyWithIndexes(
   if (!normModel) return "unknown";
   const normProvider = provider ? normalizeModelKey(provider) : "";
   const bare = stripProviderPrefix(normModel);
-  const synced = matchSyncedWithIndex(normModel, normProvider, syncedIndex);
-  const ref = matchReferenceEntry(bare);
+  const antigravity = isAntigravityRequest(normModel, normProvider);
+  const agRef = antigravity ? matchAntigravityReferenceEntry(normModel) : null;
+  const genericRef = matchReferenceEntry(bare);
+  const ref = agRef ?? genericRef;
+  const synced = matchSyncedWithIndex(agRef ? agRef.key : normModel, normProvider, syncedIndex);
+  const extraKeys: string[] = [];
+  if (agRef) extraKeys.push(agRef.key);
+  if (genericRef && genericRef.key !== agRef?.key) extraKeys.push(genericRef.key);
 
-  for (const key of candidateOverrideKeys(normModel, bare, normProvider, synced, ref)) {
+  for (const key of candidateOverrideKeys(normModel, bare, normProvider, synced, ref, extraKeys)) {
     if (overrideMap.has(key)) return key;
   }
   if (synced) return synced.id;
   if (ref) return ref.key;
+  if (antigravity) {
+    const fallbackKey = resolveAntigravityPricingKey(normModel);
+    if (fallbackKey && fallbackKey !== "unknown") return fallbackKey;
+  }
   return bare || normModel;
 }
 
@@ -1824,12 +1957,14 @@ export function resolveModelRates(
   overrides?: Readonly<Record<string, ModelRates>>,
   provider?: string | null,
   syncedCatalog?: SyncedPricingCatalog | null,
+  at?: number,
 ): ResolvedModelRates | null {
   return resolveWithIndexes(
     model,
     provider,
     buildOverrideMap(overrides),
     buildSyncedCatalogIndex(syncedCatalog),
+    at,
   );
 }
 
@@ -1904,7 +2039,7 @@ function priceCallWithIndexes(
   overrideMap: ReadonlyMap<string, ModelRates>,
   syncedIndex: SyncedCatalogIndex,
 ): CallCostResult {
-  const resolved = resolveWithIndexes(input.model, input.provider, overrideMap, syncedIndex);
+  const resolved = resolveWithIndexes(input.model, input.provider, overrideMap, syncedIndex, input.at);
   if (!resolved) {
     return {
       priced: false,
@@ -1969,8 +2104,8 @@ export function createPricingResolver(
     resolveKey(model: string, provider?: string | null): string {
       return resolveKeyWithIndexes(model, provider, overrideMap, syncedIndex);
     },
-    resolveRates(model: string, provider?: string | null): ResolvedModelRates | null {
-      return resolveWithIndexes(model, provider, overrideMap, syncedIndex);
+    resolveRates(model: string, provider?: string | null, at?: number): ResolvedModelRates | null {
+      return resolveWithIndexes(model, provider, overrideMap, syncedIndex, at);
     },
     priceCall(input: PricingCallInput): CallCostResult {
       return priceCallWithIndexes(input, displayCurrency, usdToCnyRate, overrideMap, syncedIndex);

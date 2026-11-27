@@ -30,6 +30,10 @@ export const USAGE_SCOPES = ["all", "main", "subagent"] as const;
 export const usageScopeSchema = z.enum(USAGE_SCOPES);
 export type UsageScope = z.infer<typeof usageScopeSchema>;
 
+export const USAGE_SOURCES = ["all", "dsh", "antigravity"] as const;
+export const usageSourceSchema = z.enum(USAGE_SOURCES);
+export type UsageSource = z.infer<typeof usageSourceSchema>;
+
 export const USAGE_CURRENCIES = ["USD", "CNY"] as const;
 export const usageCurrencySchema = z.enum(USAGE_CURRENCIES);
 export type UsageCurrency = z.infer<typeof usageCurrencySchema>;
@@ -99,6 +103,14 @@ export const usageProviderRowSchema = usageTotalsSchema.extend({
 });
 export type UsageProviderRow = z.infer<typeof usageProviderRowSchema>;
 
+/** Antigravity Google account filter chip entry (requests, tokens, and converted cost per account). */
+export const usageAccountRowSchema = usageTotalsSchema.extend({
+  id: z.string(),
+  label: z.string(),
+  sessions: z.number().int().nonnegative().optional(),
+});
+export type UsageAccountRow = z.infer<typeof usageAccountRowSchema>;
+
 export const usageModelPricedStateSchema = z.enum(["full", "partial", "none"]);
 export type UsageModelPricedState = z.infer<typeof usageModelPricedStateSchema>;
 
@@ -139,7 +151,9 @@ export const usageStatsInputSchema = z
   .object({
     range: usageStatsRangeInputSchema,
     scope: usageScopeSchema.optional(),
+    source: usageSourceSchema.optional(),
     provider: z.string().min(1).max(120).optional(),
+    account: z.string().min(1).max(160).optional(),
     model: z.string().min(1).max(240).optional(),
     currency: usageCurrencySchema.optional(),
   })
@@ -149,6 +163,10 @@ export type UsageStatsInput = z.infer<typeof usageStatsInputSchema>;
 export const usageStatsSchema = z.object({
   range: usageRangeSchema,
   scope: usageScopeSchema,
+  /** Active usage data source (`"all" | "dsh" | "antigravity"`). */
+  source: usageSourceSchema.optional(),
+  /** Sources currently attached/available on the server. */
+  availableSources: z.array(z.enum(["dsh", "antigravity"])).optional(),
   /** Nominal bin duration in ms (DST days can be 23h or 25h; each bin carries exact start/end). */
   binMs: z.number().int().positive(),
   /** Time-bucketed full-metric series for the interactive chart and hover tooltips. */
@@ -165,6 +183,8 @@ export const usageStatsSchema = z.object({
   hasSubagents: z.boolean(),
   /** Provider routing chips within the selected range and scope (before provider/model filter). */
   providers: z.array(usageProviderRowSchema),
+  /** Antigravity Google account chips within the selected range and scope (before account/model filter). */
+  accounts: z.array(usageAccountRowSchema).optional(),
   /** Per-(provider, model) rows within the selected range, provider, and scope (before model filter). */
   models: z.array(usageModelRowSchema),
   /** Distinct session count matching the active filters. */
@@ -208,7 +228,9 @@ export type UsageDailySummary = z.infer<typeof usageDailySummarySchema>;
 export const usageDailyInputSchema = z
   .object({
     scope: usageScopeSchema.optional(),
+    source: usageSourceSchema.optional(),
     provider: z.string().min(1).max(120).optional(),
+    account: z.string().min(1).max(160).optional(),
     model: z.string().min(1).max(240).optional(),
     currency: usageCurrencySchema.optional(),
   })
@@ -218,6 +240,10 @@ export type UsageDailyInput = z.infer<typeof usageDailyInputSchema>;
 export const usageDailySchema = z.object({
   /** Today in the daemon's local calendar (`YYYY-MM-DD`). */
   today: usageDayKeySchema,
+  /** Active usage data source (`"all" | "dsh" | "antigravity"`). */
+  source: usageSourceSchema.optional(),
+  /** Sources currently attached/available on the server. */
+  availableSources: z.array(z.enum(["dsh", "antigravity"])).optional(),
   /** Sparse active days in the last `DAILY_HISTORY_DAYS` (371) days, oldest first. */
   days: z.array(usageDaySchema),
   /** Full-window heatmap summary (active days, busiest day, active daily average, streak). */
@@ -259,6 +285,8 @@ export interface UsagePriceCallInput {
   model: string;
   provider?: string | null;
   tokens: UsageTokenInput;
+  /** Optional call timestamp (ms since epoch) for scheduled official rate changes. */
+  at?: number;
 }
 
 /** Result of `UsagePricer.priceCall`; structurally compatible with `shared/pricing.ts`'s `CallCostResult`. */

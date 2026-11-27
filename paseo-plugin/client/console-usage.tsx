@@ -20,17 +20,20 @@ import {
   useWindowDimensions,
 } from "react-native";
 import { pricingUpdateRpc } from "../shared/pricing";
+import type { CapabilitiesSnapshot } from "../shared/capabilities";
 import {
   deriveUsageMetrics,
   emptyUsageTotals,
   usageDailyRpc,
   usageStatsRpc,
+  type UsageAccountRow,
   type UsageBin,
   type UsageDaily,
   type UsageIndexingStatus,
   type UsageModelRow,
   type UsageRange,
   type UsageScope,
+  type UsageSource,
   type UsageStats,
   type UsageTotals,
 } from "../shared/usage";
@@ -79,15 +82,21 @@ const METRICS: readonly ChartMetric[] = [
 
 interface UsageCopy {
   title: string;
+  refreshButton: string;
   pricingButton: string;
   switchCurrencyLabel(currency: Currency, symbol: string): string;
   scopeAll: string;
   scopeMain: string;
   scopeSubagent: string;
+  sourceAll: string;
+  sourceDsh: string;
+  sourceAntigravity: string;
+  sourceAntigravityShort: string;
   rangeToday: string;
   range7d: string;
   range30d: string;
   allProviders: string;
+  allAccounts: string;
   filterModel(model: string): string;
   clearFilter: string;
   clearFilters: string;
@@ -132,20 +141,26 @@ interface UsageCopy {
 
 const COPY_EN: UsageCopy = {
   title: "Usage",
+  refreshButton: "Refresh usage",
   pricingButton: "Pricing",
   switchCurrencyLabel: (currency, symbol) =>
     `Switch display currency, currently ${currency} ${symbol}`,
   scopeAll: "All",
   scopeMain: "Main",
   scopeSubagent: "Subagent",
+  sourceAll: "All",
+  sourceDsh: "DSH",
+  sourceAntigravity: "Antigravity",
+  sourceAntigravityShort: "AGY",
   rangeToday: "Today",
   range7d: "7d",
   range30d: "30d",
   allProviders: "All providers",
+  allAccounts: "All accounts",
   filterModel: (model) => `Model: ${model}`,
   clearFilter: "Clear filter",
   clearFilters: "Clear filters",
-  indexingScanning: "Scanning DSH session logs…",
+  indexingScanning: "Scanning session logs…",
   indexingProgress: (done, total) => `Indexing session logs (${done} / ${total})`,
   retry: "Retry",
   loadErrorTitle: "Could not load usage statistics",
@@ -203,19 +218,25 @@ const COPY_EN: UsageCopy = {
 
 const COPY_ZH: UsageCopy = {
   title: "用量统计",
+  refreshButton: "刷新用量",
   pricingButton: "单价设置",
   switchCurrencyLabel: (currency, symbol) => `切换显示币种，当前 ${currency} ${symbol}`,
   scopeAll: "全部",
   scopeMain: "主对话",
   scopeSubagent: "子代理",
+  sourceAll: "全部",
+  sourceDsh: "DSH",
+  sourceAntigravity: "Antigravity",
+  sourceAntigravityShort: "AGY",
   rangeToday: "今天",
   range7d: "7天",
   range30d: "30天",
   allProviders: "全部路由",
+  allAccounts: "全部账号",
   filterModel: (model) => `模型：${model}`,
   clearFilter: "清除筛选",
   clearFilters: "清除全部筛选",
-  indexingScanning: "正在扫描 DSH 会话日志…",
+  indexingScanning: "正在扫描会话日志…",
   indexingProgress: (done, total) => `正在索引会话日志（${done} / ${total}）`,
   retry: "重试",
   loadErrorTitle: "无法加载用量统计",
@@ -1610,6 +1631,7 @@ function ModelTable({
 export interface ConsoleUsageTabProps {
   client: PluginClientContext;
   colors: Colors;
+  capabilities?: CapabilitiesSnapshot;
   displayCurrency?: Currency;
   pricingRevision?: number; // bumped when PricingDialog updates rates/currency
   onCurrencyChange?: (currency: Currency) => void;
@@ -1619,6 +1641,7 @@ export interface ConsoleUsageTabProps {
 export function ConsoleUsageTab({
   client,
   colors,
+  capabilities,
   displayCurrency,
   pricingRevision = 0,
   onCurrencyChange,
@@ -1628,12 +1651,35 @@ export function ConsoleUsageTab({
   const copy = locale === "zh-CN" ? COPY_ZH : COPY_EN;
   const windowDims = useWindowDimensions();
 
+  const dshVisible = capabilities ? capabilities.dshVisible : true;
+  const antigravityVisible = capabilities ? capabilities.antigravityVisible : false;
+  const bothVisible = dshVisible && antigravityVisible;
+
   const [measuredWidth, setMeasuredWidth] = useState(0);
+  const [selectedSource, setSelectedSource] = useState<UsageSource>("all");
   const [range, setRange] = useState<UsageRange>("today");
   const [scope, setScope] = useState<UsageScope>("all");
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
+  const [selectedAccount, setSelectedAccount] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState<SelectedModelFilter | null>(null);
   const [metric, setMetric] = useState<ChartMetric>("tokens");
+
+  const effectiveSource: UsageSource = bothVisible
+    ? selectedSource
+    : antigravityVisible && !dshVisible
+      ? "antigravity"
+      : "dsh";
+
+  // Reset source-specific filters when effective source changes (e.g. switcher tap or capability resolution).
+  const prevSourceRef = useRef<UsageSource>(effectiveSource);
+  useEffect(() => {
+    if (prevSourceRef.current !== effectiveSource) {
+      prevSourceRef.current = effectiveSource;
+      setSelectedProvider(null);
+      setSelectedAccount(null);
+      setSelectedModel(null);
+    }
+  }, [effectiveSource]);
 
   // Local currency override lets the toggle respond immediately and survive a failed pricingUpdateRpc.
   const [localCurrency, setLocalCurrency] = useState<Currency | undefined>(displayCurrency);
@@ -1643,11 +1689,14 @@ export function ConsoleUsageTab({
   const [daily, setDaily] = useState<UsageDaily | null>(null);
   const [statsTransitioning, setStatsTransitioning] = useState(false);
   const [dailyTransitioning, setDailyTransitioning] = useState(false);
+  const [manualRefreshing, setManualRefreshing] = useState(false);
   const [statsError, setStatsError] = useState<string | null>(null);
   const [dailyError, setDailyError] = useState<string | null>(null);
 
   const statsSeqRef = useRef(0);
   const dailySeqRef = useRef(0);
+  const hasStatsRef = useRef(false);
+  const hasDailyRef = useRef(false);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -1677,24 +1726,52 @@ export function ConsoleUsageTab({
   const effectiveCurrency: Currency =
     requestedCurrency ?? stats?.displayCurrency ?? daily?.displayCurrency ?? "USD";
 
+  const activeProviderFilter = effectiveSource === "dsh" ? selectedProvider : null;
+  const activeAccountFilter = effectiveSource === "antigravity" ? selectedAccount : null;
+
+  const isTransientTransportError = (error: unknown): boolean => {
+    const msg = error instanceof Error ? error.message : String(error ?? "");
+    return /stream end encountered|socket|connection closed|not connected|network|timed?\s*out|aborted|econn|eof/i.test(
+      msg,
+    );
+  };
+
   const fetchStats = useCallback(
     async (silent: boolean): Promise<UsageStats | null> => {
       const seq = ++statsSeqRef.current;
       if (!silent) setStatsTransitioning(true);
-      try {
-        const result = await client.rpc(usageStatsRpc, {
+      const callOnce = () =>
+        client.rpc(usageStatsRpc, {
           range,
           scope,
-          ...(selectedProvider ? { provider: selectedProvider } : {}),
+          source: effectiveSource,
+          ...(activeProviderFilter ? { provider: activeProviderFilter } : {}),
+          ...(activeAccountFilter ? { account: activeAccountFilter } : {}),
           ...(selectedModel ? { model: selectedModel.id } : {}),
           ...(requestedCurrency ? { currency: requestedCurrency } : {}),
         });
+      try {
+        let result: UsageStats;
+        try {
+          result = await callOnce();
+        } catch (firstError) {
+          // Paseo iOS relay sockets briefly raise "Stream end encountered" on wake/reconnect;
+          // retry once automatically before surfacing a red error banner.
+          if (!isTransientTransportError(firstError)) throw firstError;
+          await new Promise((resolve) => setTimeout(resolve, 650));
+          if (!mountedRef.current || seq !== statsSeqRef.current) return null;
+          result = await callOnce();
+        }
         if (!mountedRef.current || seq !== statsSeqRef.current) return null;
+        hasStatsRef.current = true;
         setStats(result);
         setStatsError(null);
         return result;
       } catch (error) {
         if (!mountedRef.current || seq !== statsSeqRef.current) return null;
+        if (silent && hasStatsRef.current && isTransientTransportError(error)) {
+          return null;
+        }
         setStatsError(error instanceof Error ? error.message : String(error));
         return null;
       } finally {
@@ -1703,26 +1780,42 @@ export function ConsoleUsageTab({
         }
       }
     },
-    [client, range, scope, selectedProvider, selectedModel, requestedCurrency],
+    [client, range, scope, effectiveSource, activeProviderFilter, activeAccountFilter, selectedModel, requestedCurrency],
   );
 
   const fetchDaily = useCallback(
     async (silent: boolean): Promise<UsageDaily | null> => {
       const seq = ++dailySeqRef.current;
       if (!silent) setDailyTransitioning(true);
-      try {
-        const result = await client.rpc(usageDailyRpc, {
+      const callOnce = () =>
+        client.rpc(usageDailyRpc, {
           scope,
-          ...(selectedProvider ? { provider: selectedProvider } : {}),
+          source: effectiveSource,
+          ...(activeProviderFilter ? { provider: activeProviderFilter } : {}),
+          ...(activeAccountFilter ? { account: activeAccountFilter } : {}),
           ...(selectedModel ? { model: selectedModel.id } : {}),
           ...(requestedCurrency ? { currency: requestedCurrency } : {}),
         });
+      try {
+        let result: UsageDaily;
+        try {
+          result = await callOnce();
+        } catch (firstError) {
+          if (!isTransientTransportError(firstError)) throw firstError;
+          await new Promise((resolve) => setTimeout(resolve, 650));
+          if (!mountedRef.current || seq !== dailySeqRef.current) return null;
+          result = await callOnce();
+        }
         if (!mountedRef.current || seq !== dailySeqRef.current) return null;
+        hasDailyRef.current = true;
         setDaily(result);
         setDailyError(null);
         return result;
       } catch (error) {
         if (!mountedRef.current || seq !== dailySeqRef.current) return null;
+        if (silent && hasDailyRef.current && isTransientTransportError(error)) {
+          return null;
+        }
         setDailyError(error instanceof Error ? error.message : String(error));
         return null;
       } finally {
@@ -1731,8 +1824,15 @@ export function ConsoleUsageTab({
         }
       }
     },
-    [client, scope, selectedProvider, selectedModel, requestedCurrency],
+    [client, scope, effectiveSource, activeProviderFilter, activeAccountFilter, selectedModel, requestedCurrency],
   );
+
+  const handleManualRefresh = useCallback(() => {
+    setManualRefreshing(true);
+    void Promise.all([fetchStats(false), fetchDaily(false)]).finally(() => {
+      if (mountedRef.current) setManualRefreshing(false);
+    });
+  }, [fetchStats, fetchDaily]);
 
   // Trigger stats fetch on filter/range/currency/pricing changes (retains previous data at opacity 0.6).
   useEffect(() => {
@@ -1794,6 +1894,7 @@ export function ConsoleUsageTab({
   const clearAllFilters = useCallback(() => {
     setScope("all");
     setSelectedProvider(null);
+    setSelectedAccount(null);
     setSelectedModel(null);
   }, []);
 
@@ -1812,11 +1913,20 @@ export function ConsoleUsageTab({
   const totals = useMemo(() => (stats ? deriveUsageMetrics(stats.totals) : null), [stats]);
   const hasSubagents = Boolean(stats?.hasSubagents);
   const showScopeControl = hasSubagents || scope !== "all";
-  const providerRows = stats?.providers ?? [];
-  const showFilterRow =
-    providerRows.length > 1 || selectedProvider !== null || selectedModel !== null;
+  const providerRows = effectiveSource === "dsh" ? (stats?.providers ?? []) : [];
+  const accountRows: readonly UsageAccountRow[] =
+    effectiveSource === "antigravity" ? (stats?.accounts ?? []) : [];
+  const showProviderChips =
+    effectiveSource === "dsh" && (providerRows.length > 1 || selectedProvider !== null);
+  const showAccountChips =
+    effectiveSource === "antigravity" && (accountRows.length > 1 || selectedAccount !== null);
+  const showFilterRow = showProviderChips || showAccountChips || selectedModel !== null;
   const unpricedCount = stats ? Math.max(0, stats.totals.requests - stats.totals.pricedRequests) : 0;
-  const hasActiveFilter = scope !== "all" || selectedProvider !== null || selectedModel !== null;
+  const hasActiveFilter =
+    scope !== "all" ||
+    activeProviderFilter !== null ||
+    activeAccountFilter !== null ||
+    selectedModel !== null;
 
   const indexingFraction =
     indexing && indexing.total > 0 ? Math.min(1, indexing.done / indexing.total) : 0;
@@ -1863,12 +1973,33 @@ export function ConsoleUsageTab({
 
   const currencySym = currencySymbol(effectiveCurrency);
 
+  const sourceControl = bothVisible ? (
+    <SegmentedControl<UsageSource>
+      colors={colors}
+      value={selectedSource}
+      size="sm"
+      options={[
+        { value: "all", label: copy.sourceAll },
+        { value: "dsh", label: copy.sourceDsh },
+        {
+          value: "antigravity",
+          label: isNarrow ? copy.sourceAntigravityShort : copy.sourceAntigravity,
+        },
+      ]}
+      onChange={(next) => {
+        setSelectedSource(next);
+        setSelectedProvider(null);
+        setSelectedAccount(null);
+        setSelectedModel(null);
+      }}
+    />
+  ) : null;
+
   const scopeControl = (
     <SegmentedControl<UsageScope>
       colors={colors}
       value={scope}
       size="sm"
-      fullWidth={isNarrow}
       options={[
         { value: "all", label: copy.scopeAll },
         { value: "main", label: copy.scopeMain },
@@ -1883,6 +2014,37 @@ export function ConsoleUsageTab({
 
   const compactTopControls = (
     <>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={copy.refreshButton}
+        disabled={manualRefreshing}
+        hitSlop={4}
+        onPress={handleManualRefresh}
+        style={(state) => {
+          const active =
+            !manualRefreshing &&
+            ((state as PressState).pressed || Boolean((state as PressState).hovered));
+          return {
+            width: 30,
+            height: 30,
+            borderRadius: radius.md,
+            borderWidth: 1,
+            borderColor: colors.border,
+            backgroundColor: active ? tint(colors.foreground, 0.06) : colors.surface1,
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+            opacity: manualRefreshing ? 0.65 : 1,
+          };
+        }}
+      >
+        {manualRefreshing ? (
+          <ActivityIndicator size="small" color={colors.accent} />
+        ) : (
+          <Icon name="RefreshCw" size={14} color={colors.foreground} />
+        )}
+      </Pressable>
+
       <Pressable
         accessibilityRole="button"
         accessibilityLabel={copy.switchCurrencyLabel(effectiveCurrency, currencySym)}
@@ -2066,6 +2228,130 @@ export function ConsoleUsageTab({
       </Pressable>
     ) : null;
 
+  const selectedAccountLabel = useMemo(() => {
+    if (!selectedAccount) return null;
+    return accountRows.find((row) => row.id === selectedAccount)?.label ?? selectedAccount;
+  }, [accountRows, selectedAccount]);
+
+  const accountScrollView = (
+    <ScrollView
+      horizontal
+      showsHorizontalScrollIndicator={false}
+      contentContainerStyle={{
+        flexDirection: "row",
+        alignItems: "center",
+        gap: space.xs + 2,
+        paddingRight: space.xs,
+      }}
+    >
+      <Pressable
+        accessibilityRole="button"
+        accessibilityState={{ selected: selectedAccount === null }}
+        onPress={() => {
+          setSelectedAccount(null);
+          setSelectedModel(null);
+        }}
+        style={(state) => ({
+          flexDirection: "row",
+          alignItems: "center",
+          paddingHorizontal: space.sm + 2,
+          height: 28,
+          borderRadius: radius.pill,
+          borderWidth: 1,
+          borderColor:
+            selectedAccount === null ? tint(colors.accent, 0.35) : colors.border,
+          backgroundColor:
+            selectedAccount === null
+              ? tint(colors.accent, 0.14)
+              : colors.surface1,
+          opacity: (state as PressState).pressed ? 0.75 : 1,
+        })}
+      >
+        <Text
+          numberOfLines={1}
+          style={{
+            ...font.caption,
+            fontWeight: selectedAccount === null ? "600" : "500",
+            color: selectedAccount === null ? colors.accent : colors.foregroundMuted,
+          }}
+        >
+          {copy.allAccounts}
+        </Text>
+      </Pressable>
+
+      {accountRows.map((row) => {
+        const active = selectedAccount === row.id;
+        const costText =
+          row.pricedRequests > 0
+            ? ` · ${money(row.cost, effectiveCurrency, locale)}`
+            : "";
+        return (
+          <Pressable
+            key={row.id}
+            accessibilityRole="button"
+            accessibilityState={{ selected: active }}
+            onPress={() => {
+              setSelectedAccount(active ? null : row.id);
+              setSelectedModel(null);
+            }}
+            style={(state) => ({
+              flexDirection: "row",
+              alignItems: "center",
+              paddingHorizontal: space.sm + 2,
+              height: 28,
+              borderRadius: radius.pill,
+              borderWidth: 1,
+              borderColor: active ? tint(colors.accent, 0.35) : colors.border,
+              backgroundColor: active ? tint(colors.accent, 0.14) : colors.surface1,
+              opacity: (state as PressState).pressed ? 0.75 : 1,
+            })}
+          >
+            <Text
+              numberOfLines={1}
+              style={{
+                ...font.caption,
+                ...tabular,
+                fontWeight: active ? "600" : "500",
+                color: active ? colors.accent : colors.foregroundMuted,
+              }}
+            >
+              {`${row.label} · ${integer(row.requests, locale)}${costText}`}
+            </Text>
+          </Pressable>
+        );
+      })}
+    </ScrollView>
+  );
+
+  const singleAccountChip =
+    effectiveSource === "antigravity" && accountRows.length <= 1 && selectedAccount !== null ? (
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`${copy.clearFilter}: ${selectedAccountLabel ?? selectedAccount}`}
+        onPress={() => {
+          setSelectedAccount(null);
+          setSelectedModel(null);
+        }}
+        style={(state) => ({
+          flexDirection: "row",
+          alignItems: "center",
+          gap: 4,
+          paddingHorizontal: space.sm + 2,
+          height: 28,
+          borderRadius: radius.pill,
+          borderWidth: 1,
+          borderColor: tint(colors.accent, 0.35),
+          backgroundColor: tint(colors.accent, 0.14),
+          opacity: (state as PressState).pressed ? 0.75 : 1,
+        })}
+      >
+        <Text numberOfLines={1} style={{ ...font.caption, fontWeight: "600", color: colors.accent }}>
+          {selectedAccountLabel ?? selectedAccount}
+        </Text>
+        <Icon name="X" size={12} color={colors.accent} />
+      </Pressable>
+    ) : null;
+
   const activeModelChip = selectedModel ? (
     <Pressable
       accessibilityRole="button"
@@ -2086,7 +2372,8 @@ export function ConsoleUsageTab({
     >
       <Text numberOfLines={1} style={{ ...font.caption, fontWeight: "600", color: colors.accent }}>
         {copy.filterModel(
-          providerRows.length > 1 && selectedProvider === null
+          (effectiveSource === "all" || (providerRows.length > 1 && selectedProvider === null)) &&
+            selectedModel.provider
             ? `${selectedModel.label} (${selectedModel.provider})`
             : selectedModel.label,
         )}
@@ -2106,7 +2393,7 @@ export function ConsoleUsageTab({
       {/* Top control bar */}
       {isNarrow ? (
         <View style={{ gap: space.sm }}>
-          {/* Row 1: Title + Currency + Pricing */}
+          {/* Row 1: Title + Refresh + Currency + Pricing */}
           <View
             style={{
               flexDirection: "row",
@@ -2134,45 +2421,63 @@ export function ConsoleUsageTab({
             </View>
           </View>
 
-          {/* Row 2: Scope switcher (full width when subagents exist or non-all scope is active) */}
-          {showScopeControl ? scopeControl : null}
-        </View>
-      ) : (
-        <View
-          style={{
-            flexDirection: "row",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: space.md,
-          }}
-        >
-          <Text
-            numberOfLines={1}
-            style={{ ...font.heading, color: colors.foreground, flexShrink: 0 }}
-          >
-            {copy.title}
-          </Text>
-
-          <View
-            style={{
-              flexDirection: "row",
-              alignItems: "center",
-              justifyContent: "flex-end",
-              gap: space.sm,
-              flexShrink: 1,
-              minWidth: 0,
-            }}
-          >
-            {showScopeControl ? scopeControl : null}
+          {/* Row 2: Compact inline Source (left) & Scope (right) on one clean row */}
+          {sourceControl || showScopeControl ? (
             <View
               style={{
                 flexDirection: "row",
+                flexWrap: "wrap",
                 alignItems: "center",
-                gap: space.xs + 2,
-                flexShrink: 0,
+                justifyContent: sourceControl && showScopeControl ? "space-between" : "flex-start",
+                gap: space.sm,
               }}
             >
-              {compactTopControls}
+              {sourceControl}
+              {showScopeControl ? scopeControl : null}
+            </View>
+          ) : null}
+        </View>
+      ) : (
+        <View style={{ gap: space.sm }}>
+          <View
+            style={{
+              flexDirection: "row",
+              flexWrap: "wrap",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: space.sm,
+            }}
+          >
+            <Text
+              numberOfLines={1}
+              style={{ ...font.heading, color: colors.foreground, flexShrink: 0 }}
+            >
+              {copy.title}
+            </Text>
+
+            <View
+              style={{
+                flexDirection: "row",
+                flexWrap: "wrap",
+                alignItems: "center",
+                justifyContent: "flex-end",
+                gap: space.sm,
+                flexShrink: 1,
+                minWidth: 0,
+              }}
+            >
+              {sourceControl}
+              {showScopeControl ? scopeControl : null}
+              <View
+                style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  gap: space.xs + 2,
+                  flexShrink: 0,
+                }}
+              >
+                {compactTopControls}
+              </View>
             </View>
           </View>
         </View>
@@ -2219,12 +2524,13 @@ export function ConsoleUsageTab({
         </View>
       ) : null}
 
-      {/* Provider routing filter chips + active model filter chip */}
+      {/* Adaptive filter chips: DSH providers, Antigravity Google accounts, + active model chip */}
       {showFilterRow ? (
         <View style={{ gap: space.xs + 2 }}>
-          {providerRows.length > 1 ? providerScrollView : null}
+          {effectiveSource === "dsh" && providerRows.length > 1 ? providerScrollView : null}
+          {effectiveSource === "antigravity" && accountRows.length > 1 ? accountScrollView : null}
 
-          {singleProviderChip || activeModelChip ? (
+          {singleProviderChip || singleAccountChip || activeModelChip ? (
             <View
               style={{
                 flexDirection: "row",
@@ -2233,7 +2539,8 @@ export function ConsoleUsageTab({
                 gap: space.xs + 2,
               }}
             >
-              {singleProviderChip}
+              {effectiveSource === "dsh" ? singleProviderChip : null}
+              {effectiveSource === "antigravity" ? singleAccountChip : null}
               {activeModelChip}
             </View>
           ) : null}

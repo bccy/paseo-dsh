@@ -30,6 +30,7 @@ import {
   normalizeUsagePricingKey,
   usageDailyRpc,
   usageStatsRpc,
+  type UsageAccountRow,
   type UsageBin,
   type UsageCurrency,
   type UsageDaily,
@@ -44,6 +45,7 @@ import {
   type UsageProviderRow,
   type UsageRange,
   type UsageScope,
+  type UsageSource,
   type UsageSparklines,
   type UsageStats,
   type UsageStatsInput,
@@ -111,6 +113,29 @@ export interface UsageRefreshReport {
   corrupt: number;
 }
 
+/** Normalized Antigravity model call record supplied by `server/antigravity/stats.ts`. */
+export interface AntigravityUsageRecord {
+  at: number;
+  conversationId: string;
+  isSubagent: boolean;
+  accountId: string | null;
+  modelId: string | null;
+  label: string;
+  pricingKey: string;
+  input: number;
+  cached: number;
+  output: number;
+  firstToken: number;
+  generation: number;
+}
+
+/** Structural adapter for querying Antigravity usage alongside DSH session logs. */
+export interface AntigravityStatsAdapter {
+  allRecords(): Promise<readonly AntigravityUsageRecord[]>;
+  seenPricingModels?(): Promise<ReadonlyMap<string, string>>;
+  accountLabels?(): Promise<Readonly<Record<string, string>>> | Readonly<Record<string, string>>;
+}
+
 export interface UsageStatsEngineOptions {
   /** Override `$DSH_HOME` (primarily for tests and benchmarks). */
   dshHome?: string;
@@ -120,6 +145,8 @@ export interface UsageStatsEngineOptions {
   cachePath?: string;
   /** Structural pricer, factory, or `PricingStore` for dual-currency cost aggregation (defaults to unpriced). */
   pricer?: UsagePricerSource;
+  /** Optional Antigravity usage stats reader (`server/antigravity/stats.ts`) for unified multi-source analytics. */
+  antigravityStats?: AntigravityStatsAdapter | null;
   /** Files processed concurrently per async batch during indexing (clamped 1..32, default 8). */
   concurrency?: number;
   /** Delay before background prewarm starts (ms, default 3000). */
@@ -620,8 +647,60 @@ function accumulateCall(totals: UsageTotals, call: CachedCallRecord, cost: numbe
   }
 }
 
-function matchesModelFilter(provider: string, model: string, filterModel: string): boolean {
-  return model === filterModel || `${provider}/${model}` === filterModel;
+function matchesModelFilter(
+  provider: string,
+  model: string,
+  filterModel: string,
+  extraCandidates?: readonly (string | null | undefined)[],
+): boolean {
+  if (model === filterModel || `${provider}/${model}` === filterModel) return true;
+  if (extraCandidates) {
+    for (const candidate of extraCandidates) {
+      if (candidate && (candidate === filterModel || `${provider}/${candidate}` === filterModel)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+const ANTIGRAVITY_PROVIDER = "antigravity" as const;
+
+function antigravityRecordToCall(record: AntigravityUsageRecord): CachedCallRecord {
+  const input = nonNegNumber(record.input);
+  const cached = nonNegNumber(record.cached);
+  const output = nonNegNumber(record.output);
+  const label = nonEmptyString(record.label) ?? nonEmptyString(record.modelId) ?? nonEmptyString(record.pricingKey) ?? "Unknown model";
+
+  let firstTokenSec: number | undefined;
+  if (typeof record.firstToken === "number" && Number.isFinite(record.firstToken) && record.firstToken > 0) {
+    firstTokenSec = roundMillis(Math.min(USAGE_MAX_TTFT_SECONDS, record.firstToken));
+  }
+
+  let generationSec: number | undefined;
+  if (
+    typeof record.generation === "number" &&
+    Number.isFinite(record.generation) &&
+    record.generation > 0 &&
+    output > 0
+  ) {
+    const tps = output / record.generation;
+    if (tps <= USAGE_MAX_TPS) {
+      generationSec = roundMillis(record.generation);
+    }
+  }
+
+  const call: CachedCallRecord = {
+    at: record.at,
+    provider: ANTIGRAVITY_PROVIDER,
+    model: label,
+    input,
+    cached,
+    output,
+  };
+  if (firstTokenSec !== undefined) call.firstTokenSec = firstTokenSec;
+  if (generationSec !== undefined) call.generationSec = generationSec;
+  return call;
 }
 
 function isSupportedSessionFile(name: string): { supported: boolean; isZstd: boolean } {
@@ -768,9 +847,10 @@ function priceCallInCurrency(
   call: CachedCallRecord,
   targetCurrency: UsageCurrency,
   usdToCnyRate: number,
+  pricingModelOverride?: string,
 ): { pricingKey: string; cost: number | null } {
   const result = pricer.priceCall({
-    model: call.model,
+    model: pricingModelOverride ?? call.model,
     provider: call.provider,
     tokens: {
       input: call.input,
@@ -778,6 +858,7 @@ function priceCallInCurrency(
       cacheWrite: call.cacheWrite ?? 0,
       output: call.output,
     },
+    at: call.at,
   });
   if (!result.priced) {
     return { pricingKey: result.pricingKey, cost: null };
@@ -816,6 +897,7 @@ export class UsageStatsEngine {
 
   private readonly now: () => number;
   private pricer: UsagePricerSource;
+  private antigravityStats: AntigravityStatsAdapter | null;
   private readonly entries = new Map<string, CachedSessionEntry>();
   private diskCacheLoaded: Promise<void> | null = null;
   private activeRefresh: Promise<UsageRefreshReport> | null = null;
@@ -830,6 +912,7 @@ export class UsageStatsEngine {
     this.sessionsDir = options.sessionsDir ?? path.join(resolvedHome, "sessions");
     this.cachePath = options.cachePath ?? usageCachePath(resolvedHome);
     this.pricer = options.pricer ?? UNPRICED_PRICER;
+    this.antigravityStats = options.antigravityStats ?? null;
     const rawConc = options.concurrency ?? DEFAULT_CONCURRENCY;
     this.concurrency = Math.min(32, Math.max(1, Math.floor(rawConc)));
     this.prewarmDelayMs = Math.max(0, options.prewarmDelayMs ?? DEFAULT_PREWARM_DELAY_MS);
@@ -839,6 +922,10 @@ export class UsageStatsEngine {
 
   setPricer(pricer: UsagePricerSource): void {
     this.pricer = pricer;
+  }
+
+  setAntigravityStats(adapter: AntigravityStatsAdapter | null): void {
+    this.antigravityStats = adapter;
   }
 
   getIndexingStatus(): UsageIndexingStatus {
@@ -1081,35 +1168,99 @@ export class UsageStatsEngine {
     }
   }
 
+  private resolveEffectiveSource(requested?: UsageSource): UsageSource {
+    if (requested !== undefined) return requested;
+    return this.antigravityStats ? "all" : "dsh";
+  }
+
+  private availableSources(): Array<"dsh" | "antigravity"> {
+    return this.antigravityStats ? ["dsh", "antigravity"] : ["dsh"];
+  }
+
+  private async loadAntigravityRecords(): Promise<readonly AntigravityUsageRecord[]> {
+    if (!this.antigravityStats) return [];
+    return await this.antigravityStats.allRecords();
+  }
+
+  private async loadAntigravityAccountLabels(): Promise<Readonly<Record<string, string>>> {
+    if (!this.antigravityStats?.accountLabels) return {};
+    try {
+      return (await this.antigravityStats.accountLabels()) ?? {};
+    } catch {
+      return {};
+    }
+  }
+
   /**
    * List distinct models observed across indexed sessions (useful for seeding
    * the pricing dialog with locally seen models).
    */
   async seenModels(options?: UsageQueryOptions): Promise<Array<{ provider: string; model: string; pricingKey: string }>> {
-    await this.prepareSnapshot(options);
-    const pricerSnapshot = await resolvePricer(this.pricer);
+    const [, agRecords, pricerSnapshot] = await Promise.all([
+      this.prepareSnapshot(options),
+      this.loadAntigravityRecords().catch(() => [] as readonly AntigravityUsageRecord[]),
+      resolvePricer(this.pricer),
+    ]);
     const seen = new Map<string, { provider: string; model: string; pricingKey: string }>();
+    const resolveKeyFor = (model: string, provider: string): string =>
+      pricerSnapshot.resolveKey
+        ? pricerSnapshot.resolveKey(model, provider)
+        : pricerSnapshot.priceCall({
+            model,
+            provider,
+            tokens: { input: 0, cached: 0, cacheWrite: 0, output: 0 },
+          }).pricingKey || normalizeUsagePricingKey(model);
+
     for (const entry of this.entries.values()) {
       for (const call of entry.calls) {
         const key = `${call.provider}/${call.model}`;
         if (seen.has(key)) continue;
-        const pricingKey = pricerSnapshot.resolveKey
-          ? pricerSnapshot.resolveKey(call.model, call.provider)
-          : pricerSnapshot.priceCall({
-              model: call.model,
-              provider: call.provider,
-              tokens: { input: 0, cached: 0, cacheWrite: 0, output: 0 },
-            }).pricingKey || normalizeUsagePricingKey(call.model);
-        seen.set(key, { provider: call.provider, model: call.model, pricingKey });
+        seen.set(key, {
+          provider: call.provider,
+          model: call.model,
+          pricingKey: resolveKeyFor(call.model, call.provider),
+        });
       }
     }
+
+    for (const record of agRecords) {
+      const label =
+        nonEmptyString(record.label) ??
+        nonEmptyString(record.modelId) ??
+        nonEmptyString(record.pricingKey) ??
+        "Unknown model";
+      const key = `${ANTIGRAVITY_PROVIDER}/${label}`;
+      if (seen.has(key)) continue;
+      const pricingLookup = nonEmptyString(record.pricingKey) ?? nonEmptyString(record.modelId) ?? label;
+      seen.set(key, {
+        provider: ANTIGRAVITY_PROVIDER,
+        model: label,
+        pricingKey: resolveKeyFor(pricingLookup, ANTIGRAVITY_PROVIDER),
+      });
+    }
+
     return [...seen.values()].sort((a, b) => a.model.localeCompare(b.model) || a.provider.localeCompare(b.provider));
   }
 
   /** Map of `pricingKey -> display model label` compatible with `PricingStore.state(seenModels)`. */
   async seenPricingModels(options?: UsageQueryOptions): Promise<Map<string, string>> {
-    const list = await this.seenModels(options);
+    const [list, agSeen, pricerSnapshot] = await Promise.all([
+      this.seenModels(options),
+      this.antigravityStats?.seenPricingModels
+        ? this.antigravityStats.seenPricingModels().catch(() => new Map<string, string>())
+        : Promise.resolve(new Map<string, string>()),
+      resolvePricer(this.pricer),
+    ]);
     const map = new Map<string, string>();
+    // Prefer clean Antigravity family labels (e.g. "Gemini 4 Carbon" without effort suffix).
+    for (const [rawKey, rawLabel] of agSeen.entries()) {
+      const key = pricerSnapshot.resolveKey
+        ? pricerSnapshot.resolveKey(rawKey, ANTIGRAVITY_PROVIDER)
+        : normalizeUsagePricingKey(rawKey);
+      if (key && key !== "unknown" && !map.has(key)) {
+        map.set(key, rawLabel.trim() || key);
+      }
+    }
     for (const item of list) {
       if (!map.has(item.pricingKey)) {
         map.set(item.pricingKey, item.model);
@@ -1120,8 +1271,20 @@ export class UsageStatsEngine {
 
   /** Compute time-windowed usage analytics (`dsh.usage.stats`). */
   async stats(input: UsageStatsInput, options?: UsageQueryOptions): Promise<UsageStats> {
-    await this.prepareSnapshot(options);
-    const pricerSnapshot = await resolvePricer(this.pricer);
+    const effectiveSource = this.resolveEffectiveSource(input.source);
+    const availableSources = this.availableSources();
+    const includeDsh = effectiveSource === "dsh" || effectiveSource === "all";
+    const includeAntigravity =
+      (effectiveSource === "antigravity" || effectiveSource === "all") &&
+      this.antigravityStats !== null;
+
+    const [, agRecords, accountLabels, pricerSnapshot] = await Promise.all([
+      includeDsh ? this.prepareSnapshot(options) : Promise.resolve(),
+      includeAntigravity ? this.loadAntigravityRecords() : Promise.resolve([] as readonly AntigravityUsageRecord[]),
+      includeAntigravity ? this.loadAntigravityAccountLabels() : Promise.resolve({} as Readonly<Record<string, string>>),
+      resolvePricer(this.pricer),
+    ]);
+
     const displayCurrency: UsageCurrency = input.currency ?? pricerSnapshot.displayCurrency;
     const usdToCnyRate =
       Number.isFinite(pricerSnapshot.usdToCnyRate) && pricerSnapshot.usdToCnyRate > 0
@@ -1131,6 +1294,7 @@ export class UsageStatsEngine {
     const range: UsageRange = (input.range as string) === "24h" ? "today" : input.range;
     const scope: UsageScope = input.scope ?? "all";
     const filterProvider = input.provider;
+    const filterAccount = input.account;
     const filterModel = input.model;
     const { binMs } = RANGES[range];
     const now = this.now();
@@ -1156,6 +1320,7 @@ export class UsageStatsEngine {
     const totals = emptyUsageTotals();
     const breakdown = { main: emptyUsageTotals(), subagent: emptyUsageTotals() };
     const providerMap = new Map<string, { totals: UsageTotals; sessions: Set<string> }>();
+    const accountMap = new Map<string, { totals: UsageTotals; sessions: Set<string> }>();
     const modelMap = new Map<
       string,
       {
@@ -1169,49 +1334,123 @@ export class UsageStatsEngine {
     const sessionSet = new Set<string>();
     let hasSubagents = false;
 
-    for (const [sessionKey, entry] of this.entries) {
-      for (const call of entry.calls) {
-        if (entry.isSubagent && call.at >= dailyStart && call.at <= lastEnd) {
+    const inRange = (at: number): boolean =>
+      range === "today" ? at >= firstStart && at < windowEnd : at >= firstStart && at <= lastEnd;
+
+    if (includeDsh) {
+      for (const [sessionKey, entry] of this.entries) {
+        for (const call of entry.calls) {
+          if (entry.isSubagent && call.at >= dailyStart && call.at <= lastEnd) {
+            hasSubagents = true;
+          }
+          if (!inRange(call.at)) continue;
+
+          const { pricingKey, cost: callCost } = priceCallInCurrency(
+            pricerSnapshot,
+            call,
+            displayCurrency,
+            usdToCnyRate,
+          );
+
+          // Provider chips: scoped by range + scope, BEFORE provider/model filters so users can switch freely.
+          if (!filterAccount && (scope === "all" || (scope === "subagent") === entry.isSubagent)) {
+            let prov = providerMap.get(call.provider);
+            if (!prov) {
+              prov = { totals: emptyUsageTotals(), sessions: new Set() };
+              providerMap.set(call.provider, prov);
+            }
+            accumulateCall(prov.totals, call, callCost);
+            prov.sessions.add(sessionKey);
+          }
+
+          if (filterAccount) continue;
+          if (filterProvider && call.provider !== filterProvider) continue;
+
+          // Main vs subagent split within selected range & provider (before scope/model filter).
+          accumulateCall(entry.isSubagent ? breakdown.subagent : breakdown.main, call, callCost);
+
+          if (scope === "main" && entry.isSubagent) continue;
+          if (scope === "subagent" && !entry.isSubagent) continue;
+
+          // Model table: scoped by range + provider + scope, BEFORE model filter so clicking a row cross-filters cleanly.
+          const modelKey = `${call.provider}/${call.model}`;
+          let modelEntry = modelMap.get(modelKey);
+          if (!modelEntry) {
+            modelEntry = {
+              provider: call.provider,
+              model: call.model,
+              pricingKey,
+              totals: emptyUsageTotals(),
+              sessions: new Set(),
+            };
+            modelMap.set(modelKey, modelEntry);
+          }
+          accumulateCall(modelEntry.totals, call, callCost);
+          modelEntry.sessions.add(sessionKey);
+
+          if (filterModel && !matchesModelFilter(call.provider, call.model, filterModel)) continue;
+
+          const binIdx = findBinIndex(windows, call.at);
+          if (binIdx >= 0) {
+            accumulateCall(bins[binIdx]!, call, callCost);
+          } else if (call.at >= windows[windows.length - 1]!.start) {
+            accumulateCall(bins[bins.length - 1]!, call, callCost);
+          }
+
+          accumulateCall(totals, call, callCost);
+          sessionSet.add(sessionKey);
+        }
+      }
+    }
+
+    if (includeAntigravity) {
+      for (const record of agRecords) {
+        if (record.isSubagent && record.at >= dailyStart && record.at <= lastEnd) {
           hasSubagents = true;
         }
-        if (range === "today") {
-          if (call.at < firstStart || call.at >= windowEnd) continue;
-        } else if (call.at < firstStart || call.at > lastEnd) {
-          continue;
-        }
+        if (!inRange(record.at)) continue;
 
-        const { pricingKey, cost: callCost } = priceCallInCurrency(
+        const call = antigravityRecordToCall(record);
+        const pricingInputModel =
+          nonEmptyString(record.pricingKey) ?? nonEmptyString(record.modelId) ?? call.model;
+        const { pricingKey: resolvedKey, cost: callCost } = priceCallInCurrency(
           pricerSnapshot,
           call,
           displayCurrency,
           usdToCnyRate,
+          pricingInputModel,
         );
+        const pricingKey = resolvedKey || record.pricingKey || normalizeUsagePricingKey(call.model);
+        const sessionKey = `ag:${record.conversationId}`;
 
-        // Provider chips: scoped by range + scope, BEFORE provider/model filters so users can switch freely.
-        if (scope === "all" || (scope === "subagent") === entry.isSubagent) {
-          let prov = providerMap.get(call.provider);
-          if (!prov) {
-            prov = { totals: emptyUsageTotals(), sessions: new Set() };
-            providerMap.set(call.provider, prov);
+        // Account chips: scoped by range + scope, BEFORE account/model filters so users can switch freely.
+        if (
+          record.accountId &&
+          (!filterProvider || filterProvider === ANTIGRAVITY_PROVIDER) &&
+          (scope === "all" || (scope === "subagent") === record.isSubagent)
+        ) {
+          let acct = accountMap.get(record.accountId);
+          if (!acct) {
+            acct = { totals: emptyUsageTotals(), sessions: new Set() };
+            accountMap.set(record.accountId, acct);
           }
-          accumulateCall(prov.totals, call, callCost);
-          prov.sessions.add(sessionKey);
+          accumulateCall(acct.totals, call, callCost);
+          acct.sessions.add(sessionKey);
         }
 
-        if (filterProvider && call.provider !== filterProvider) continue;
+        if (filterProvider && filterProvider !== ANTIGRAVITY_PROVIDER) continue;
+        if (filterAccount && record.accountId !== filterAccount) continue;
 
-        // Main vs subagent split within selected range & provider (before scope/model filter).
-        accumulateCall(entry.isSubagent ? breakdown.subagent : breakdown.main, call, callCost);
+        accumulateCall(record.isSubagent ? breakdown.subagent : breakdown.main, call, callCost);
 
-        if (scope === "main" && entry.isSubagent) continue;
-        if (scope === "subagent" && !entry.isSubagent) continue;
+        if (scope === "main" && record.isSubagent) continue;
+        if (scope === "subagent" && !record.isSubagent) continue;
 
-        // Model table: scoped by range + provider + scope, BEFORE model filter so clicking a row cross-filters cleanly.
-        const modelKey = `${call.provider}/${call.model}`;
+        const modelKey = `${ANTIGRAVITY_PROVIDER}/${call.model}`;
         let modelEntry = modelMap.get(modelKey);
         if (!modelEntry) {
           modelEntry = {
-            provider: call.provider,
+            provider: ANTIGRAVITY_PROVIDER,
             model: call.model,
             pricingKey,
             totals: emptyUsageTotals(),
@@ -1222,7 +1461,15 @@ export class UsageStatsEngine {
         accumulateCall(modelEntry.totals, call, callCost);
         modelEntry.sessions.add(sessionKey);
 
-        if (filterModel && !matchesModelFilter(call.provider, call.model, filterModel)) continue;
+        if (
+          filterModel &&
+          !matchesModelFilter(ANTIGRAVITY_PROVIDER, call.model, filterModel, [
+            record.modelId,
+            record.pricingKey,
+          ])
+        ) {
+          continue;
+        }
 
         const binIdx = findBinIndex(windows, call.at);
         if (binIdx >= 0) {
@@ -1293,9 +1540,20 @@ export class UsageStatsEngine {
       }))
       .sort((a, b) => b.requests - a.requests || b.totalTokens - a.totalTokens || a.provider.localeCompare(b.provider));
 
+    const accounts: UsageAccountRow[] = [...accountMap.entries()]
+      .map(([id, item]) => ({
+        id,
+        label: accountLabels[id] ?? id,
+        sessions: item.sessions.size,
+        ...item.totals,
+      }))
+      .sort((a, b) => b.requests - a.requests || b.totalTokens - a.totalTokens || a.label.localeCompare(b.label));
+
     return {
       range,
       scope,
+      source: effectiveSource,
+      availableSources,
       binMs,
       bins,
       sparklines,
@@ -1303,20 +1561,32 @@ export class UsageStatsEngine {
       breakdown,
       hasSubagents: hasSubagents || breakdown.subagent.requests > 0,
       providers,
+      accounts,
       models,
       sessions: sessionSet.size,
       displayCurrency,
       usdToCnyRate,
       hasCustomPricing: pricerSnapshot.hasCustomPricing,
-      indexing: this.getIndexingStatus(),
+      indexing: includeDsh ? this.getIndexingStatus() : { active: false, done: 0, total: 0 },
       generatedAt: new Date(now).toISOString(),
     };
   }
 
   /** Compute 53-week (371-day) daily rollup (`dsh.usage.daily`). */
   async daily(input: UsageDailyInput = {}, options?: UsageQueryOptions): Promise<UsageDaily> {
-    await this.prepareSnapshot(options);
-    const pricerSnapshot = await resolvePricer(this.pricer);
+    const effectiveSource = this.resolveEffectiveSource(input.source);
+    const availableSources = this.availableSources();
+    const includeDsh = effectiveSource === "dsh" || effectiveSource === "all";
+    const includeAntigravity =
+      (effectiveSource === "antigravity" || effectiveSource === "all") &&
+      this.antigravityStats !== null;
+
+    const [, agRecords, pricerSnapshot] = await Promise.all([
+      includeDsh ? this.prepareSnapshot(options) : Promise.resolve(),
+      includeAntigravity ? this.loadAntigravityRecords() : Promise.resolve([] as readonly AntigravityUsageRecord[]),
+      resolvePricer(this.pricer),
+    ]);
+
     const displayCurrency: UsageCurrency = input.currency ?? pricerSnapshot.displayCurrency;
     const usdToCnyRate =
       Number.isFinite(pricerSnapshot.usdToCnyRate) && pricerSnapshot.usdToCnyRate > 0
@@ -1325,6 +1595,7 @@ export class UsageStatsEngine {
 
     const scope: UsageScope = input.scope ?? "all";
     const filterProvider = input.provider;
+    const filterAccount = input.account;
     const filterModel = input.model;
     const now = this.now();
     const anchor = new Date(now);
@@ -1339,20 +1610,63 @@ export class UsageStatsEngine {
     const dayMap = new Map<string, UsageTotals>();
     let hasSubagents = false;
 
-    for (const entry of this.entries.values()) {
-      for (const call of entry.calls) {
-        if (call.at < firstStart || call.at > lastEnd) continue;
-        if (entry.isSubagent) hasSubagents = true;
-        if (filterProvider && call.provider !== filterProvider) continue;
-        if (scope === "main" && entry.isSubagent) continue;
-        if (scope === "subagent" && !entry.isSubagent) continue;
-        if (filterModel && !matchesModelFilter(call.provider, call.model, filterModel)) continue;
+    if (includeDsh) {
+      for (const entry of this.entries.values()) {
+        for (const call of entry.calls) {
+          if (call.at < firstStart || call.at > lastEnd) continue;
+          if (entry.isSubagent) hasSubagents = true;
+          if (filterAccount) continue;
+          if (filterProvider && call.provider !== filterProvider) continue;
+          if (scope === "main" && entry.isSubagent) continue;
+          if (scope === "subagent" && !entry.isSubagent) continue;
+          if (filterModel && !matchesModelFilter(call.provider, call.model, filterModel)) continue;
 
+          const { cost: callCost } = priceCallInCurrency(
+            pricerSnapshot,
+            call,
+            displayCurrency,
+            usdToCnyRate,
+          );
+
+          const key = localDayKey(Math.min(call.at, tomorrowStart - 1));
+          let totals = dayMap.get(key);
+          if (!totals) {
+            totals = emptyUsageTotals();
+            dayMap.set(key, totals);
+          }
+          accumulateCall(totals, call, callCost);
+        }
+      }
+    }
+
+    if (includeAntigravity) {
+      for (const record of agRecords) {
+        if (record.at < firstStart || record.at > lastEnd) continue;
+        if (record.isSubagent) hasSubagents = true;
+        if (filterProvider && filterProvider !== ANTIGRAVITY_PROVIDER) continue;
+        if (filterAccount && record.accountId !== filterAccount) continue;
+        if (scope === "main" && record.isSubagent) continue;
+        if (scope === "subagent" && !record.isSubagent) continue;
+
+        const call = antigravityRecordToCall(record);
+        if (
+          filterModel &&
+          !matchesModelFilter(ANTIGRAVITY_PROVIDER, call.model, filterModel, [
+            record.modelId,
+            record.pricingKey,
+          ])
+        ) {
+          continue;
+        }
+
+        const pricingInputModel =
+          nonEmptyString(record.pricingKey) ?? nonEmptyString(record.modelId) ?? call.model;
         const { cost: callCost } = priceCallInCurrency(
           pricerSnapshot,
           call,
           displayCurrency,
           usdToCnyRate,
+          pricingInputModel,
         );
 
         const key = localDayKey(Math.min(call.at, tomorrowStart - 1));
@@ -1408,6 +1722,8 @@ export class UsageStatsEngine {
 
     return {
       today,
+      source: effectiveSource,
+      availableSources,
       days,
       summary: {
         totalTokens,
@@ -1422,7 +1738,7 @@ export class UsageStatsEngine {
       hasSubagents,
       displayCurrency,
       usdToCnyRate,
-      indexing: this.getIndexingStatus(),
+      indexing: includeDsh ? this.getIndexingStatus() : { active: false, done: 0, total: 0 },
       generatedAt: new Date(now).toISOString(),
     };
   }

@@ -8,7 +8,7 @@
  *
  * @module dsh-paseo/client/console-settings
  */
-import { useRef, useState, type ReactNode } from "react";
+import { Fragment, useRef, useState, type ReactNode } from "react";
 import { ActivityIndicator, Platform, Pressable, Text, View } from "react-native";
 import { Icon } from "@getpaseo/plugin/client/ui";
 import type { PluginHostProps } from "@getpaseo/plugin/client";
@@ -102,6 +102,10 @@ export interface ConsoleSettingsTabProps extends ConsoleSettingsEnvironmentProps
   readonly host: PluginHostProps["host"];
   readonly compact: boolean;
   readonly pricing?: PricingPreferencesSlot;
+  /** Whether DSH CLI or DSH session history was detected on this host (default `true`). */
+  readonly dshVisible?: boolean;
+  /** Whether Antigravity CLI, logs, or accounts were detected on this host (default `false`). */
+  readonly antigravityVisible?: boolean;
 }
 
 function SectionHeading({
@@ -139,11 +143,64 @@ function checkStatusTone(status: DiagnosticsCheckStatus): Tone {
   return "danger";
 }
 
+function CliSetupGuidanceSection({
+  colors,
+  compact,
+}: {
+  colors: Colors;
+  compact: boolean;
+}) {
+  const copy = useLocaleText().console.setup;
+  const items = [
+    { key: "dsh", icon: "Terminal", title: copy.dshTitle, hint: copy.dshHint },
+    { key: "agy", icon: "Sparkles", title: copy.agyTitle, hint: copy.agyHint },
+  ] as const;
+
+  return (
+    <View testID="dsh-console-setup-guidance" style={{ gap: space.md }}>
+      <Callout colors={colors} tone="accent" icon="Info" title={copy.title}>
+        <Muted colors={colors}>{copy.description}</Muted>
+      </Callout>
+      {renderHostSettingsCard(
+        colors,
+        <>
+          {items.map((item) => (
+            <Fragment key={item.key}>
+              {renderHostSettingsRow(colors, {
+                label: item.title,
+                hint: item.hint,
+                compact,
+                inline: true,
+                children: (
+                  <View
+                    style={{
+                      width: 28,
+                      height: 28,
+                      borderRadius: radius.sm,
+                      alignItems: "center",
+                      justifyContent: "center",
+                      backgroundColor: tint(colors.accent, 0.12),
+                    }}
+                  >
+                    <Icon name={item.icon} size={14} color={colors.accent} />
+                  </View>
+                ),
+              })}
+            </Fragment>
+          ))}
+        </>,
+        "dsh-console-setup-card",
+      )}
+    </View>
+  );
+}
+
 function EnvironmentSection({
   colors,
   host,
   compact,
   locale,
+  dshVisible = true,
   renderEnvironment,
   environment,
 }: {
@@ -151,13 +208,56 @@ function EnvironmentSection({
   host: PluginHostProps["host"];
   compact: boolean;
   locale: Locale;
+  dshVisible?: boolean;
   renderEnvironment?: ConsoleSettingsEnvironmentProps["renderEnvironment"];
   environment?: EnvironmentOverviewSlotData;
 }) {
   const copy = useLocaleText().console.settingsSections.environment;
+  const [expandedWhenMissing, setExpandedWhenMissing] = useState(false);
+
+  if (!dshVisible && !expandedWhenMissing) {
+    return (
+      <View testID="dsh-console-environment-collapsed" style={{ gap: space.sm }}>
+        <Callout
+          colors={colors}
+          tone="neutral"
+          icon="Info"
+          title={copy.dshNotDetectedTitle}
+          action={
+            <Button
+              colors={colors}
+              size="sm"
+              variant="secondary"
+              label={copy.dshNotDetectedExpand}
+              onPress={() => setExpandedWhenMissing(true)}
+            />
+          }
+        >
+          <Muted colors={colors} small>
+            {copy.dshNotDetectedHint}
+          </Muted>
+        </Callout>
+      </View>
+    );
+  }
 
   if (renderEnvironment) {
-    return <>{renderEnvironment({ colors, compact, locale })}</>;
+    return (
+      <View style={{ gap: space.sm }}>
+        {!dshVisible ? (
+          <View style={{ flexDirection: "row", justifyContent: "flex-end" }}>
+            <Button
+              colors={colors}
+              size="sm"
+              variant="ghost"
+              label={copy.dshNotDetectedCollapse}
+              onPress={() => setExpandedWhenMissing(false)}
+            />
+          </View>
+        ) : null}
+        {renderEnvironment({ colors, compact, locale })}
+      </View>
+    );
   }
 
   const hasDoctorFailures =
@@ -1042,7 +1142,7 @@ function TimelineDisplaySection({
   );
 }
 
-/** Unified Settings tab rendered inside the DSH Console. */
+/** Unified Settings tab rendered inside the Console. */
 export function ConsoleSettingsTab({
   colors,
   host,
@@ -1050,15 +1150,22 @@ export function ConsoleSettingsTab({
   environment,
   renderEnvironment,
   pricing,
+  dshVisible = true,
+  antigravityVisible = false,
 }: ConsoleSettingsTabProps) {
   const locale = useCurrentLocale();
+  const neitherInstalled = !dshVisible && !antigravityVisible;
   return (
     <View style={{ gap: compact ? space.lg : space.xl }}>
+      {neitherInstalled ? (
+        <CliSetupGuidanceSection colors={colors} compact={compact} />
+      ) : null}
       <EnvironmentSection
         colors={colors}
         host={host}
         compact={compact}
         locale={locale}
+        dshVisible={dshVisible}
         environment={environment}
         renderEnvironment={renderEnvironment}
       />

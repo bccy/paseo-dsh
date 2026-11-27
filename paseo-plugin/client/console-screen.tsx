@@ -1,13 +1,18 @@
 /**
- * Unified 3-tab DSH Console screen (`Usage` / `Plugins` / `Settings`).
+ * Unified 4-tab Console screen (`Usage` / `Antigravity` / `Plugins` / `Settings`).
  *
  * - Wrapped in `PluginsBoundary` so render errors never abort a release app.
- * - Top header pairs the DeepSeek whale `Avatar` with a responsive 3-tab
+ * - Top header pairs the DeepSeek whale `Avatar` with a responsive
  *   `SegmentedControl` on wide layouts, and omits the redundant title row on
  *   compact mobile where Paseo's native navigation bar already renders the title.
+ * - Supports bidirectional CLI auto-detection via `capabilities`:
+ *   - `usage` when `dshVisible || antigravityVisible`
+ *   - `antigravity` only when `antigravityVisible`
+ *   - `plugins` only when `dshVisible`
+ *   - `settings` always visible (default when neither CLI is detected)
  * - Supports `initialTab`, URL `params.tab`, and live `requestConsoleTab()` so
- *   Paseo Settings & Command Center open directly on Tab 3 (`settings`) even if
- *   the screen is already mounted on another tab.
+ *   external navigation (Settings, Command Center, Quota footer) opens directly
+ *   on the requested tab even if the screen is already mounted.
  *
  * @module dsh-paseo/client/console-screen
  */
@@ -19,6 +24,7 @@ import type {
   PluginScreenProps,
 } from "@getpaseo/plugin/client";
 import * as PaseoUi from "@getpaseo/plugin/client/ui";
+import type { CapabilitiesSnapshot } from "../shared/capabilities";
 import {
   DEFAULT_USD_TO_CNY_RATE,
   pricingGetRpc,
@@ -36,22 +42,46 @@ import { font, radius, space, tint, type Colors } from "./console-theme";
 import { Avatar, Badge, Card, Divider, Muted, SegmentedControl } from "./console-ui";
 import { ConsoleUsageTab } from "./console-usage";
 import { DEEPSEEK_MARK_SVG } from "./deepseek-mark-svg";
-import { PluginsBoundary, PluginsFailedCard, report } from "./dsh-plugins-guard";
+import { PluginsBoundary, PluginsFailedCard, formatBoundaryError, report } from "./dsh-plugins-guard";
 import { DshPluginsContent } from "./dsh-plugins-page";
 import type { Locale } from "./locale";
 import { useCurrentLocale, useLocaleText } from "./use-locale";
 
-/** Screen and sidebar contribution id for the unified DSH Console. */
+/** Screen and sidebar contribution id for the unified Console. */
 export const CONSOLE_SCREEN_ID = "dsh-console";
 
-export type ConsoleTabId = "usage" | "plugins" | "settings";
+export type ConsoleTabId = "usage" | "antigravity" | "plugins" | "settings";
 
-const VALID_TABS = new Set<string>(["usage", "plugins", "settings"]);
+const VALID_TABS = new Set<string>(["usage", "antigravity", "plugins", "settings"]);
 
 /** Parse a route param or external tab hint into a valid `ConsoleTabId`. */
 export function parseConsoleTab(value: unknown): ConsoleTabId | undefined {
   if (typeof value !== "string") return undefined;
   return VALID_TABS.has(value) ? (value as ConsoleTabId) : undefined;
+}
+
+/**
+ * Compute visible console tabs from detected host capabilities.
+ *
+ * When `capabilities` is still loading (`undefined`), defaults safely to the
+ * DSH baseline (`usage`, `plugins`, `settings`) so the console never flashes
+ * broken Antigravity UI before host detection resolves.
+ */
+export function visibleConsoleTabs(capabilities?: CapabilitiesSnapshot): ConsoleTabId[] {
+  const dshVisible = capabilities ? capabilities.dshVisible : true;
+  const antigravityVisible = capabilities ? capabilities.antigravityVisible : false;
+  const tabs: ConsoleTabId[] = [];
+  if (dshVisible || antigravityVisible) tabs.push("usage");
+  if (antigravityVisible) tabs.push("antigravity");
+  if (dshVisible) tabs.push("plugins");
+  tabs.push("settings");
+  return tabs;
+}
+
+/** Default console tab for a given host capability snapshot. */
+export function defaultConsoleTab(capabilities?: CapabilitiesSnapshot): ConsoleTabId {
+  const tabs = visibleConsoleTabs(capabilities);
+  return tabs[0] ?? "settings";
 }
 
 interface PendingTabRequest {
@@ -115,11 +145,13 @@ export interface ConsoleTabRenderContext {
 export interface DshConsoleScreenProps
   extends Omit<PluginScreenProps, "params">,
     ConsoleSettingsEnvironmentProps {
-  /** Plugin client context used by Usage analytics, Pricing dialog, and Tab 3 pricing prefs. */
+  /** Plugin client context used by Usage analytics, Pricing dialog, and Tab 4 pricing prefs. */
   readonly client?: PluginClientContext;
+  /** Live host CLI/data capability snapshot driving tab visibility and usage source defaults. */
+  readonly capabilities?: CapabilitiesSnapshot;
   /** Route params supplied by `addScreen`; optional so `addSettingsScreen` can mount directly. */
   readonly params?: PluginScreenParams;
-  /** Default tab when `params?.tab` does not specify one (default `"usage"`). */
+  /** Default tab when `params?.tab` does not specify one (default derived from `capabilities`). */
   readonly initialTab?: ConsoleTabId;
   /**
    * Whether this instance listens to live `requestConsoleTab()` navigation pushes
@@ -127,11 +159,13 @@ export interface DshConsoleScreenProps
    * Paseo Settings so it stays independent).
    */
   readonly subscribeTabRequests?: boolean;
-  /** Phase 3 drop-in slot for `ConsoleUsageTab`. */
+  /** Drop-in slot for `ConsoleUsageTab`. */
   readonly renderUsage?: (context: ConsoleTabRenderContext) => ReactNode;
-  /** Integrator drop-in slot for `DshPluginsContent` once `plugins-polish` merges. */
+  /** Drop-in slot for `AntigravityTab`. */
+  readonly renderAntigravity?: (context: ConsoleTabRenderContext) => ReactNode;
+  /** Drop-in slot for `DshPluginsContent`. */
   readonly renderPlugins?: (context: ConsoleTabRenderContext) => ReactNode;
-  /** Phase 3 dual-currency & pricing modal integration props forwarded to Tab 3. */
+  /** Dual-currency & pricing modal integration props forwarded to Settings tab. */
   readonly pricing?: PricingPreferencesSlot;
 }
 
@@ -187,14 +221,16 @@ function UsagePlaceholder({ colors, compact }: { colors: Colors; compact: boolea
 
 function DshConsoleBody({
   client,
+  capabilities,
   theme,
   host,
   layout,
   navigation,
   params,
-  initialTab = "usage",
+  initialTab,
   subscribeTabRequests = true,
   renderUsage,
+  renderAntigravity,
   renderPlugins,
   environment,
   renderEnvironment,
@@ -339,6 +375,12 @@ function DshConsoleBody({
     openPricingModal,
   ]);
 
+  const dshVisible = capabilities ? capabilities.dshVisible : true;
+  const antigravityVisible = capabilities ? capabilities.antigravityVisible : false;
+  const visibleTabs = useMemo(() => visibleConsoleTabs(capabilities), [capabilities]);
+  const fallbackTab = visibleTabs[0] ?? "settings";
+  const resolvedInitialTab = initialTab ?? fallbackTab;
+
   const paramTab = parseConsoleTab(params?.tab);
   const lastParamTabRef = useRef<ConsoleTabId | undefined>(paramTab);
   const lastConsumedSeqRef = useRef(0);
@@ -351,7 +393,7 @@ function DshConsoleBody({
         return paramTab ?? pending.tab;
       }
     }
-    return paramTab ?? initialTab;
+    return paramTab ?? resolvedInitialTab;
   });
 
   useEffect(() => {
@@ -376,16 +418,31 @@ function DshConsoleBody({
     return subscribeConsoleTabRequests(consumeIfNewer);
   }, [subscribeTabRequests]);
 
+  // Once capabilities have resolved, coerce an unavailable tab to the first
+  // visible tab (e.g. `"settings"` when neither CLI is installed, or `"usage"`
+  // if `"plugins"` was requested on an Antigravity-only host).
+  useEffect(() => {
+    if (capabilities === undefined) return;
+    if (!visibleTabs.includes(activeTab)) {
+      setActiveTab(fallbackTab);
+    }
+  }, [capabilities, visibleTabs, activeTab, fallbackTab]);
+
+  const effectiveTab: ConsoleTabId =
+    capabilities !== undefined && !visibleTabs.includes(activeTab) ? fallbackTab : activeTab;
+
   const compact = layout.compact || (width > 0 && width < 560);
   const narrowHeader = compact || (width > 0 && width < 680);
   const horizontalPadding = compact ? space.lg : space.xxl;
   const contentWidth = width > 0 ? Math.min(Math.max(width - horizontalPadding * 2, 0), 980) : 0;
 
-  const tabOptions = [
-    { value: "usage" as const, label: copy.tabs.usage, icon: "Activity" },
-    { value: "plugins" as const, label: copy.tabs.plugins, icon: "Puzzle" },
-    { value: "settings" as const, label: copy.tabs.settings, icon: "Wrench" },
+  const allTabOptions: ReadonlyArray<{ value: ConsoleTabId; label: string; icon: string }> = [
+    { value: "usage", label: copy.tabs.usage, icon: "Activity" },
+    { value: "antigravity", label: copy.tabs.antigravity, icon: "Sparkles" },
+    { value: "plugins", label: copy.tabs.plugins, icon: "Puzzle" },
+    { value: "settings", label: copy.tabs.settings, icon: "Wrench" },
   ];
+  const tabOptions = allTabOptions.filter((option) => visibleTabs.includes(option.value));
 
   const tabContext: ConsoleTabRenderContext = {
     theme,
@@ -396,7 +453,7 @@ function DshConsoleBody({
     compact,
     width: contentWidth,
     locale,
-    activeTab,
+    activeTab: effectiveTab,
     setActiveTab,
   };
 
@@ -408,12 +465,12 @@ function DshConsoleBody({
         setWidth((prev) => (Math.abs(prev - nextWidth) < 1 ? prev : nextWidth));
       }}
     >
-      {/* Fixed responsive console header + 3-tab SegmentedControl */}
+      {/* Fixed responsive console header + SegmentedControl */}
       <View
         style={{
           paddingHorizontal: horizontalPadding,
-          paddingTop: compact ? space.sm : space.lg,
-          paddingBottom: compact ? space.md : space.lg,
+          paddingTop: compact ? space.xs + 2 : space.lg,
+          paddingBottom: compact ? space.sm + 2 : space.lg,
           alignItems: "center",
         }}
       >
@@ -455,10 +512,11 @@ function DshConsoleBody({
 
           <SegmentedControl<ConsoleTabId>
             colors={colors}
-            value={activeTab}
+            value={effectiveTab}
             options={tabOptions}
             onChange={setActiveTab}
             size={compact ? "sm" : "md"}
+            variant="accent"
             fullWidth={narrowHeader}
             testID="dsh-console-tabs"
           />
@@ -467,7 +525,7 @@ function DshConsoleBody({
 
       <Divider colors={colors} />
 
-      {/* Active tab body — single HostScrollView shared by all 3 tabs */}
+      {/* Active tab body — single HostScrollView shared by all tabs */}
       <HostScrollView
         style={{ flex: 1 }}
         keyboardShouldPersistTaps="handled"
@@ -479,13 +537,14 @@ function DshConsoleBody({
         }}
       >
         <View style={{ width: contentWidth || "100%", maxWidth: 980 }}>
-          {activeTab === "usage" ? (
+          {effectiveTab === "usage" ? (
             renderUsage ? (
               renderUsage(tabContext)
             ) : client ? (
               <ConsoleUsageTab
                 client={client}
                 colors={colors}
+                capabilities={capabilities}
                 displayCurrency={effectiveDisplayCurrency}
                 pricingRevision={pricingRevision}
                 onCurrencyChange={handleUsageCurrencyChange}
@@ -494,7 +553,15 @@ function DshConsoleBody({
             ) : (
               <UsagePlaceholder colors={colors} compact={compact} />
             )
-          ) : activeTab === "plugins" ? (
+          ) : effectiveTab === "antigravity" ? (
+            renderAntigravity ? (
+              renderAntigravity(tabContext)
+            ) : (
+              <Card colors={colors} style={{ padding: compact ? space.lg : space.xl }}>
+                <Muted colors={colors}>{copy.antigravityUnavailable}</Muted>
+              </Card>
+            )
+          ) : effectiveTab === "plugins" ? (
             renderPlugins ? (
               renderPlugins(tabContext)
             ) : (
@@ -510,6 +577,8 @@ function DshConsoleBody({
               colors={colors}
               host={host}
               compact={compact}
+              dshVisible={dshVisible}
+              antigravityVisible={antigravityVisible}
               environment={environment}
               renderEnvironment={renderEnvironment}
               pricing={resolvedPricingSlot}
@@ -532,14 +601,16 @@ function DshConsoleBody({
   );
 }
 
-/** Unified 3-tab DSH Console screen wrapped in `PluginsBoundary`. */
+/** Unified 4-tab Console screen wrapped in `PluginsBoundary`. */
 export function DshConsoleScreen(props: DshConsoleScreenProps) {
   const copy = useLocaleText().console;
   return (
     <PluginsBoundary
-      fallback={(
+      fallback={(error) => (
         <PluginsFailedCard
           message={copy.renderFailed}
+          detail={formatBoundaryError(error)}
+          detailColor={props.theme.colors.foregroundMuted}
           color={props.theme.colors.statusDanger}
           background={props.theme.colors.surface0}
         />

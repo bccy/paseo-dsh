@@ -26,6 +26,7 @@ import {
   defaultPricingConfig,
   formatLongContextNote,
   inferModelFamily,
+  matchAntigravityReferenceEntry,
   matchReferenceEntry,
   matchSyncedCatalogEntry,
   modelRatesSchema,
@@ -51,6 +52,7 @@ import {
   type PricingUpdateInput,
   type SyncedPricingCatalog,
 } from "../shared/pricing";
+import { parseLegacyAntigravityPricing } from "../shared/antigravity/pricing-defaults";
 import { dshHome } from "./bootstrap";
 
 export const PRICING_CACHE_FILENAME = "paseo-dsh-pricing-v1.json";
@@ -74,6 +76,8 @@ export interface PricingPathOptions {
 }
 
 export interface PricingStoreOptions extends PricingPathOptions {
+  /** Optional path to legacy `antigravity-accounts/pricing.json` for one-time custom override import. */
+  legacyAntigravityPricingPath?: string;
   /** Override remote official catalog URL (defaults to `https://models.dev/api.json`). */
   catalogUrl?: string;
   /** Catalog freshness TTL in ms (defaults to 24 hours). */
@@ -222,6 +226,7 @@ async function readResponseTextCapped(
 export class PricingStore {
   readonly filePath: string;
   readonly catalogPath: string;
+  readonly legacyAntigravityPricingPath: string | null;
   readonly catalogUrl: string;
   readonly catalogTtlMs: number;
   readonly syncTimeoutMs: number;
@@ -258,6 +263,11 @@ export class PricingStore {
   constructor(options: PricingStoreOptions = {}) {
     this.filePath = pricingFilePath(options);
     this.catalogPath = pricingCatalogFilePath(options);
+    this.legacyAntigravityPricingPath =
+      options.legacyAntigravityPricingPath !== undefined &&
+      options.legacyAntigravityPricingPath.trim() !== ""
+        ? resolve(options.legacyAntigravityPricingPath)
+        : null;
     this.catalogUrl = options.catalogUrl ?? DEFAULT_MODELS_DEV_URL;
     this.catalogTtlMs = Math.max(1_000, options.catalogTtlMs ?? DEFAULT_CATALOG_TTL_MS);
     this.syncTimeoutMs = Math.max(50, options.syncTimeoutMs ?? DEFAULT_SYNC_TIMEOUT_MS);
@@ -411,6 +421,7 @@ export class PricingStore {
     await this.load();
 
     const run = this.writing.then(async () => {
+      const preserveLegacyImported = this.config.legacyAntigravityImported === true;
       const next: PricingConfig = parsed.resetAll
         ? defaultPricingConfig()
         : structuredClone(this.config);
@@ -445,6 +456,7 @@ export class PricingStore {
         usdToCnyRate: next.usdToCnyRate,
         autoSync: next.autoSync,
         overrides: normalizeOverridesRecord(next.overrides),
+        ...(preserveLegacyImported ? { legacyAntigravityImported: true } : {}),
       });
 
       // A config recovered from an unreadable file must never be replaced silently:
@@ -486,15 +498,23 @@ export class PricingStore {
     await this.load();
     const overrides = this.config.overrides;
     const catalog = this.catalog;
-    const seenByKey = this.normalizeSeenModels(seenModels);
-    const configuredByKey = this.normalizeSeenModels(configuredModels);
+    const seenNormalized = this.normalizeSeenModels(seenModels);
+    const configuredNormalized = this.normalizeSeenModels(configuredModels);
+    const seenByKey = seenNormalized.labels;
+    const configuredByKey = configuredNormalized.labels;
+    const antigravityEligibleKeys = new Set<string>([
+      ...seenNormalized.antigravityEligible,
+      ...configuredNormalized.antigravityEligible,
+    ]);
+    const nowMs = this.now();
 
     const rows: PricingModelRow[] = [];
     const listed = new Set<string>();
     const rankByKey = new Map<string, number>();
 
     // 1. Built-in generic public reference families (overlaid with exact synced rates when available).
-    for (const entry of REFERENCE_PRICING) {
+    for (const rawEntry of REFERENCE_PRICING) {
+      const entry = matchReferenceEntry(rawEntry.key, nowMs) ?? rawEntry;
       listed.add(entry.key);
       const custom = overrides[entry.key] ?? null;
       const syncedEntry = catalog?.models[entry.key] ?? null;
@@ -536,7 +556,9 @@ export class PricingStore {
       listed.add(key);
       const custom = overrides[key] ?? null;
       const syncedEntry = matchSyncedCatalogEntry(key, catalog);
-      const matchedRef = matchReferenceEntry(key);
+      const matchedRef =
+        matchReferenceEntry(key, nowMs) ??
+        (antigravityEligibleKeys.has(key) ? matchAntigravityReferenceEntry(key, nowMs) : null);
       const effective = custom
         ? { ...custom }
         : syncedEntry
@@ -707,36 +729,50 @@ export class PricingStore {
     }
   }
 
-  private normalizeSeenModels(seenModels?: SeenModelsInput): Map<string, string> {
-    const result = new Map<string, string>();
-    if (!seenModels) return result;
+  private normalizeSeenModels(seenModels?: SeenModelsInput): {
+    labels: Map<string, string>;
+    antigravityEligible: Set<string>;
+  } {
+    const labels = new Map<string, string>();
+    const antigravityEligible = new Set<string>();
+    if (!seenModels) return { labels, antigravityEligible };
     const overrides = this.config.overrides;
     const catalog = this.catalog;
+
+    const record = (rawModel: string, rawLabel?: string): void => {
+      const trimmed = rawModel.trim();
+      if (!trimmed) return;
+      const lowered = trimmed.toLowerCase();
+      const isDirectOrAntigravity = !lowered.includes("/") || lowered.startsWith("antigravity/");
+      const key = resolvePricingKey(
+        trimmed,
+        lowered.startsWith("antigravity/") ? "antigravity" : undefined,
+        overrides,
+        catalog,
+      );
+      if (!key || key === "unknown" || key.length > 160) return;
+      if (isDirectOrAntigravity) {
+        antigravityEligible.add(key);
+      }
+      if (!labels.has(key)) {
+        const label = ((rawLabel ?? "").trim() || trimmed).slice(0, 160);
+        labels.set(key, label);
+      }
+    };
 
     if (Array.isArray(seenModels)) {
       const list: ReadonlyArray<string> = seenModels;
       for (const rawModel of list) {
-        const trimmed = rawModel.trim();
-        if (!trimmed) continue;
-        const key = resolvePricingKey(trimmed, undefined, overrides, catalog);
-        if (!key || key === "unknown" || key.length > 160) continue;
-        if (!result.has(key)) result.set(key, trimmed.slice(0, 160));
+        record(rawModel);
       }
-      return result;
+      return { labels, antigravityEligible };
     }
 
     const map = seenModels as ReadonlyMap<string, string>;
     for (const [rawModel, rawLabel] of map.entries()) {
-      const trimmed = rawModel.trim();
-      if (!trimmed) continue;
-      const key = resolvePricingKey(trimmed, undefined, overrides, catalog);
-      if (!key || key === "unknown" || key.length > 160) continue;
-      if (!result.has(key)) {
-        const label = (rawLabel.trim() || trimmed).slice(0, 160);
-        result.set(key, label);
-      }
+      record(rawModel, rawLabel);
     }
-    return result;
+    return { labels, antigravityEligible };
   }
 
   private async loadAllFromDisk(): Promise<PricingConfig> {
@@ -744,9 +780,84 @@ export class PricingStore {
     return config;
   }
 
+  private async maybeImportLegacyAntigravityPricing(configFileExisted: boolean): Promise<void> {
+    if (
+      !this.legacyAntigravityPricingPath ||
+      this.recoveredFromCorruption ||
+      this.config.legacyAntigravityImported === true
+    ) {
+      return;
+    }
+
+    let rawText: string;
+    try {
+      rawText = await readFile(this.legacyAntigravityPricingPath, "utf8");
+    } catch (error) {
+      const code = (error as { code?: string } | null)?.code;
+      if (code !== "ENOENT") {
+        this.warn(
+          `could not read legacy Antigravity pricing at ${this.legacyAntigravityPricingPath}`,
+          error,
+        );
+      }
+      return;
+    }
+
+    const parsed = parseLegacyAntigravityPricing(rawText);
+    if (!parsed) {
+      this.warn(
+        `could not parse legacy Antigravity pricing at ${this.legacyAntigravityPricingPath}`,
+        new Error("invalid legacy Antigravity pricing schema"),
+      );
+      return;
+    }
+
+    const mergedOverrides: Record<string, ModelRates> = { ...this.config.overrides };
+    let importedCount = 0;
+    for (const [key, rates] of Object.entries(parsed.overrides)) {
+      const normalizedKey = normalizeModelKey(key);
+      if (!normalizedKey || normalizedKey in mergedOverrides) continue;
+      mergedOverrides[normalizedKey] = modelRatesSchema.parse(rates);
+      importedCount += 1;
+    }
+
+    if (importedCount === 0 && !configFileExisted) {
+      return;
+    }
+
+    const validated = pricingConfigSchema.parse({
+      version: PRICING_SCHEMA_VERSION,
+      displayCurrency: this.config.displayCurrency,
+      usdToCnyRate: this.config.usdToCnyRate,
+      autoSync: this.config.autoSync,
+      overrides: normalizeOverridesRecord(mergedOverrides),
+      legacyAntigravityImported: true,
+    });
+
+    this.config = validated;
+    const persist = this.writing.then(async () => {
+      if (this.disposed) return;
+      await this.writeAtomicFile(this.filePath, validated);
+    });
+    this.writing = persist.then(
+      () => undefined,
+      () => undefined,
+    );
+    try {
+      await persist;
+    } catch (error) {
+      this.warn(
+        `could not persist imported legacy Antigravity pricing overrides to ${this.filePath}`,
+        error,
+      );
+    }
+  }
+
   private async readConfigFromDisk(): Promise<PricingConfig> {
+    let configFileExisted = false;
     try {
       const rawText = await readFile(this.filePath, "utf8");
+      configFileExisted = true;
       const rawJson = JSON.parse(rawText) as unknown;
       const parsed = pricingConfigSchema.parse(rawJson);
       this.config = pricingConfigSchema.parse({
@@ -755,6 +866,7 @@ export class PricingStore {
         usdToCnyRate: parsed.usdToCnyRate,
         autoSync: parsed.autoSync,
         overrides: normalizeOverridesRecord(parsed.overrides),
+        ...(parsed.legacyAntigravityImported === true ? { legacyAntigravityImported: true } : {}),
       });
       this.readError = null;
       this.recoveredFromCorruption = false;
@@ -768,6 +880,7 @@ export class PricingStore {
         this.recoveredFromCorruption = false;
         this.corruptBackupPath = null;
         this.overwriteWarningEmitted = false;
+        await this.maybeImportLegacyAntigravityPricing(false);
         return structuredClone(this.config);
       }
       // Preserve the unreadable file instead of letting the next `update()` overwrite it.
@@ -782,7 +895,9 @@ export class PricingStore {
           : `could not read pricing config at ${this.filePath} and could not quarantine it; using built-in defaults without touching the existing file`,
         error,
       );
+      return structuredClone(this.config);
     }
+    await this.maybeImportLegacyAntigravityPricing(configFileExisted);
     return structuredClone(this.config);
   }
 

@@ -272,7 +272,7 @@ export interface DisplaySettingsText {
   renderFailed: string;
 }
 
-/** Copy for the unified 3-tab DSH Console screen and its Settings tab sections. */
+/** Copy for the unified 4-tab Console screen and its Settings tab sections. */
 export interface ConsoleText {
   /** Unified console screen title and sidebar row label. */
   title: string;
@@ -280,10 +280,22 @@ export interface ConsoleText {
   subtitle: string;
   /** Error boundary fallback for the unified console screen. */
   renderFailed: string;
+  /** Fallback text when the Antigravity tab is opened without an Antigravity environment. */
+  antigravityUnavailable: string;
   tabs: {
     usage: string;
+    antigravity: string;
     plugins: string;
     settings: string;
+  };
+  /** Concise install guidance shown on Settings when neither DSH nor Antigravity CLI is detected. */
+  setup: {
+    title: string;
+    description: string;
+    dshTitle: string;
+    dshHint: string;
+    agyTitle: string;
+    agyHint: string;
   };
   usagePlaceholder: {
     title: string;
@@ -305,6 +317,10 @@ export interface ConsoleText {
       hostLabel: string;
       cliLabel: string;
       cliMissing: string;
+      dshNotDetectedTitle: string;
+      dshNotDetectedHint: string;
+      dshNotDetectedExpand: string;
+      dshNotDetectedCollapse: string;
       profileLabel: string;
       bridgeLabel: string;
       routeLabel: string;
@@ -1642,12 +1658,22 @@ const TEXT: Record<Locale, UiText> = {
     },
     console: {
       title: "DSH Console",
-      subtitle: "Usage, plugins, diagnostics, and display preferences",
+      subtitle: "Usage, Antigravity, plugins, diagnostics, and display preferences",
       renderFailed: "The DSH Console could not be rendered. Reopen it; if the issue persists, check the daemon log.",
+      antigravityUnavailable: "Antigravity CLI (agy) and account data were not detected on this host.",
       tabs: {
         usage: "Usage",
+        antigravity: "Accounts",
         plugins: "Plugins",
         settings: "Settings",
+      },
+      setup: {
+        title: "No CLI detected yet",
+        description: "Install DeepSeek Harness (dsh) or Antigravity CLI (agy) on this host to enable usage analytics and provider controls.",
+        dshTitle: "DeepSeek Harness (dsh)",
+        dshHint: "Run `npm i -g @deepseek-ai/dsh`, then configure your model route in `~/.dsh/profiles/paseo/cordis.patch.yml`.",
+        agyTitle: "Antigravity CLI (agy)",
+        agyHint: "Install the `agy` CLI and sign in with a Google account to enable multi-account quotas, automatic fallback, and unified usage.",
       },
       usagePlaceholder: {
         title: "Usage & Cost Overview",
@@ -1669,6 +1695,10 @@ const TEXT: Record<Locale, UiText> = {
           hostLabel: "Host",
           cliLabel: "DSH CLI",
           cliMissing: "Not found",
+          dshNotDetectedTitle: "DSH CLI not detected",
+          dshNotDetectedHint: "DeepSeek Harness (dsh) is not installed on this host. Install `@deepseek-ai/dsh` to enable DSH provider diagnostics and plugin management.",
+          dshNotDetectedExpand: "Show diagnostics",
+          dshNotDetectedCollapse: "Hide diagnostics",
           profileLabel: "Profile",
           bridgeLabel: "Bridge",
           routeLabel: "Default route",
@@ -2365,12 +2395,22 @@ const TEXT: Record<Locale, UiText> = {
     },
     console: {
       title: "DSH 控制台",
-      subtitle: "用量统计、插件管理、环境诊断与显示偏好",
+      subtitle: "用量统计、Antigravity、插件管理、环境诊断与显示偏好",
       renderFailed: "DSH 控制台渲染失败。重新打开试试；如果反复出现，请检查 daemon 日志。",
+      antigravityUnavailable: "当前主机未检测到 Antigravity CLI (agy) 或账号数据。",
       tabs: {
         usage: "用量",
+        antigravity: "账号",
         plugins: "插件",
         settings: "设置",
+      },
+      setup: {
+        title: "尚未检测到可用 CLI",
+        description: "在当前主机安装 DeepSeek Harness (dsh) 或 Antigravity CLI (agy) 后，即可启用对应的用量统计与控制台功能。",
+        dshTitle: "DeepSeek Harness (dsh)",
+        dshHint: "执行 `npm i -g @deepseek-ai/dsh` 安装，并在 `~/.dsh/profiles/paseo/cordis.patch.yml` 中配置默认模型路由。",
+        agyTitle: "Antigravity CLI (agy)",
+        agyHint: "安装 `agy` CLI 并登录 Google 账号，即可启用多账号额度监控、出错自动切换与统一用量统计。",
       },
       usagePlaceholder: {
         title: "用量与费用概览",
@@ -2392,6 +2432,10 @@ const TEXT: Record<Locale, UiText> = {
           hostLabel: "当前主机",
           cliLabel: "DSH CLI",
           cliMissing: "未找到",
+          dshNotDetectedTitle: "未检测到 DSH CLI",
+          dshNotDetectedHint: "当前主机未安装 DeepSeek Harness (dsh)。如需使用 DSH Provider 诊断与插件管理，请先安装 `@deepseek-ai/dsh`。",
+          dshNotDetectedExpand: "展开诊断",
+          dshNotDetectedCollapse: "收起诊断",
           profileLabel: "Profile",
           bridgeLabel: "桥接状态",
           routeLabel: "默认路由",

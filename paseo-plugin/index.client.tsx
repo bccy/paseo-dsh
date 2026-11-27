@@ -24,12 +24,16 @@ import type {
   PluginSurfaceProps,
 } from "@getpaseo/plugin/client";
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
+import { useSyncExternalStore } from "react";
 import { z } from "zod";
+import { contributeAntigravityClient } from "./client/antigravity";
 import { ConsoleDiagnosticsSection } from "./client/console-diagnostics";
 import {
   CONSOLE_SCREEN_ID,
   DshConsoleScreen,
+  defaultConsoleTab,
   requestConsoleTab,
+  type ConsoleTabRenderContext,
 } from "./client/console-screen";
 import { DEEPSEEK_MARK_SVG } from "./client/deepseek-mark-svg";
 import { guardCleanup, installFatalGuard, report } from "./client/dsh-plugins-guard";
@@ -65,6 +69,11 @@ import { bindSubagentLiveClient } from "./client/subagent-live";
 import { InlineToolCall } from "./client/tool-call";
 import { toolCallData } from "./client/tool-call-data";
 import {
+  capabilitiesGetRpc,
+  capabilitiesSnapshotSchema,
+  type CapabilitiesSnapshot,
+} from "./shared/capabilities";
+import {
   REWIND_NOTICE_KIND,
   REWIND_NOTICE_VERSION,
   rewindNoticeArm,
@@ -72,26 +81,34 @@ import {
 import { languageSettings } from "./shared/settings";
 
 /**
- * The sidebar header row that opens the unified DSH Console on Tab 1 (`usage`).
+ * The sidebar header row that opens the unified Console on its default tab
+ * (`usage` when DSH or Antigravity is detected; `settings` when neither CLI is installed).
  *
  * Uses host 0.16+'s `addSidebarHeaderItem` + `SidebarRow` with the DeepSeek whale
  * mark and a live-localized label from `useLocaleText()`.
  */
-function ConsoleSidebarItem({ currentScreen, openScreen }: PluginSidebarItemProps) {
-  const title = useLocaleText().console.title;
-  return (
-    <SidebarRow
-      icon={{ svg: DEEPSEEK_MARK_SVG }}
-      label={title}
-      active={currentScreen?.screenId === CONSOLE_SCREEN_ID}
-      onPress={() => {
-        if (currentScreen?.screenId !== CONSOLE_SCREEN_ID) {
-          requestConsoleTab("usage");
-        }
-        openScreen({ screenId: CONSOLE_SCREEN_ID, params: { tab: "usage" } });
-      }}
-    />
-  );
+function createConsoleSidebarItem(
+  subscribeCapabilities: (listener: () => void) => () => void,
+  getCapabilities: () => CapabilitiesSnapshot | undefined,
+) {
+  return function ConsoleSidebarItem({ currentScreen, openScreen }: PluginSidebarItemProps) {
+    const title = useLocaleText().console.title;
+    const caps = useSyncExternalStore(subscribeCapabilities, getCapabilities);
+    const targetTab = defaultConsoleTab(caps);
+    return (
+      <SidebarRow
+        icon={{ svg: DEEPSEEK_MARK_SVG }}
+        label={title}
+        active={currentScreen?.screenId === CONSOLE_SCREEN_ID}
+        onPress={() => {
+          if (currentScreen?.screenId !== CONSOLE_SCREEN_ID) {
+            requestConsoleTab(targetTab);
+          }
+          openScreen({ screenId: CONSOLE_SCREEN_ID, params: { tab: targetTab } });
+        }}
+      />
+    );
+  };
 }
 
 export default function contribute(client: PluginClientContext) {
@@ -135,6 +152,46 @@ function buildContributions(client: PluginClientContext): () => void {
   // match the host language before the first tool call arrives.
   adoptHostLocale(client.i18n?.locale);
   bootstrapLanguage(client);
+
+  // Reactive host capabilities store populated from `capabilitiesGetRpc` on
+  // startup. Defaults safely to `undefined` (DSH-only console baseline, quota
+  // footer hidden) until resolved so nothing flashes broken.
+  let capabilities: CapabilitiesSnapshot | undefined;
+  let disposed = false;
+  const capabilitiesListeners = new Set<() => void>();
+  const getCapabilities = () => capabilities;
+  const subscribeCapabilities = (listener: () => void) => {
+    capabilitiesListeners.add(listener);
+    return () => {
+      capabilitiesListeners.delete(listener);
+    };
+  };
+  const notifyCapabilities = () => {
+    for (const listener of Array.from(capabilitiesListeners)) listener();
+  };
+
+  const antigravity = contributeAntigravityClient(client, {
+    consoleScreenId: CONSOLE_SCREEN_ID,
+    onOpenAntigravityTab: () => requestConsoleTab("antigravity"),
+    initialVisible: false,
+    isVisible: () => capabilities?.antigravityVisible ?? false,
+    subscribeVisibility: subscribeCapabilities,
+  });
+
+  void Promise.resolve()
+    .then(() => client.rpc(capabilitiesGetRpc, {}))
+    .then((raw) => {
+      if (disposed) return;
+      const parsed = capabilitiesSnapshotSchema.safeParse(raw);
+      if (!parsed.success) return;
+      capabilities = parsed.data;
+      antigravity.setVisible(parsed.data.antigravityVisible);
+      notifyCapabilities();
+    })
+    .catch((error) => {
+      report("capabilities get", error);
+    });
+
   client.addTimelineTransformer({
     id: "dsh-inline-thinking",
     query: { itemType: "reasoning" },
@@ -161,6 +218,12 @@ function buildContributions(client: PluginClientContext): () => void {
     id: "dsh-inline-tool",
     query: { itemType: "tool_call" },
     transform: ({ item, phase }) => {
+      // Deterministic `tool_call` precedence: Antigravity subagent and
+      // interactive `ask_question` cards run FIRST; all other tool calls fall
+      // through to DSH's `dsh-tool` mapper below.
+      const antigravityResult = antigravity.transformToolCall(item);
+      if (antigravityResult !== undefined) return antigravityResult;
+
       // The server half resolved the daemon's locale and put it on this item's
       // `metadata` (`server/timeline.ts`: every tool-call item carries it, not
       // just the first — React never re-renders a row that already transformed,
@@ -447,11 +510,13 @@ function buildContributions(client: PluginClientContext): () => void {
   // (host v0.15.3), so all three may be visible together and each decides its
   // own visibility — no cross-pill coordination.
   const workspaceStatus = createWorkspaceStatusStore();
-  // Unified 3-tab DSH Console (Usage / Plugins / Settings).
-  // Sidebar top entry opens Tab 1 (`usage`); Paseo Settings & Command Center
-  // open directly on Tab 3 (`settings`), even if the console is already mounted.
+  // Unified 4-tab Console (Usage / Antigravity / Plugins / Settings).
+  // Sidebar top entry opens the default visible tab (`usage` or `settings` if
+  // neither CLI is installed); Paseo Settings & Command Center open directly
+  // on `settings`; Antigravity quota footer / account pills open `antigravity`.
   // Titles are registered as resolved strings via `registerWithLiveTitle` so
   // native hosts render them safely and refresh them when language changes.
+  const ConsoleSidebarItem = createConsoleSidebarItem(subscribeCapabilities, getCapabilities);
   const renderEnvironment = ({
     colors,
     compact,
@@ -459,23 +524,52 @@ function buildContributions(client: PluginClientContext): () => void {
     colors: PluginScreenProps["theme"]["colors"];
     compact: boolean;
   }) => <ConsoleDiagnosticsSection client={client} colors={colors} compact={compact} />;
-  const ConsoleScreen = (props: PluginScreenProps) => (
-    <DshConsoleScreen
-      {...props}
-      client={client}
-      initialTab="usage"
-      renderEnvironment={renderEnvironment}
-    />
-  );
-  const ConsoleSettingsEntry = (props: PluginSurfaceProps) => (
-    <DshConsoleScreen
-      {...props}
-      client={client}
-      initialTab="settings"
-      subscribeTabRequests={false}
-      renderEnvironment={renderEnvironment}
-    />
-  );
+  const renderAntigravity = ({
+    theme,
+    layout,
+    host,
+    navigation,
+    width,
+    compact,
+  }: ConsoleTabRenderContext) => {
+    const AntigravityTab = antigravity.AntigravityTab;
+    return (
+      <AntigravityTab
+        theme={theme}
+        layout={layout}
+        host={host}
+        navigation={navigation}
+        width={width}
+        compact={compact}
+      />
+    );
+  };
+  const ConsoleScreen = (props: PluginScreenProps) => {
+    const caps = useSyncExternalStore(subscribeCapabilities, getCapabilities);
+    return (
+      <DshConsoleScreen
+        {...props}
+        client={client}
+        capabilities={caps}
+        renderAntigravity={renderAntigravity}
+        renderEnvironment={renderEnvironment}
+      />
+    );
+  };
+  const ConsoleSettingsEntry = (props: PluginSurfaceProps) => {
+    const caps = useSyncExternalStore(subscribeCapabilities, getCapabilities);
+    return (
+      <DshConsoleScreen
+        {...props}
+        client={client}
+        capabilities={caps}
+        initialTab="settings"
+        subscribeTabRequests={false}
+        renderAntigravity={renderAntigravity}
+        renderEnvironment={renderEnvironment}
+      />
+    );
+  };
   const openConsoleSettings = (command: PluginGlobalCommandContext) => {
     requestConsoleTab("settings");
     if (typeof command.openScreen === "function") {
@@ -485,6 +579,11 @@ function buildContributions(client: PluginClientContext): () => void {
     command.openSettings(DISPLAY_SETTINGS_ID);
   };
   const cleanups = [
+    () => {
+      disposed = true;
+      capabilitiesListeners.clear();
+    },
+    () => antigravity.dispose(),
     contributeStreamStats(client),
     contributeJobsPill(client, workspaceStatus.observer("jobs")),
     contributeGoalPill(client, workspaceStatus.observer("goal")),

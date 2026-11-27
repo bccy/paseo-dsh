@@ -488,11 +488,14 @@ export interface SegmentedOption<T extends string> {
 }
 
 export interface SegmentedControlProps<T extends string> {
-  colors: Pick<Colors, "surface0" | "border" | "foreground" | "foregroundMuted">;
+  colors: Pick<Colors, "surface0" | "border" | "foreground" | "foregroundMuted"> &
+    Partial<Pick<Colors, "surface1" | "surface2" | "accent">>;
   value: T;
   options: ReadonlyArray<SegmentedOption<T>>;
   onChange(next: T): void;
   size?: ButtonSize;
+  /** Visual emphasis: `"accent"` for primary navigation tabs, `"default"` for inline switches. */
+  variant?: "default" | "accent";
   /** Stretch options evenly across the available width. */
   fullWidth?: boolean;
   style?: StyleProp<ViewStyle>;
@@ -505,11 +508,25 @@ export function SegmentedControl<T extends string>({
   options,
   onChange,
   size = "sm",
+  variant = "default",
   fullWidth = false,
   style,
   testID,
 }: SegmentedControlProps<T>) {
-  const height = size === "md" ? 32 : 28;
+  const isAccent = variant === "accent" && Boolean(colors.accent);
+  const inlineCompact = !isAccent && !fullWidth && size === "sm";
+  const height = isAccent ? (size === "md" ? 34 : 30) : inlineCompact ? 26 : size === "md" ? 32 : 28;
+  const trackBg = inlineCompact
+    ? tint(colors.foreground, 0.06)
+    : (colors.surface1 ?? tint(colors.foreground, 0.06));
+  const activeBg = isAccent
+    ? tint(colors.accent!, 0.16)
+    : (colors.surface2 ?? colors.surface0);
+  const activeBorder = isAccent
+    ? tint(colors.accent!, 0.42)
+    : tint(colors.foreground, inlineCompact ? 0.1 : 0.14);
+  const compactSegment = inlineCompact || (fullWidth && (size === "sm" || options.length >= 4));
+
   return (
     <View
       testID={testID}
@@ -519,9 +536,12 @@ export function SegmentedControl<T extends string>({
           flexDirection: "row",
           flexWrap: fullWidth ? "nowrap" : "wrap",
           ...(fullWidth ? { width: "100%" } : { flexShrink: 0 }),
-          padding: 2,
-          borderRadius: radius.md,
-          backgroundColor: tint(colors.foreground, 0.06),
+          padding: inlineCompact ? 2 : 3,
+          gap: 2,
+          borderRadius: size === "md" ? radius.lg : radius.md,
+          borderWidth: inlineCompact ? 0 : 1,
+          borderColor: inlineCompact ? "transparent" : tint(colors.border, 0.75),
+          backgroundColor: trackBg,
         },
         style,
       ]}
@@ -530,6 +550,7 @@ export function SegmentedControl<T extends string>({
         const selected = option.value === value;
         const disabled = Boolean(option.disabled);
         const ink = selected ? colors.foreground : colors.foregroundMuted;
+        const iconInk = selected && isAccent ? colors.accent! : ink;
         return (
           <Pressable
             key={option.value}
@@ -539,29 +560,33 @@ export function SegmentedControl<T extends string>({
             onPress={() => onChange(option.value)}
             style={(state) => ({
               ...(fullWidth ? { flex: 1, minWidth: 0 } : { flexShrink: 0 }),
-              paddingHorizontal: space.md,
+              paddingHorizontal: inlineCompact
+                ? space.sm
+                : compactSegment
+                  ? space.xs + 2
+                  : space.md,
               height,
               flexDirection: "row",
               alignItems: "center",
               justifyContent: "center",
-              gap: space.xs,
-              borderRadius: radius.sm,
+              gap: compactSegment ? 4 : space.xs + 1,
+              borderRadius: size === "md" ? radius.md : radius.sm,
               backgroundColor: selected
-                ? colors.surface0
+                ? activeBg
                 : !disabled && Boolean((state as PressState).hovered)
                   ? tint(colors.foreground, 0.05)
                   : "transparent",
               borderWidth: 1,
-              borderColor: selected ? colors.border : "transparent",
+              borderColor: selected ? activeBorder : "transparent",
               opacity: disabled ? 0.45 : 1,
             })}
           >
-            {renderIcon(option.icon, 14, ink)}
+            {renderIcon(option.icon, compactSegment ? 13 : 14, iconInk)}
             <Text
               numberOfLines={1}
               style={{
-                ...font.small,
-                fontWeight: selected ? "600" : "400",
+                ...(compactSegment ? font.caption : font.small),
+                fontWeight: selected ? "600" : "500",
                 color: ink,
               }}
             >
