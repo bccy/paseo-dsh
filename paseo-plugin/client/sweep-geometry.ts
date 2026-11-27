@@ -29,9 +29,9 @@ export const SWEEP_PEAK_OPACITY_LIGHT = 0.68;
 /** Gentle base-text dim while active for clean yet understated contrast. */
 export const SWEEP_ACTIVE_BASE_OPACITY = 0.78;
 
-/** Slices per beam period (9 per beam = 7 feathered visible steps; dark troughs skipped). */
-export const SWEEP_SLICES_PER_BEAM = 9;
-/** Total slice count across the visible row width (`3 * 9 = 27`). */
+/** Slices per beam period (7 per beam = 5 feathered visible steps; dark troughs skipped). */
+export const SWEEP_SLICES_PER_BEAM = 7;
+/** Total slice count across the visible row width (`3 * 7 = 21`). */
 export const SWEEP_BANDS = SWEEP_BEAMS * SWEEP_SLICES_PER_BEAM;
 
 /**
@@ -85,10 +85,64 @@ export function sweepOffset(elapsedMs: number, cycleMs: number = SWEEP_CYCLE_MS)
   return phase / SWEEP_BEAMS;
 }
 
-/** `steps(120, end)`: smooth stepping finer than the 27-slice feathered staircase. */
-export const SWEEP_STEPS = 120;
+/** Concentric nested highlight layers per beam (zero adjacent slice seams on iOS Retina). */
+export const SWEEP_CONCENTRIC_LAYERS = 6;
 
-/** Quantize a 0..1 progress the way `steps(120, end)` does. */
+export interface ConcentricBeamLayer {
+  /** Left inset within a single `[0, 1]` beam period. */
+  readonly leftInPeriod: number;
+  /** Width fraction within a single `[0, 1]` beam period. */
+  readonly widthInPeriod: number;
+  /** Individual layer opacity solved via Porter-Duff so nested layers compose smoothly. */
+  readonly alpha: number;
+  /** Target cumulative composited opacity inside this layer. */
+  readonly cumulativeAlpha: number;
+}
+
+/**
+ * Build nested concentric highlight layers for one beam period `[0, 1]`.
+ *
+ * Unlike side-by-side tiled slices (which create 1px sub-pixel seams and sharp
+ * vertical steps on iOS `@3x` screens), concentric nested layers NEVER meet
+ * edge-to-edge and build brightness gradually (~7%..18% per step) up to `peakOpacity`.
+ */
+export function concentricBeamLayers(
+  peakOpacity: number,
+  layerCount: number = SWEEP_CONCENTRIC_LAYERS,
+): ConcentricBeamLayer[] {
+  const clampedPeak = Math.max(0, Math.min(0.99, peakOpacity));
+  if (clampedPeak <= 0 || layerCount <= 0) return [];
+  const layers: ConcentricBeamLayer[] = [];
+  let prevCumulative = 0;
+  // Widths shrink smoothly from 86% (outer mist) to 16% (velvet core).
+  const outerW = 0.86;
+  const innerW = 0.16;
+  for (let i = 0; i < layerCount; i += 1) {
+    const frac = layerCount === 1 ? 1 : i / (layerCount - 1);
+    const widthInPeriod = outerW - (outerW - innerW) * frac;
+    const leftInPeriod = (1 - widthInPeriod) / 2;
+    // Sample our smooth raised-cosine bell at the midpoint of this concentric ring
+    // (or exact peak at the innermost core).
+    const u = i === layerCount - 1 ? 0.5 : leftInPeriod + (outerW - innerW) / (2 * Math.max(1, layerCount - 1));
+    const profile = i === layerCount - 1 ? 1 : beamPeriodProfile(u);
+    const targetCumulative = Math.max(prevCumulative, Math.min(clampedPeak, profile * clampedPeak));
+    const denom = Math.max(1e-6, 1 - prevCumulative);
+    const layerAlpha = Math.max(0, Math.min(1, (targetCumulative - prevCumulative) / denom));
+    layers.push({
+      leftInPeriod,
+      widthInPeriod,
+      alpha: Number(layerAlpha.toFixed(4)),
+      cumulativeAlpha: Number(targetCumulative.toFixed(4)),
+    });
+    prevCumulative = targetCumulative;
+  }
+  return layers;
+}
+
+/** `steps(96, end)`: smooth stepping finer than the 21-slice feathered staircase. */
+export const SWEEP_STEPS = 96;
+
+/** Quantize a 0..1 progress the way `steps(96, end)` does. */
 export function quantize(progress: number, steps: number = SWEEP_STEPS): number {
   const clamped = Math.max(0, Math.min(1, progress));
   return Math.round(clamped * steps) / steps;

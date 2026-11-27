@@ -29,8 +29,8 @@ const LIVE_TAIL_MIN_CHARS = 14;
 const LIVE_TAIL_MIN_CHARS_SUBSEQUENT = 48;
 const LIVE_TAIL_TRAILING_MS = 180;
 const LIVE_TAIL_MAX_WAIT_MS = 320;
-const PENDING_FALLBACK_STREAMING_MS = 8_000;
-const PENDING_FALLBACK_SETTLED_MS = 3_500;
+const PENDING_FALLBACK_STREAMING_MS = 6_000;
+const PENDING_FALLBACK_SETTLED_MS = 2_200;
 /** Settled thoughts up to this length translate in full while collapsed so tapping open is instant (0ms). */
 export const EAGER_FULL_TRANSLATE_MAX_CHARS = 1_500;
 /** Long historical thoughts (>1200 chars) split into parallel paragraph chunks for progressive display. */
@@ -742,6 +742,7 @@ export function useStreamingTranslatedThinking(
     }
 
     let hasAnyTranslation = false;
+    let hasActiveTranslatable = false;
     let allTranslatableResolved = phase === "complete";
     let hasUnresolvedTail = false;
     let assembled = "";
@@ -758,6 +759,7 @@ export function useStreamingTranslatedThinking(
         // English fragments while streaming so raw English words don't pop in at the end.
         if (!seg.isCode && !seg.closed && phase === "streaming" && isLikelyStartingEnglish(seg.text)) {
           hasUnresolvedTail = true;
+          hasActiveTranslatable = true;
           continue;
         }
         assembled += seg.text + seg.sep;
@@ -777,9 +779,10 @@ export function useStreamingTranslatedThinking(
           const inCooldown = isInFailureCooldown(seg.text);
           if (phase === "complete" && (inCooldown || settledTimedOut)) {
             // Segment failed/echoed into cooldown or settled grace window expired:
-            // fall back verbatim to source text so completed thoughts never drop or truncate segments.
+            // fall back verbatim to source text so completed thoughts never drop or hang.
             assembled += seg.text + seg.sep;
           } else {
+            if (!inCooldown) hasActiveTranslatable = true;
             // Seamless handoff while the full closed sentence is still translating:
             // carry prior liveTail prefix briefly instead of flashing back to English.
             const prev = segFallbackRef.current.get(i);
@@ -829,6 +832,7 @@ export function useStreamingTranslatedThinking(
         latestTranslatedLine = usableLiveTail.replaceAll("**", "").trim();
       } else {
         hasUnresolvedTail = true;
+        if (!isInFailureCooldown(trimmedTail)) hasActiveTranslatable = true;
       }
     }
 
@@ -837,7 +841,7 @@ export function useStreamingTranslatedThinking(
         output: {
           translated: "",
           latestTranslatedLine: "",
-          pending: !placeholderTimedOut,
+          pending: hasActiveTranslatable && !placeholderTimedOut && !settledTimedOut,
         },
         allTranslatableResolved: false,
       };

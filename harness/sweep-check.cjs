@@ -21,6 +21,7 @@
 const {
   SWEEP_BANDS,
   SWEEP_BEAMS,
+  SWEEP_CONCENTRIC_LAYERS,
   SWEEP_CYCLE_MS,
   SWEEP_DELAY_MS,
   SWEEP_PEAK_OPACITY_DARK,
@@ -32,6 +33,7 @@ const {
   bandLeft,
   bandWidth,
   beamPeriodProfile,
+  concentricBeamLayers,
   quantize,
   sweepOffset,
   sweepProfile,
@@ -70,19 +72,18 @@ console.log("the mask profile matches the seamless raised-cosine 3-beam wave");
 
 console.log("the feathered triple-beam slice staircase");
 {
-  check("27 slices resolve 3 beams with 9 feathered slices per period", SWEEP_BANDS === 27);
-  check("each beam center slice reaches full peak alpha", near(bandAlpha(4), 1) && near(bandAlpha(13), 1) && near(bandAlpha(22), 1));
+  check("21 slices resolve 3 beams with 7 feathered slices per period", SWEEP_BANDS === 21);
+  check("each beam center slice reaches full peak alpha", near(bandAlpha(3), 1) && near(bandAlpha(10), 1) && near(bandAlpha(17), 1));
   check(
     "each beam ramps smoothly through multi-step feathered edges",
-    bandAlpha(0) < 0.02 &&
-      bandAlpha(1) > 0.05 &&
+    bandAlpha(0) < 0.04 &&
+      bandAlpha(1) > 0.1 &&
       bandAlpha(1) < bandAlpha(2) &&
-      bandAlpha(2) < bandAlpha(3) &&
-      bandAlpha(3) < bandAlpha(4),
+      bandAlpha(2) < bandAlpha(3),
   );
   check(
     "all 3 periods have identical slice alphas (100% uniform spacing)",
-    [0, 1, 2, 3, 4, 5, 6, 7, 8].every((sub) => near(bandAlpha(sub), bandAlpha(sub + 9)) && near(bandAlpha(sub), bandAlpha(sub + 18))),
+    [0, 1, 2, 3, 4, 5, 6].every((sub) => near(bandAlpha(sub), bandAlpha(sub + 7)) && near(bandAlpha(sub), bandAlpha(sub + 14))),
   );
   check(
     "the slices tile the window",
@@ -115,12 +116,36 @@ console.log("the seamless 4.5s conveyor clock");
   );
 }
 
-console.log("steps(120, end)");
+console.log("concentric nested beam layers (zero adjacent seams)");
 {
-  check("120 steps", SWEEP_STEPS === 120);
+  const layers = concentricBeamLayers(SWEEP_PEAK_OPACITY_DARK);
+  check("builds SWEEP_CONCENTRIC_LAYERS nested rings", layers.length === SWEEP_CONCENTRIC_LAYERS && layers.length >= 6);
+  let nested = true;
+  let maxStep = 0;
+  let composited = 0;
+  for (let i = 0; i < layers.length; i += 1) {
+    const cur = layers[i];
+    if (i > 0) {
+      const prev = layers[i - 1];
+      if (!(cur.leftInPeriod > prev.leftInPeriod && cur.leftInPeriod + cur.widthInPeriod < prev.leftInPeriod + prev.widthInPeriod)) {
+        nested = false;
+      }
+    }
+    const nextComposited = 1 - (1 - composited) * (1 - cur.alpha);
+    maxStep = Math.max(maxStep, nextComposited - composited);
+    composited = nextComposited;
+  }
+  check("every ring sits strictly inside the previous ring (zero edge-to-edge seams)", nested);
+  check("composited core reaches exact peakOpacity", near(composited, SWEEP_PEAK_OPACITY_DARK, 1e-3), `${composited} vs ${SWEEP_PEAK_OPACITY_DARK}`);
+  check("every single concentric step stays gentle (<= 0.22)", maxStep <= 0.22, `maxStep=${maxStep.toFixed(3)}`);
+}
+
+console.log("steps(96, end)");
+{
+  check("96 steps", SWEEP_STEPS === 96);
   check("the start is exact", quantize(0) === 0);
   check("the end is exact", quantize(1) === 1);
-  check("values snap to a step", near(quantize(0.5) % (1 / 120), 0));
+  check("values snap to a step", near(quantize(0.5) % (1 / 96), 0));
   check("stepping is finer than the slice staircase", SWEEP_STEPS > SWEEP_BANDS * 4);
 }
 

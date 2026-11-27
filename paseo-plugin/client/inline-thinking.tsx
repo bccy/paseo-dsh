@@ -42,7 +42,6 @@ import {
 } from "../shared/settings";
 import { normalizeRowTimestamp, noteRender, useIsPulseOwner } from "./newest";
 import {
-  AnimatedBodyParagraph,
   RowEntrance,
   SCROLL_BOX_TEST_ID,
   renderInkTrailText,
@@ -571,7 +570,8 @@ function SmoothMarqueeLine({
 }
 
 const NATIVE_MARQUEE_CHUNK_CHARS = 24;
-const NATIVE_MARQUEE_MAX_MOUNTED_CHUNKS = 8;
+/** 4 chunks (~96 chars ≈ 1200pt) is >4x an iPhone width while cutting shimmer overlay nodes in half. */
+const NATIVE_MARQUEE_MAX_MOUNTED_CHUNKS = 4;
 const NATIVE_MARQUEE_RETIRE_MARGIN_PX = 48;
 
 interface NativeMarqueeController {
@@ -614,10 +614,42 @@ function useNativeSmoothMarquee(
     typeof Easing?.linear === "function";
 
   const normalized = canUseNative && keepAlive ? normalizeLeftScrollStream(source) : "";
-  const allChunks = useMemo(
-    () => (normalized ? splitNativeMarqueeChunks(normalized, NATIVE_MARQUEE_CHUNK_CHARS) : []),
-    [normalized],
-  );
+  // Incremental O(delta) chunk cache so 15k-char DSH thinking streams never
+  // re-split the entire string on every arriving token.
+  const chunkCacheRef = useRef<{
+    source: string;
+    chunks: string[];
+    lastChunkStart: number;
+  }>({ source: "", chunks: [], lastChunkStart: 0 });
+  const allChunks = useMemo(() => {
+    if (!normalized) {
+      chunkCacheRef.current = { source: "", chunks: [], lastChunkStart: 0 };
+      return [] as string[];
+    }
+    const prev = chunkCacheRef.current;
+    if (prev.source === normalized) return prev.chunks;
+    if (prev.source !== "" && normalized.startsWith(prev.source) && prev.chunks.length > 0) {
+      const tail = normalized.slice(prev.lastChunkStart);
+      const tailChunks = splitNativeMarqueeChunks(tail, NATIVE_MARQUEE_CHUNK_CHARS);
+      const nextChunks = prev.chunks.slice(0, -1).concat(tailChunks);
+      const lastChunkLen = tailChunks.length > 0 ? tailChunks[tailChunks.length - 1]!.length : 0;
+      const nextLastStart = normalized.length - lastChunkLen;
+      chunkCacheRef.current = {
+        source: normalized,
+        chunks: nextChunks,
+        lastChunkStart: nextLastStart,
+      };
+      return nextChunks;
+    }
+    const fresh = splitNativeMarqueeChunks(normalized, NATIVE_MARQUEE_CHUNK_CHARS);
+    const lastLen = fresh.length > 0 ? fresh[fresh.length - 1]!.length : 0;
+    chunkCacheRef.current = {
+      source: normalized,
+      chunks: fresh,
+      lastChunkStart: normalized.length - lastLen,
+    };
+    return fresh;
+  }, [normalized]);
   const effectiveActive = canUseNative && active && lineWidth > 0 && allChunks.length > 0;
 
   const revealedRef = useRef<Animated.Value | null>(null);
@@ -1200,6 +1232,16 @@ function useExpandedBodyInkReveal(
           paragraphIndex: frozenRef.current.paragraphIndex,
         };
       }
+    } else if (prevText !== "" && text.startsWith(prevText)) {
+      // Fast O(delta) path for normal streaming appends — avoids O(N) rescans
+      // across 10k-30k char DSH thinking streams on every arriving token.
+      const prevTotal = totalCpRef.current;
+      const deltaCp = countCodePoints(text.slice(prevText.length));
+      totalCpRef.current = prevTotal + deltaCp;
+      if (cursorRef.current > prevTotal) {
+        settledFloorRef.current = Math.max(settledFloorRef.current, prevTotal);
+        cursorRef.current = prevTotal;
+      }
     } else {
       const commonUtf16 = commonUtf16PrefixLength(prevText, text);
       const commonCp = countCodePoints(text.slice(0, commonUtf16));
@@ -1321,7 +1363,11 @@ function useExpandedBodyInkReveal(
         setTick((v) => (v + 1) & 0x7fffffff);
         return;
       }
-      if (lastEmitAt === 0 || now - lastEmitAt >= STREAM_FRAME_INTERVAL_MS) {
+      const emitInterval =
+        text.length - frozenRef.current.activeStartUtf16 > 400
+          ? STREAM_FRAME_INTERVAL_MS * 2
+          : STREAM_FRAME_INTERVAL_MS;
+      if (lastEmitAt === 0 || now - lastEmitAt >= emitInterval) {
         lastEmitAt = now;
         setTick((v) => (v + 1) & 0x7fffffff);
       }
@@ -2501,28 +2547,21 @@ export function InlineThinking({
               {bodyInk.active ? (
                 <>
                   {frozenBodyElement}
-                  <AnimatedBodyParagraph
-                    key={bodyInk.paragraphIndex}
-                    animate={bodyInk.paragraphIndex > 0}
-                    fromOpacity={0.35}
-                    durationMs={480}
+                  <Text
+                    style={
+                      bodyInk.frozenText !== "" && bodyInk.gapLines > 0
+                        ? [styles.full, { marginTop: bodyInk.gapLines * bodyLineHeight }]
+                        : styles.full
+                    }
+                    selectable
                   >
-                    <Text
-                      style={
-                        bodyInk.frozenText !== "" && bodyInk.gapLines > 0
-                          ? [styles.full, { marginTop: bodyInk.gapLines * bodyLineHeight }]
-                          : styles.full
-                      }
-                      selectable
-                    >
-                      {renderExpandedBloomText(
-                        bodyInk.activeText,
-                        bodyInk.localProgress,
-                        theme.colors.foregroundMuted,
-                        bodyInk.localSettledFloor,
-                      )}
-                    </Text>
-                  </AnimatedBodyParagraph>
+                    {renderExpandedBloomText(
+                      bodyInk.activeText,
+                      bodyInk.localProgress,
+                      theme.colors.foregroundMuted,
+                      bodyInk.localSettledFloor,
+                    )}
+                  </Text>
                 </>
               ) : (
                 <Text style={styles.full} selectable>
