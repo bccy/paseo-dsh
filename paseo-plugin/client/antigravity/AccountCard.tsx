@@ -94,6 +94,17 @@ function Meter({
   );
 }
 
+function localizeQuotaGroupName(name: string, locale: string): string {
+  if (!locale.toLowerCase().startsWith("zh")) return upper(name, locale);
+  const normalized = name.trim().toLowerCase();
+  if (normalized === "gemini models") return "Gemini 模型";
+  if (normalized === "claude and gpt models") return "Claude 与 GPT 模型";
+  if (normalized.endsWith(" models")) {
+    return `${name.trim().slice(0, -7)} 模型`;
+  }
+  return name;
+}
+
 function QuotaGroupView({
   colors,
   group,
@@ -117,7 +128,7 @@ function QuotaGroupView({
   return (
     <View style={{ gap: space.sm }}>
       <Text numberOfLines={1} style={{ ...font.overline, color: colors.foregroundMuted }}>
-        {upper(group.name, locale)}
+        {localizeQuotaGroupName(group.name, locale)}
       </Text>
       {rows.map(([left, right]) => (
         <View key={left.id} style={{ flexDirection: "row", gap: compact ? space.lg : space.xl }}>

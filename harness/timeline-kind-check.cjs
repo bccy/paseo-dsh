@@ -62,7 +62,12 @@ function readKinds(source) {
     }
     if (id === './client/stream-stats') {
       const file = path.join(build, 'client/stream-stats.js');
-      return evaluate(fs.readFileSync(file, 'utf8'), file, (name) => name === 'react-native' ? {} : fromBuild(name));
+      const requireStats = createRequire(file);
+      return evaluate(fs.readFileSync(file, 'utf8'), file, (name) => {
+        if (name === 'react-native') return {};
+        if (name === './row-entrance') return { RowEntrance: ({ children }) => children };
+        return requireStats(name);
+      });
     }
     if (id === './client/rewind-notice-live') return { startRewindLiveMonitor: () => noop };
     if (id === './client/subagent-live') return { bindSubagentLiveClient: () => noop };
@@ -117,7 +122,7 @@ function readKinds(source) {
       return new Proxy({}, { get: () => () => noop });
     }
     if (id === './client/row-entrance') return { retainRowEntranceObservers: () => noop, disposeRowEntranceObservers: noop };
-    if (/^\.\/client\/(inline-thinking|rewind-notice|tool-call)$/.test(id)) return {};
+    if (/^\.\/client\/(assistant-bloom|inline-thinking|rewind-notice|tool-call)$/.test(id)) return {};
     return fromBuild(id);
   };
   const cleanup = evaluate(source, path.join(build, 'index.client.js'), requireClient).default(client);
@@ -127,6 +132,7 @@ function readKinds(source) {
 assert.deepEqual(
   readKinds(entrySource).sort(),
   [
+    'dsh-assistant-bloom',
     'dsh-thinking',
     'dsh-tool',
     'dsh-rewind-notice',

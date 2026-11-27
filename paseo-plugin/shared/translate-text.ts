@@ -20,6 +20,7 @@ export function needsChineseTranslation(text: string): boolean {
   if (trimmed.length < 8) return false;
   const prose = trimmed
     .replace(/```[\s\S]*?```/g, " ")
+    .replace(/```[\s\S]*$/g, " ")
     .replace(/`[^`\n]+`/g, " ")
     .replace(/https?:\/\/\S+/g, " ")
     .replace(/(?:\/[\w.-]+){2,}/g, " ");
@@ -27,6 +28,44 @@ export function needsChineseTranslation(text: string): boolean {
   const latinCount = (prose.match(/[A-Za-z]/g) ?? []).length;
   if (latinCount < 8) return false;
   return cjkCount < latinCount * 0.25;
+}
+
+const ENGLISH_PROSE_STARTER_RE =
+  /^(?:the|this|that|these|those|let(?:'s)?|i(?:'ll|'m|'ve|'d)?|we(?:'ll|'re|'ve|'d)?|first|next|now|here|wait|okay|ok|sure|well|looking|checking|reading|inspecting|analyzing|thinking|reviewing|need|should|could|would|actually|however|since|because|before|after|when|while|user|hmm|alright)\b/i;
+
+/**
+ * Detects the first few ASCII characters of an English streaming thought before
+ * it reaches `needsChineseTranslation`'s 8-letter threshold, so the UI can show
+ * a smooth placeholder instead of briefly flashing `"The"` / `"Let's"` and then
+ * jumping to Chinese.
+ *
+ * Deliberately rejects code spans, paths, filenames, camelCase/snake_case
+ * identifiers, and short ALL-CAPS acronyms (e.g. `"DSH"`, `"iOS"`,
+ * `"inline-thinking.tsx"`) so Chinese DSH thoughts starting with a symbol never
+ * flash `"推理中…"`.
+ */
+export function isLikelyStartingEnglish(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length >= 24) return false;
+  if (/[\u4e00-\u9fff]/.test(trimmed)) return false;
+  const stripped = trimmed
+    .replace(/^(?:[#>*+-]|\d+\.)+\s*/u, "")
+    .replace(/^\*+\s*/u, "")
+    .replace(/```[\s\S]*$/g, " ")
+    .replace(/`[^`\n]*`?/g, " ")
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/(?:~|\.{1,2})?(?:\/[\w.-]+)+/g, " ")
+    .trim();
+  if (!stripped) return false;
+  const firstToken = stripped.split(/\s+/)[0] ?? "";
+  if (/[_/.\\]/.test(firstToken)) return false;
+  if (/[a-z][A-Z]/.test(firstToken)) return false;
+  if (/^[A-Za-z']+\s+[A-Za-z']{2,}/.test(stripped)) return true;
+  if (ENGLISH_PROSE_STARTER_RE.test(stripped)) return true;
+  if (/^[A-Za-z']{4,}[,:;!?]?$/.test(firstToken) && firstToken !== firstToken.toUpperCase()) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -82,6 +121,141 @@ export function splitTranslationChunks(text: string, maxLen = 420): TranslationC
   }
 
   return { pieces, seps };
+}
+
+export interface StreamingThinkingSegment {
+  /** Exact source text of this segment (sentence, line, or code block). */
+  text: string;
+  /** Exact trailing separator (`\n`, `\r\n`, spaces, or `""`) after `text`. */
+  sep: string;
+  /** True once this segment is closed and safe to translate & lock in cache. */
+  closed: boolean;
+  /** True for fenced code blocks (closed or still streaming) that must never be translated. */
+  isCode?: boolean;
+}
+
+/**
+ * Splits a single line into Hermes-safe sentence segments while keeping exact
+ * inter-sentence whitespace in `sep`.
+ */
+function splitLineSentencesWithSeps(
+  line: string,
+  lineClosed: boolean,
+): StreamingThinkingSegment[] {
+  if (!line) return [];
+  const out: StreamingThinkingSegment[] = [];
+  const boundaryRe = /[.!?。！？](\s+)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = boundaryRe.exec(line)) !== null) {
+    const endOfSentence = match.index + 1;
+    const whitespace = match[1] ?? " ";
+    const piece = line.slice(lastIndex, endOfSentence);
+    if (piece) {
+      out.push({ text: piece, sep: whitespace, closed: true });
+    } else if (out.length > 0) {
+      out[out.length - 1]!.sep += whitespace;
+    }
+    lastIndex = endOfSentence + whitespace.length;
+  }
+  const tail = line.slice(lastIndex);
+  if (tail) {
+    const trimmedTail = tail.trim();
+    const tailClosed =
+      lineClosed || (trimmedTail.length >= 12 && /[.!?。！？]$/.test(trimmedTail));
+    out.push({ text: tail, sep: "", closed: tailClosed });
+  }
+  return out;
+}
+
+/**
+ * Splits streaming or completed thinking text into stable closed segments plus
+ * an optional live trailing fragment so each finished sentence/line translates
+ * once and never flickers as newer tokens arrive.
+ */
+export function splitStreamingThinkingSegments(
+  text: string,
+  phase: "streaming" | "complete",
+): StreamingThinkingSegment[] {
+  if (!text) return [];
+  const segments: StreamingThinkingSegment[] = [];
+  const lineRe = /\r?\n/g;
+  let cursor = 0;
+  let inFence = false;
+  let fenceStart = -1;
+
+  const pushLine = (line: string, lineSep: string, isLastLine: boolean) => {
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith("```")) {
+      if (!inFence) {
+        inFence = true;
+        fenceStart = cursor;
+        if (isLastLine) {
+          segments.push({
+            text: text.slice(fenceStart),
+            sep: "",
+            closed: phase === "complete",
+            isCode: true,
+          });
+        }
+        return;
+      }
+      const blockEnd = cursor + line.length;
+      segments.push({
+        text: text.slice(fenceStart, blockEnd),
+        sep: lineSep,
+        closed: true,
+        isCode: true,
+      });
+      inFence = false;
+      fenceStart = -1;
+      return;
+    }
+    if (inFence) {
+      if (isLastLine) {
+        segments.push({
+          text: text.slice(fenceStart),
+          sep: "",
+          closed: phase === "complete",
+          isCode: true,
+        });
+      }
+      return;
+    }
+    if (!line) {
+      if (segments.length > 0) {
+        segments[segments.length - 1]!.sep += lineSep;
+      } else {
+        segments.push({ text: "", sep: lineSep, closed: true });
+      }
+      return;
+    }
+    const lineClosed = phase === "complete" || !isLastLine;
+    const parts = splitLineSentencesWithSeps(line, lineClosed);
+    if (parts.length > 0) {
+      parts[parts.length - 1]!.sep += lineSep;
+      segments.push(...parts);
+    }
+  };
+
+  let match: RegExpExecArray | null;
+  while ((match = lineRe.exec(text)) !== null) {
+    const line = text.slice(cursor, match.index);
+    const sep = match[0];
+    pushLine(line, sep, false);
+    cursor = match.index + sep.length;
+  }
+  if (cursor < text.length) {
+    pushLine(text.slice(cursor), "", true);
+  } else if (inFence && fenceStart >= 0) {
+    segments.push({
+      text: text.slice(fenceStart),
+      sep: "",
+      closed: phase === "complete",
+      isCode: true,
+    });
+  }
+  return segments;
 }
 
 /**

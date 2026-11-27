@@ -38,7 +38,9 @@ import {
 import { DEEPSEEK_MARK_SVG } from "./client/deepseek-mark-svg";
 import { guardCleanup, installFatalGuard, report } from "./client/dsh-plugins-guard";
 import { contributeGoalPill } from "./client/goal-pill";
+import { AssistantMessageBloom } from "./client/assistant-bloom";
 import { InlineThinking } from "./client/inline-thinking";
+import { isStandaloneMarkdownImage } from "./client/thinking-text";
 import { registerAntigravityToolSummariesReader } from "./client/antigravity/tool-summaries";
 import { registerThinkingTranslator } from "./client/thinking-translate";
 import { toolSummariesRpc } from "./shared/antigravity/contracts";
@@ -273,6 +275,35 @@ function buildContributions(client: PluginClientContext): () => void {
     version: 1,
     schema: z.object({ text: z.string(), phase: z.enum(["streaming", "complete"]) }),
     Component: InlineThinking,
+  });
+
+  // Global smooth block-emergence for live assistant replies across all providers.
+  // Registered after `antigravity-ask-question-echo` so echo suppression keeps
+  // first precedence, and skips standalone markdown image messages so Paseo's
+  // built-in image renderer handles tool-emitted images untouched.
+  client.addTimelineTransformer({
+    id: "dsh-assistant-bloom",
+    query: { itemType: "assistant_message" },
+    transform: ({ item, phase }) => {
+      if (isStandaloneMarkdownImage(item.text)) return undefined;
+      return {
+        items: [
+          {
+            type: "plugin",
+            kind: "dsh-assistant-bloom",
+            version: 1,
+            data: { text: item.text, phase },
+          },
+        ],
+      };
+    },
+  });
+
+  client.addTimelineRenderer({
+    kind: "dsh-assistant-bloom",
+    version: 1,
+    schema: z.object({ text: z.string(), phase: z.enum(["streaming", "complete"]) }),
+    Component: AssistantMessageBloom,
   });
 
   client.addTimelineTransformer({

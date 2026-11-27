@@ -626,6 +626,8 @@ export const subagentSummarySchema = z.object({
   parentId: z.string(),
   depth: z.number().int().min(1),
   role: z.string().nullable(),
+  /** Human-friendly display name (e.g. Chinese role title from swarm brief or plan.json), when available. */
+  displayName: z.string().nullable().optional(),
   type: z.string().nullable(),
   /** Whether this child came from a regular subagent or an Antigravity `/swarm` worker. */
   origin: subagentOriginSchema.optional(),
@@ -826,3 +828,35 @@ export const askQuestionCardSchema = z.object({
   status: z.enum(["running", "completed", "failed", "canceled"]),
 });
 export type AskQuestionCard = z.infer<typeof askQuestionCardSchema>;
+
+const CJK_RE = /[\u4e00-\u9fff]/;
+const SWARM_EXPLICIT_ROLE_RE =
+  /(?:你是(?:本?蜂群的?|负责)?|角色\s*[：:]\s*)[「『【"']([^」』】"'\n]{2,40})[」』】"']/;
+const TRAILING_PARENS_RE = /\s*[（(][^）)\n]{1,32}[）)]\s*$/;
+
+/**
+ * Extracts a short human-readable Chinese role title (e.g. `Antigravity 服务端审查员`) from a
+ * swarm worker's brief when the coordinator declares it via `你是「...」` or `角色：「...」`.
+ */
+export function extractSwarmBriefLabel(brief: string | null | undefined): string | null {
+  if (typeof brief !== "string" || !brief) return null;
+  const head = brief.replace(/^@[a-z0-9_-]+\s+/i, "").trim().slice(0, 220);
+  if (!head) return null;
+  const match = SWARM_EXPLICIT_ROLE_RE.exec(head);
+  if (!match?.[1]) return null;
+  const cleaned = match[1].replace(TRAILING_PARENS_RE, "").trim();
+  if (cleaned.length < 2 || cleaned.length > 32) return null;
+  return CJK_RE.test(cleaned) ? cleaned : null;
+}
+
+/**
+ * Normalizes a task title from `.system_generated/swarm/plan.json` into a concise Chinese label.
+ */
+export function cleanSwarmPlanLabel(task: string | null | undefined): string | null {
+  if (typeof task !== "string" || !task) return null;
+  const trimmed = task.replace(/\s+/g, " ").trim();
+  if (!trimmed) return null;
+  const cleaned = trimmed.replace(TRAILING_PARENS_RE, "").trim();
+  if (cleaned.length < 2 || !CJK_RE.test(cleaned)) return null;
+  return cleaned.length > 28 ? `${cleaned.slice(0, 27)}…` : cleaned;
+}

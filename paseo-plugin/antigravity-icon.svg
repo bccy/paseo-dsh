@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="8.8 10.5 94 94">
+<defs>
+<linearGradient id="agy-usage-body" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#3A78EF"/>
+<stop offset="1" stop-color="#5E9DF9"/>
+</linearGradient>
+<linearGradient id="agy-usage-crown" x1="0.1" y1="0" x2="0.9" y2="0">
+<stop offset="0" stop-color="#34A853"/>
+<stop offset="0.38" stop-color="#8BC34A"/>
+<stop offset="0.52" stop-color="#FBBC04"/>
+<stop offset="0.72" stop-color="#F57C1F"/>
+<stop offset="1" stop-color="#EA4335"/>
+</linearGradient>
+<linearGradient id="agy-usage-fade" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0.18" stop-color="#ffffff" stop-opacity="1"/>
+<stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/>
+</linearGradient>
+<mask id="agy-usage-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="120" height="120">
+<rect x="0" y="0" width="120" height="120" fill="url(#agy-usage-fade)"/>
+</mask>
+</defs>
+<path d="M89.6992 93.695C94.3659 97.195 101.366 94.8617 94.9492 88.445C75.6992 69.7783 79.7825 18.445 55.8659 18.445C31.9492 18.445 36.0325 69.7783 16.7825 88.445C9.78251 95.445 17.3658 97.195 22.0325 93.695C40.1159 81.445 38.9492 59.8617 55.8659 59.8617C72.7825 59.8617 71.6159 81.445 89.6992 93.695Z" fill="url(#agy-usage-body)"/>
+<path d="M89.6992 93.695C94.3659 97.195 101.366 94.8617 94.9492 88.445C75.6992 69.7783 79.7825 18.445 55.8659 18.445C31.9492 18.445 36.0325 69.7783 16.7825 88.445C9.78251 95.445 17.3658 97.195 22.0325 93.695C40.1159 81.445 38.9492 59.8617 55.8659 59.8617C72.7825 59.8617 71.6159 81.445 89.6992 93.695Z" fill="url(#agy-usage-crown)" mask="url(#agy-usage-mask)"/>
+</svg>

@@ -1526,6 +1526,7 @@ export function InlineToolCall({
           ? text.toolLabels[normalizedName]
           : (paseoMcpLabel(data.name) ?? agyFastToolLabel(data.name) ?? data.label);
 
+  const TOOL_BLOOM_TRAIL_WIDTH = 9;
   const stream = useInkStreamReveal({
     agentId,
     timestamp,
@@ -1533,6 +1534,12 @@ export function InlineToolCall({
     liveHint: data.status === "running",
     label: displayLabel,
     summary: showSummary ? headSummary : "",
+    // Let fast completed tools finish their gentle rgba bloom instead of
+    // teleporting to 100% after 10ms; only snap immediately on failure/cancel.
+    snapOnSettle: false,
+    snapNow: data.failed || data.status === "canceled",
+    trailWidth: TOOL_BLOOM_TRAIL_WIDTH,
+    leadDelayMs: 25,
   });
 
   const styles = useMemo(
@@ -1636,7 +1643,15 @@ export function InlineToolCall({
               {(color) => (
                 <>
                   <Text style={[styles.label, color === null ? null : { color }]}>
-                    {renderInkTrailText(displayLabel, stream.labelProgress, colors.foreground, color)}
+                    {renderInkTrailText(
+                      displayLabel,
+                      stream.labelProgress,
+                      colors.foreground,
+                      color,
+                      0,
+                      colors.foregroundMuted,
+                      TOOL_BLOOM_TRAIL_WIDTH,
+                    )}
                   </Text>
                   {showSummary && stream.showSeparator ? (
                     <>
@@ -1651,7 +1666,15 @@ export function InlineToolCall({
                         ]}
                         numberOfLines={1}
                       >
-                        {renderInkTrailText(headSummary, stream.summaryProgress, colors.foreground, color)}
+                        {renderInkTrailText(
+                          headSummary,
+                          stream.summaryProgress,
+                          colors.foreground,
+                          color,
+                          0,
+                          errorHeadline ? colors.statusDanger : colors.foregroundMuted,
+                          TOOL_BLOOM_TRAIL_WIDTH,
+                        )}
                       </Text>
                     </>
                   ) : null}

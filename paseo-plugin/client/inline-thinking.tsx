@@ -22,15 +22,27 @@
  * @module dsh-paseo/client/inline-thinking
  */
 import { useSettings, type PluginTimelineItemProps } from "@getpaseo/plugin/client";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Image, Pressable, ScrollView, Text, View } from "react-native";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  Animated,
+  Easing,
+  Image,
+  Platform,
+  Pressable,
+  ScrollView,
+  Text,
+  View,
+  type StyleProp,
+  type TextStyle,
+} from "react-native";
 import {
   EXPANDED_MAX_HEIGHT_DEFAULT,
   TIMELINE_STYLE_DEFAULTS,
   timelineStyleSettings,
 } from "../shared/settings";
-import { normalizeRowTimestamp, noteRender } from "./newest";
+import { normalizeRowTimestamp, noteRender, useIsPulseOwner } from "./newest";
 import {
+  AnimatedBodyParagraph,
   RowEntrance,
   SCROLL_BOX_TEST_ID,
   renderInkTrailText,
@@ -40,10 +52,30 @@ import {
 import { RowStatusIcon, resolveThinkingIconStatus } from "./row-status-icon";
 import { TextShimmer } from "./text-shimmer";
 import { currentLocale } from "./locale";
-import { useTranslatedThinking } from "./thinking-translate";
+import {
+  EAGER_FULL_TRANSLATE_MAX_CHARS,
+  prefetchThinkingTranslation,
+  useStreamingTranslatedThinking,
+  useTranslatedThinking,
+} from "./thinking-translate";
 import { isPreviewReadyForTranslation } from "../shared/translate-text";
-import { formatThinkingDuration, reasoningPreview, streamingTail } from "./thinking-text";
-import { BODY_INDENT, ROW_FONT_SIZE, ROW_GAP, ROW_LINE_HEIGHT } from "./tokens";
+import {
+  EXPANDED_BLOOM_WAVE_WIDTH,
+  advanceExpandedInkCursor,
+  advanceLeftScrollCursor,
+  advanceSmoothPixelOffset,
+  buildExpandedBloomSegments,
+  computeSmoothMarqueeDurationMs,
+  countCodePoints,
+  findSettledBodySplit,
+  formatThinkingDuration,
+  normalizeLeftScrollStream,
+  reasoningPreview,
+  splitNativeMarqueeChunks,
+  streamingTail,
+} from "./thinking-text";
+import { STREAM_FRAME_INTERVAL_MS } from "./stream-reveal";
+import { BODY_INDENT, ROW_FONT_SIZE, ROW_GAP, ROW_LINE_HEIGHT, withAlpha } from "./tokens";
 import { useLocaleText } from "./use-locale";
 
 /**
@@ -284,6 +316,1085 @@ function useGrowing(
       sameOrContinued && !resumedOnRender ? state.lastActivityAt : Date.now(),
     continuedKeyShift,
   };
+}
+
+const useCommitLayoutEffect =
+  typeof useLayoutEffect === "function" ? useLayoutEffect : useEffect;
+
+/** Maximum trailing characters kept in Native fallback / Web marquee text node. */
+const LEFT_SCROLL_DOM_WINDOW_CHARS = 180;
+const WEB_MARQUEE_MAX_CHARS = 4000;
+const WEB_LEFT_FADE_MASK = "linear-gradient(to right, transparent 0px, black 14px, black 100%)";
+
+interface WebMarqueeDomNode {
+  clientWidth?: number;
+  scrollWidth?: number;
+  style?: {
+    width?: string;
+    transform?: string;
+    maskImage?: string;
+    webkitMaskImage?: string;
+  };
+}
+
+interface WebMarqueeSlot {
+  outer: WebMarqueeDomNode | null;
+  clip: WebMarqueeDomNode | null;
+  inner: WebMarqueeDomNode | null;
+}
+
+interface SmoothMarqueeController {
+  readonly text: string;
+  readonly active: boolean;
+  readonly register: (slot: WebMarqueeSlot) => () => void;
+}
+
+/**
+ * Drives 60/120fps sub-pixel GPU `translate3d` leftward marquee scrolling on
+ * Web/Safari with ZERO React re-renders per frame. Both layers rendered by
+ * `TextShimmer` register their DOM refs here and stay sub-pixel synchronized.
+ */
+function useSmoothWebMarquee(
+  source: string,
+  active: boolean,
+  keepAlive: boolean,
+  resetKey: string | number,
+): SmoothMarqueeController {
+  const isWeb =
+    Platform?.OS === "web" &&
+    typeof globalThis.requestAnimationFrame === "function" &&
+    typeof globalThis.cancelAnimationFrame === "function";
+  const normalized = isWeb && keepAlive ? normalizeLeftScrollStream(source) : "";
+  const text =
+    normalized.length > WEB_MARQUEE_MAX_CHARS
+      ? normalized.slice(normalized.length - WEB_MARQUEE_MAX_CHARS)
+      : normalized;
+
+  const slotsRef = useRef<Set<WebMarqueeSlot>>(new Set());
+  const revealedPxRef = useRef<number>(0);
+  const lastFrameRef = useRef<number>(0);
+  const rafRef = useRef<number | null>(null);
+  const activeRef = useRef<boolean>(isWeb && active && text !== "");
+  const prevResetKeyRef = useRef<string | number>(resetKey);
+  const prevKeepAliveRef = useRef<boolean>(keepAlive);
+
+  if (prevResetKeyRef.current !== resetKey || (!keepAlive && prevKeepAliveRef.current)) {
+    prevResetKeyRef.current = resetKey;
+    prevKeepAliveRef.current = keepAlive;
+    revealedPxRef.current = 0;
+    lastFrameRef.current = 0;
+  } else {
+    prevKeepAliveRef.current = keepAlive;
+  }
+
+  const effectiveActive = isWeb && active && text !== "";
+  activeRef.current = effectiveActive;
+
+  const applyToSlot = (slot: WebMarqueeSlot, revealedPx: number) => {
+    const outer = slot.outer;
+    const clip = slot.clip;
+    const inner = slot.inner;
+    if (!outer || !clip || !inner || !clip.style || !inner.style || !outer.style) return;
+    const containerW = outer.clientWidth ?? 0;
+    const contentW = inner.scrollWidth ?? 0;
+    if (containerW <= 0 || contentW <= 0) return;
+    const clampedRevealed = Math.min(contentW, Math.max(0, revealedPx));
+    if (clampedRevealed <= containerW) {
+      clip.style.width = `${clampedRevealed.toFixed(2)}px`;
+      inner.style.transform = "translate3d(0px, 0, 0)";
+      if (outer.style.maskImage) {
+        outer.style.maskImage = "";
+        outer.style.webkitMaskImage = "";
+      }
+    } else {
+      const offsetPx = clampedRevealed - containerW;
+      clip.style.width = "100%";
+      inner.style.transform = `translate3d(${(-offsetPx).toFixed(2)}px, 0, 0)`;
+      if (outer.style.maskImage !== WEB_LEFT_FADE_MASK) {
+        outer.style.maskImage = WEB_LEFT_FADE_MASK;
+        outer.style.webkitMaskImage = WEB_LEFT_FADE_MASK;
+      }
+    }
+  };
+
+  const measureMaxContentW = (): number => {
+    let maxW = 0;
+    for (const slot of slotsRef.current) {
+      const w = slot.inner?.scrollWidth ?? 0;
+      if (w > maxW) maxW = w;
+    }
+    return maxW;
+  };
+
+  const startLoopRef = useRef<() => void>(() => undefined);
+  startLoopRef.current = () => {
+    if (!activeRef.current || rafRef.current !== null) return;
+    const targetW = measureMaxContentW();
+    if (targetW > 0 && revealedPxRef.current > targetW) {
+      revealedPxRef.current = targetW;
+    }
+    for (const slot of slotsRef.current) {
+      applyToSlot(slot, revealedPxRef.current);
+    }
+    if (targetW <= 0 || revealedPxRef.current >= targetW) {
+      lastFrameRef.current = 0;
+      return;
+    }
+    const tick = (now: number) => {
+      rafRef.current = null;
+      if (!activeRef.current) {
+        lastFrameRef.current = 0;
+        return;
+      }
+      const curTargetW = measureMaxContentW();
+      if (curTargetW <= 0) {
+        lastFrameRef.current = 0;
+        return;
+      }
+      if (revealedPxRef.current > curTargetW) {
+        revealedPxRef.current = curTargetW;
+      }
+      const dt = lastFrameRef.current === 0 ? 16 : Math.max(1, now - lastFrameRef.current);
+      lastFrameRef.current = now;
+      revealedPxRef.current = advanceSmoothPixelOffset(revealedPxRef.current, curTargetW, dt);
+      for (const slot of slotsRef.current) {
+        applyToSlot(slot, revealedPxRef.current);
+      }
+      if (revealedPxRef.current < curTargetW - 0.25) {
+        rafRef.current = globalThis.requestAnimationFrame(tick);
+      } else {
+        revealedPxRef.current = curTargetW;
+        for (const slot of slotsRef.current) {
+          applyToSlot(slot, curTargetW);
+        }
+        lastFrameRef.current = 0;
+      }
+    };
+    lastFrameRef.current = 0;
+    rafRef.current = globalThis.requestAnimationFrame(tick);
+  };
+
+  // Cancel running rAF only on unmount or row switch.
+  useEffect(() => {
+    return () => {
+      if (rafRef.current !== null && typeof globalThis.cancelAnimationFrame === "function") {
+        globalThis.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      lastFrameRef.current = 0;
+    };
+  }, [resetKey]);
+
+  // Synchronously sync newly measured text width before paint and wake rAF if needed.
+  useCommitLayoutEffect(() => {
+    if (!effectiveActive) {
+      if (rafRef.current !== null && typeof globalThis.cancelAnimationFrame === "function") {
+        globalThis.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      lastFrameRef.current = 0;
+      if (!keepAlive) {
+        revealedPxRef.current = 0;
+      }
+      return;
+    }
+    startLoopRef.current();
+  }, [effectiveActive, keepAlive, text, resetKey]);
+
+  const register = useMemo(
+    () => (slot: WebMarqueeSlot) => {
+      slotsRef.current.add(slot);
+      if (activeRef.current) {
+        startLoopRef.current();
+      }
+      return () => {
+        slotsRef.current.delete(slot);
+      };
+    },
+    [],
+  );
+
+  return { text, active: effectiveActive, register };
+}
+
+function SmoothMarqueeLine({
+  controller,
+  style,
+}: {
+  controller: SmoothMarqueeController;
+  style: StyleProp<TextStyle>;
+}) {
+  const slotRef = useRef<WebMarqueeSlot>({ outer: null, clip: null, inner: null });
+
+  useCommitLayoutEffect(() => {
+    return controller.register(slotRef.current);
+  }, [controller.register]);
+
+  return (
+    <View
+      ref={(node) => {
+        slotRef.current.outer = node as unknown as WebMarqueeDomNode | null;
+      }}
+      style={{
+        flex: 1,
+        minWidth: 0,
+        overflow: "hidden",
+        flexDirection: "row",
+        alignItems: "center",
+      }}
+    >
+      <View
+        ref={(node) => {
+          slotRef.current.clip = node as unknown as WebMarqueeDomNode | null;
+        }}
+        style={{
+          overflow: "hidden",
+          flexDirection: "row",
+          alignItems: "center",
+          maxWidth: "100%",
+        }}
+      >
+        <Text
+          ref={(node) => {
+            slotRef.current.inner = node as unknown as WebMarqueeDomNode | null;
+          }}
+          style={[
+            style,
+            { flex: 0, flexShrink: 0, whiteSpace: "nowrap", willChange: "transform" } as unknown as TextStyle,
+          ]}
+        >
+          {controller.text}
+        </Text>
+      </View>
+    </View>
+  );
+}
+
+const NATIVE_MARQUEE_CHUNK_CHARS = 24;
+const NATIVE_MARQUEE_MAX_MOUNTED_CHUNKS = 8;
+const NATIVE_MARQUEE_RETIRE_MARGIN_PX = 48;
+
+interface NativeMarqueeController {
+  readonly active: boolean;
+  readonly lineWidth: number;
+  readonly rowLineHeight: number;
+  readonly retiredCount: number;
+  readonly retiredWidth: number;
+  readonly mountedChunks: readonly string[];
+  readonly trackWidth: number;
+  readonly clipX: Animated.AnimatedInterpolation<number> | null;
+  readonly innerX: Animated.AnimatedInterpolation<number> | null;
+  readonly onChunkLayout: (chunkIndex: number, width: number) => void;
+}
+
+/**
+ * Drives 60/120fps CoreAnimation/GPU leftward marquee scrolling on native
+ * iOS/Android via a single shared `Animated.Value` with `useNativeDriver: true`.
+ *
+ * Uses the same double-counter-translate clip trick as `SweepNative` so both
+ * the initial left-to-right reveal (`0..lineWidth`) and the continuous leftward
+ * glide (`> lineWidth`) run purely on GPU transforms with ZERO per-frame JS
+ * thread callbacks, ZERO React re-renders during motion, and bounded small
+ * `<Text>` chunks so iOS `UILabel` backing textures never overflow.
+ */
+function useNativeSmoothMarquee(
+  source: string,
+  active: boolean,
+  keepAlive: boolean,
+  lineWidth: number,
+  rowLineHeight: number,
+  resetKey: string | number,
+): NativeMarqueeController {
+  const canUseNative =
+    typeof Platform?.OS === "string" &&
+    Platform.OS !== "web" &&
+    typeof Animated?.Value === "function" &&
+    typeof Animated?.timing === "function" &&
+    typeof Animated?.View !== "undefined" &&
+    typeof Easing?.linear === "function";
+
+  const normalized = canUseNative && keepAlive ? normalizeLeftScrollStream(source) : "";
+  const allChunks = useMemo(
+    () => (normalized ? splitNativeMarqueeChunks(normalized, NATIVE_MARQUEE_CHUNK_CHARS) : []),
+    [normalized],
+  );
+  const effectiveActive = canUseNative && active && lineWidth > 0 && allChunks.length > 0;
+
+  const revealedRef = useRef<Animated.Value | null>(null);
+  if (canUseNative && revealedRef.current === null) {
+    revealedRef.current = new Animated.Value(0);
+  }
+
+  const chunkWidthsRef = useRef<number[]>([]);
+  const animStateRef = useRef({
+    fromPx: 0,
+    toPx: 0,
+    startedAt: 0,
+    durationMs: 0,
+    running: false,
+  });
+  const [retireState, setRetireState] = useState<{
+    epoch: string | number;
+    retiredCount: number;
+    retiredWidth: number;
+  }>({ epoch: resetKey, retiredCount: 0, retiredWidth: 0 });
+  const retireStateRef = useRef({ retiredCount: 0, retiredWidth: 0 });
+  const retireTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const prevResetKeyRef = useRef<string | number>(resetKey);
+  const prevKeepAliveRef = useRef<boolean>(keepAlive);
+
+  const resetKeyRef = useRef<string | number>(resetKey);
+  resetKeyRef.current = resetKey;
+  const lineWidthRef = useRef<number>(lineWidth);
+  lineWidthRef.current = lineWidth;
+  const allChunksLenRef = useRef<number>(allChunks.length);
+  allChunksLenRef.current = allChunks.length;
+  const effectiveActiveRef = useRef<boolean>(effectiveActive);
+  effectiveActiveRef.current = effectiveActive;
+
+  const needsReset =
+    prevResetKeyRef.current !== resetKey || (!keepAlive && prevKeepAliveRef.current);
+  if (needsReset) {
+    prevResetKeyRef.current = resetKey;
+    prevKeepAliveRef.current = keepAlive;
+    chunkWidthsRef.current = [];
+    retireStateRef.current = { retiredCount: 0, retiredWidth: 0 };
+    animStateRef.current = { fromPx: 0, toPx: 0, startedAt: 0, durationMs: 0, running: false };
+  } else {
+    prevKeepAliveRef.current = keepAlive;
+    if (chunkWidthsRef.current.length > allChunks.length) {
+      chunkWidthsRef.current.length = allChunks.length;
+    }
+  }
+
+  const effectiveRetiredCount =
+    !needsReset && keepAlive && retireState.epoch === resetKey
+      ? Math.min(retireState.retiredCount, Math.max(0, allChunks.length - 1))
+      : 0;
+  const effectiveRetiredWidth =
+    !needsReset && keepAlive && retireState.epoch === resetKey && effectiveRetiredCount > 0
+      ? retireState.retiredWidth
+      : 0;
+  retireStateRef.current = {
+    retiredCount: effectiveRetiredCount,
+    retiredWidth: effectiveRetiredWidth,
+  };
+
+  const clearRetireTimer = () => {
+    if (retireTimerRef.current !== null) {
+      clearTimeout(retireTimerRef.current);
+      retireTimerRef.current = null;
+    }
+  };
+
+  const estimateRevealedPx = (): number => {
+    const st = animStateRef.current;
+    if (!st.running) return st.toPx;
+    const elapsed = Math.max(0, Date.now() - st.startedAt);
+    const frac = st.durationMs > 0 ? Math.min(1, elapsed / st.durationMs) : 1;
+    return st.fromPx + (st.toPx - st.fromPx) * frac;
+  };
+
+  const computeMeasuredTotalWidth = (): number => {
+    const { retiredCount: rCount, retiredWidth: rWidth } = retireStateRef.current;
+    const endIdx = Math.min(allChunksLenRef.current, rCount + NATIVE_MARQUEE_MAX_MOUNTED_CHUNKS);
+    let sum = rWidth;
+    for (let i = rCount; i < endIdx; i += 1) {
+      const w = chunkWidthsRef.current[i];
+      if (typeof w === "number" && w > 0) sum += w;
+    }
+    return sum;
+  };
+
+  const tryRetireRef = useRef<() => void>(() => undefined);
+  const scheduleRetireRef = useRef<() => void>(() => undefined);
+
+  tryRetireRef.current = () => {
+    if (!effectiveActiveRef.current) return;
+    const { retiredCount: rCount, retiredWidth: rWidth } = retireStateRef.current;
+    const maxRetirable = Math.max(0, allChunksLenRef.current - 2);
+    if (rCount >= maxRetirable) return;
+
+    const currentPx = estimateRevealedPx();
+    const viewportLeftWorldPx = currentPx - lineWidthRef.current - NATIVE_MARQUEE_RETIRE_MARGIN_PX;
+    let nextCount = rCount;
+    let nextWidth = rWidth;
+    while (nextCount < maxRetirable) {
+      const w = chunkWidthsRef.current[nextCount];
+      if (!(typeof w === "number" && w > 0)) break;
+      if (nextWidth + w <= viewportLeftWorldPx) {
+        nextWidth += w;
+        nextCount += 1;
+      } else {
+        break;
+      }
+    }
+    if (nextCount > rCount) {
+      retireStateRef.current = { retiredCount: nextCount, retiredWidth: nextWidth };
+      setRetireState({
+        epoch: resetKeyRef.current,
+        retiredCount: nextCount,
+        retiredWidth: nextWidth,
+      });
+    } else {
+      scheduleRetireRef.current();
+    }
+  };
+
+  scheduleRetireRef.current = () => {
+    clearRetireTimer();
+    if (!effectiveActiveRef.current) return;
+    const { retiredCount: rCount, retiredWidth: rWidth } = retireStateRef.current;
+    const totalChunks = allChunksLenRef.current;
+    // Only schedule periodic retirement when mounted window is filling up or has queued tail chunks.
+    if (totalChunks - rCount <= 4) return;
+    const maxRetirable = Math.max(0, totalChunks - 2);
+    if (rCount >= maxRetirable) return;
+    const oldestW = chunkWidthsRef.current[rCount];
+    if (!(typeof oldestW === "number" && oldestW > 0)) return;
+
+    const thresholdPx = rWidth + oldestW + lineWidthRef.current + NATIVE_MARQUEE_RETIRE_MARGIN_PX;
+    const currentPx = estimateRevealedPx();
+    if (currentPx >= thresholdPx) {
+      tryRetireRef.current();
+      return;
+    }
+    const st = animStateRef.current;
+    if (!st.running || st.toPx < thresholdPx) return;
+    const speedPxPerMs =
+      st.durationMs > 0 ? Math.max(0.05, (st.toPx - st.fromPx) / st.durationMs) : 0.145;
+    const etaMs = Math.min(2000, Math.max(120, Math.ceil((thresholdPx - currentPx) / speedPxPerMs)));
+    retireTimerRef.current = setTimeout(() => {
+      retireTimerRef.current = null;
+      tryRetireRef.current();
+    }, etaMs);
+  };
+
+  const kickAnimationRef = useRef<() => void>(() => undefined);
+  kickAnimationRef.current = () => {
+    const revealed = revealedRef.current;
+    if (!revealed || !effectiveActiveRef.current) return;
+    const targetW = computeMeasuredTotalWidth();
+    if (targetW <= 0) return;
+
+    const currentPx = estimateRevealedPx();
+    if (targetW < currentPx - 0.5) {
+      revealed.stopAnimation();
+      revealed.setValue(targetW);
+      animStateRef.current = {
+        fromPx: targetW,
+        toPx: targetW,
+        startedAt: Date.now(),
+        durationMs: 0,
+        running: false,
+      };
+      return;
+    }
+
+    const remainingPx = targetW - currentPx;
+    if (remainingPx < 0.5) return;
+    if (animStateRef.current.running && Math.abs(animStateRef.current.toPx - targetW) < 0.5) {
+      scheduleRetireRef.current();
+      return;
+    }
+
+    const durationMs = computeSmoothMarqueeDurationMs(remainingPx);
+    const startedAt = Date.now();
+    animStateRef.current = {
+      fromPx: currentPx,
+      toPx: targetW,
+      startedAt,
+      durationMs,
+      running: true,
+    };
+    Animated.timing(revealed, {
+      toValue: targetW,
+      duration: durationMs,
+      easing: Easing.linear,
+      useNativeDriver: true,
+    }).start(({ finished }) => {
+      if (finished && animStateRef.current.startedAt === startedAt) {
+        animStateRef.current = {
+          fromPx: targetW,
+          toPx: targetW,
+          startedAt: Date.now(),
+          durationMs: 0,
+          running: false,
+        };
+        tryRetireRef.current();
+      }
+    });
+    scheduleRetireRef.current();
+  };
+
+  // Stop native animation and clear timer on unmount or row switch.
+  useEffect(() => {
+    return () => {
+      clearRetireTimer();
+      revealedRef.current?.stopAnimation();
+      animStateRef.current = { fromPx: 0, toPx: 0, startedAt: 0, durationMs: 0, running: false };
+    };
+  }, [resetKey]);
+
+  // Sync activation / settle / reset transitions.
+  useEffect(() => {
+    if (!canUseNative) return;
+    const revealed = revealedRef.current;
+    if (!keepAlive) {
+      clearRetireTimer();
+      revealed?.stopAnimation();
+      revealed?.setValue(0);
+      chunkWidthsRef.current = [];
+      animStateRef.current = { fromPx: 0, toPx: 0, startedAt: 0, durationMs: 0, running: false };
+      setRetireState((prev) =>
+        prev.epoch === resetKey && prev.retiredCount === 0 && prev.retiredWidth === 0
+          ? prev
+          : { epoch: resetKey, retiredCount: 0, retiredWidth: 0 },
+      );
+      return;
+    }
+    if (!effectiveActive) {
+      clearRetireTimer();
+      if (animStateRef.current.running) {
+        const pausedPx = estimateRevealedPx();
+        revealed?.stopAnimation();
+        animStateRef.current = {
+          fromPx: pausedPx,
+          toPx: pausedPx,
+          startedAt: Date.now(),
+          durationMs: 0,
+          running: false,
+        };
+      }
+      return;
+    }
+    if (retireState.epoch !== resetKey) {
+      setRetireState({ epoch: resetKey, retiredCount: 0, retiredWidth: 0 });
+    }
+    kickAnimationRef.current();
+  }, [canUseNative, effectiveActive, keepAlive, allChunks.length, lineWidth, resetKey]);
+
+  const onChunkLayout = useMemo(
+    () => (chunkIndex: number, width: number) => {
+      if (!Number.isFinite(width) || width <= 0) return;
+      const prev = chunkWidthsRef.current[chunkIndex];
+      if (typeof prev === "number" && Math.abs(prev - width) < 0.25) return;
+      chunkWidthsRef.current[chunkIndex] = width;
+      kickAnimationRef.current();
+    },
+    [],
+  );
+
+  const interpolations = useMemo(() => {
+    const revealed = revealedRef.current;
+    if (!canUseNative || !revealed || lineWidth <= 0) {
+      return { clipX: null, innerX: null };
+    }
+    const clipX = revealed.interpolate({
+      inputRange: [0, lineWidth],
+      outputRange: [-lineWidth, 0],
+      extrapolateLeft: "clamp",
+      extrapolateRight: "clamp",
+    });
+    const innerX = revealed.interpolate({
+      inputRange: [0, lineWidth],
+      outputRange: [lineWidth, 0],
+      extrapolateLeft: "extend",
+      extrapolateRight: "extend",
+    });
+    return { clipX, innerX };
+  }, [canUseNative, lineWidth]);
+
+  const mountedChunks = useMemo(() => {
+    if (!effectiveActive) return [];
+    return allChunks.slice(
+      effectiveRetiredCount,
+      effectiveRetiredCount + NATIVE_MARQUEE_MAX_MOUNTED_CHUNKS,
+    );
+  }, [effectiveActive, allChunks, effectiveRetiredCount]);
+
+  let activeCharCount = 0;
+  for (const chunk of mountedChunks) activeCharCount += chunk.length;
+  const trackWidth = Math.ceil(
+    effectiveRetiredWidth + activeCharCount * ROW_FONT_SIZE * 1.6 + lineWidth + 200,
+  );
+
+  return {
+    active: effectiveActive && interpolations.clipX !== null && interpolations.innerX !== null,
+    lineWidth,
+    rowLineHeight,
+    retiredCount: effectiveRetiredCount,
+    retiredWidth: effectiveRetiredWidth,
+    mountedChunks,
+    trackWidth,
+    clipX: interpolations.clipX,
+    innerX: interpolations.innerX,
+    onChunkLayout,
+  };
+}
+
+/**
+ * Smoothly reveals a growing single-line stream character-by-character so that
+ * once the text fills the row width, older characters glide smoothly leftward
+ * one character at a time — identical physics for both DSH native chunks and
+ * Antigravity translated sentences.
+ *
+ * Never resets the cursor mid-thought on markdown/tail revisions (eliminating
+ * flash-backs to char 1) and never tears down rAF on chunk arrivals.
+ *
+ * Falls back synchronously to `source` in headless environments without
+ * `requestAnimationFrame` (e.g. Node unit harnesses).
+ */
+function useLeftScrollText(
+  source: string,
+  active: boolean,
+  keepAlive: boolean,
+  resetKey: string | number,
+): { text: string; active: boolean } {
+  const hasRaf =
+    typeof globalThis.requestAnimationFrame === "function" &&
+    typeof globalThis.cancelAnimationFrame === "function";
+  const normalized = keepAlive ? normalizeLeftScrollStream(source) : "";
+  const chars = useMemo(() => (normalized ? Array.from(normalized) : []), [normalized]);
+  const targetLen = chars.length;
+
+  const cursorRef = useRef<number>(0);
+  const targetRef = useRef<number>(targetLen);
+  const activeRef = useRef<boolean>(active);
+  const lastFrameRef = useRef<number>(0);
+  const rafRef = useRef<number | null>(null);
+  const prevResetKeyRef = useRef<string | number>(resetKey);
+  const prevKeepAliveRef = useRef<boolean>(keepAlive);
+
+  const [shownLen, setShownLen] = useState<number>(0);
+
+  if (prevResetKeyRef.current !== resetKey || (!keepAlive && prevKeepAliveRef.current)) {
+    prevResetKeyRef.current = resetKey;
+    prevKeepAliveRef.current = keepAlive;
+    cursorRef.current = 0;
+    lastFrameRef.current = 0;
+  } else {
+    prevKeepAliveRef.current = keepAlive;
+    // Never rewind to 0 mid-thought when markdown markers (`**`) or liveTail
+    // wording shift slightly — only clamp down if the string shrank.
+    if (targetLen < cursorRef.current) {
+      cursorRef.current = targetLen;
+    }
+  }
+  targetRef.current = targetLen;
+  activeRef.current = active;
+
+  // Effect 1: Cancel any running rAF only on unmount or row switch (never on chunk arrival!).
+  useEffect(() => {
+    return () => {
+      if (rafRef.current !== null && typeof globalThis.cancelAnimationFrame === "function") {
+        globalThis.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      lastFrameRef.current = 0;
+    };
+  }, [resetKey]);
+
+  // Effect 2: Start or pause the persistent rAF loop without tearing it down on new chunks.
+  useEffect(() => {
+    if (!hasRaf || !active || targetLen === 0) {
+      if (rafRef.current !== null && typeof globalThis.cancelAnimationFrame === "function") {
+        globalThis.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      lastFrameRef.current = 0;
+      if (!keepAlive || targetLen === 0) {
+        cursorRef.current = 0;
+        setShownLen(0);
+      }
+      return;
+    }
+
+    // Seed at least 1 char immediately so the line never flashes empty on frame 1.
+    if (cursorRef.current < 1 && targetLen >= 1) {
+      cursorRef.current = 1;
+      setShownLen(1);
+    }
+
+    const tick = (now: number) => {
+      rafRef.current = null;
+      if (!activeRef.current) {
+        lastFrameRef.current = 0;
+        return;
+      }
+      const dt = lastFrameRef.current === 0 ? 16 : Math.max(1, now - lastFrameRef.current);
+      lastFrameRef.current = now;
+
+      const nextCursor = advanceLeftScrollCursor(cursorRef.current, targetRef.current, dt);
+      cursorRef.current = nextCursor;
+      const nextInt = Math.min(targetRef.current, Math.max(1, Math.floor(nextCursor)));
+      setShownLen((prev) => (prev === nextInt ? prev : nextInt));
+
+      if (cursorRef.current < targetRef.current) {
+        rafRef.current = globalThis.requestAnimationFrame(tick);
+      } else {
+        lastFrameRef.current = 0;
+      }
+    };
+
+    if (cursorRef.current < targetRef.current && rafRef.current === null) {
+      lastFrameRef.current = 0;
+      rafRef.current = globalThis.requestAnimationFrame(tick);
+    } else if (cursorRef.current >= targetRef.current) {
+      const clamped = Math.min(targetLen, Math.max(1, Math.floor(cursorRef.current)));
+      setShownLen((prev) => (prev === clamped ? prev : clamped));
+    }
+  }, [hasRaf, active, keepAlive, targetLen, normalized, resetKey]);
+
+  if (!active || targetLen === 0) {
+    return { text: "", active: false };
+  }
+  if (!hasRaf) {
+    return { text: source, active: false };
+  }
+  const visibleCount = Math.min(targetLen, Math.max(1, shownLen || Math.floor(cursorRef.current) || 1));
+  const sliceStart = Math.max(0, visibleCount - LEFT_SCROLL_DOM_WINDOW_CHARS);
+  return { text: chars.slice(sliceStart, visibleCount).join(""), active: true };
+}
+
+/** Max unbroken single-paragraph tail size before bypassing per-frame ink-trail splits. */
+const EXPANDED_INK_MAX_ACTIVE_CHARS = 1600;
+
+interface ExpandedBodyInkState {
+  readonly active: boolean;
+  readonly frozenText: string;
+  readonly activeText: string;
+  readonly localProgress: number;
+  readonly localSettledFloor: number;
+  readonly gapLines: number;
+  /** Increments each time a brand-new paragraph begins so it can gently float up as a whole block. */
+  readonly paragraphIndex: number;
+}
+
+function commonUtf16PrefixLength(a: string, b: string): number {
+  const max = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < max && a.charCodeAt(i) === b.charCodeAt(i)) i += 1;
+  if (i > 0 && i < max) {
+    const prev = a.charCodeAt(i - 1);
+    if (prev >= 0xd800 && prev <= 0xdbff) i -= 1;
+  }
+  return i;
+}
+
+/**
+ * Streams newly arriving text inside an expanded thinking box with the same
+ * 5.5-character soft ink-bloom trail used on the timeline (`renderInkTrailText`).
+ *
+ * - Text already present when the user expands appears immediately (0ms).
+ * - Completed paragraphs above the active ink tail freeze into a memoized
+ *   static `<Text>` so even 30k+ character thoughts only re-layout the active
+ *   trailing paragraph (~50–250 chars) at 60fps.
+ * - `settledFloor` guarantees already-settled trailing characters stay at
+ *   opacity 1.0 when a new chunk arrives while new characters bloom cleanly
+ *   from the very first appended glyph.
+ * - Automatically snaps to plain selectable text when settled, collapsed,
+ *   toggled between original/translation, or in headless Node harnesses.
+ */
+function useExpandedBodyInkReveal(
+  text: string,
+  open: boolean,
+  growing: boolean,
+  isPlaceholder: boolean,
+  resetKey: string | number,
+): ExpandedBodyInkState {
+  const hasRaf =
+    typeof globalThis.requestAnimationFrame === "function" &&
+    typeof globalThis.cancelAnimationFrame === "function";
+
+  const prevOpenRef = useRef<boolean>(open);
+  const prevResetKeyRef = useRef<string | number>(resetKey);
+  const prevTextRef = useRef<string>(text);
+  const prevPlaceholderRef = useRef<boolean>(isPlaceholder);
+  const totalCpRef = useRef<number>(countCodePoints(text));
+  const cursorRef = useRef<number>(totalCpRef.current + EXPANDED_BLOOM_WAVE_WIDTH);
+  const settledFloorRef = useRef<number>(totalCpRef.current);
+  const frozenRef = useRef<{
+    text: string;
+    activeStartUtf16: number;
+    activeCpOffset: number;
+    gapLines: number;
+    paragraphIndex: number;
+  }>({ text: "", activeStartUtf16: 0, activeCpOffset: 0, gapLines: 0, paragraphIndex: 0 });
+  const rafRef = useRef<number | null>(null);
+  const lastFrameRef = useRef<number>(0);
+  const [, setTick] = useState(0);
+
+  const snapSettled = (nextText: string) => {
+    const total = countCodePoints(nextText);
+    totalCpRef.current = total;
+    cursorRef.current = total + EXPANDED_BLOOM_WAVE_WIDTH;
+    settledFloorRef.current = total;
+    frozenRef.current = {
+      text: "",
+      activeStartUtf16: 0,
+      activeCpOffset: 0,
+      gapLines: 0,
+      paragraphIndex: 0,
+    };
+  };
+
+  if (prevResetKeyRef.current !== resetKey) {
+    prevResetKeyRef.current = resetKey;
+    prevOpenRef.current = open;
+    prevTextRef.current = text;
+    prevPlaceholderRef.current = isPlaceholder;
+    snapSettled(text);
+  } else if (!open) {
+    prevOpenRef.current = false;
+    prevTextRef.current = text;
+    prevPlaceholderRef.current = isPlaceholder;
+    snapSettled(text);
+  } else if (!prevOpenRef.current && open) {
+    prevOpenRef.current = true;
+    prevTextRef.current = text;
+    prevPlaceholderRef.current = isPlaceholder;
+    snapSettled(text);
+  } else if (text !== prevTextRef.current) {
+    const prevText = prevTextRef.current;
+    const wasPlaceholder = prevPlaceholderRef.current;
+    prevTextRef.current = text;
+    prevPlaceholderRef.current = isPlaceholder;
+
+    if (!hasRaf || isPlaceholder || (!growing && cursorRef.current >= totalCpRef.current + EXPANDED_BLOOM_WAVE_WIDTH)) {
+      snapSettled(text);
+    } else if (wasPlaceholder && !isPlaceholder) {
+      totalCpRef.current = countCodePoints(text);
+      cursorRef.current = 0;
+      settledFloorRef.current = 0;
+      frozenRef.current = {
+        text: "",
+        activeStartUtf16: 0,
+        activeCpOffset: 0,
+        gapLines: 0,
+        paragraphIndex: 1,
+      };
+    } else if (text.startsWith(prevText)) {
+      const prevTotal = totalCpRef.current;
+      totalCpRef.current += countCodePoints(text.slice(prevText.length));
+      if (cursorRef.current > prevTotal) {
+        settledFloorRef.current = Math.max(settledFloorRef.current, prevTotal);
+        cursorRef.current = prevTotal;
+      }
+    } else if (prevText.endsWith("…") && text.startsWith(prevText.slice(0, -1))) {
+      const commonUtf16 = prevText.length - 1;
+      const commonCp = Math.max(0, totalCpRef.current - 1);
+      totalCpRef.current = commonCp + countCodePoints(text.slice(commonUtf16));
+      if (cursorRef.current > commonCp) {
+        settledFloorRef.current = Math.min(commonCp, Math.max(settledFloorRef.current, commonCp));
+        cursorRef.current = commonCp;
+      } else {
+        settledFloorRef.current = Math.min(settledFloorRef.current, commonCp);
+      }
+      if (frozenRef.current.activeStartUtf16 > commonUtf16) {
+        frozenRef.current = {
+          text: "",
+          activeStartUtf16: 0,
+          activeCpOffset: 0,
+          gapLines: 0,
+          paragraphIndex: frozenRef.current.paragraphIndex,
+        };
+      }
+    } else {
+      const commonUtf16 = commonUtf16PrefixLength(prevText, text);
+      const commonCp = countCodePoints(text.slice(0, commonUtf16));
+      totalCpRef.current = commonCp + countCodePoints(text.slice(commonUtf16));
+      if (cursorRef.current > commonCp) {
+        settledFloorRef.current = Math.min(commonCp, Math.max(settledFloorRef.current, commonCp));
+        cursorRef.current = commonCp;
+      } else {
+        settledFloorRef.current = Math.min(settledFloorRef.current, commonCp);
+      }
+      if (frozenRef.current.activeStartUtf16 > commonUtf16) {
+        frozenRef.current = {
+          text: "",
+          activeStartUtf16: 0,
+          activeCpOffset: 0,
+          gapLines: 0,
+          paragraphIndex: frozenRef.current.paragraphIndex,
+        };
+      }
+    }
+  } else {
+    prevPlaceholderRef.current = isPlaceholder;
+  }
+
+  if (open && hasRaf && !isPlaceholder && cursorRef.current < totalCpRef.current + EXPANDED_BLOOM_WAVE_WIDTH) {
+    const f = frozenRef.current;
+    const currentActive = text.slice(f.activeStartUtf16);
+    const settledGlobalCp = Math.max(
+      settledFloorRef.current,
+      Math.floor(cursorRef.current - EXPANDED_BLOOM_WAVE_WIDTH) - 1,
+    );
+    const settledLocalCp = settledGlobalCp - f.activeCpOffset;
+    if (settledLocalCp > 0) {
+      const advance = findSettledBodySplit(currentActive, settledLocalCp);
+      if (advance !== null) {
+        const prefixSep = f.text !== "" ? "\n".repeat(f.gapLines + 1) : "";
+        frozenRef.current = {
+          text: f.text + prefixSep + advance.frozenDelta,
+          activeStartUtf16: f.activeStartUtf16 + advance.nextActiveStart,
+          activeCpOffset: f.activeCpOffset + advance.consumedCodePoints,
+          gapLines: advance.gapLines,
+          paragraphIndex: f.paragraphIndex + 1,
+        };
+      }
+    }
+  }
+
+  const f = frozenRef.current;
+  const activeText = open ? text.slice(f.activeStartUtf16) : "";
+  const settledTarget = totalCpRef.current + EXPANDED_BLOOM_WAVE_WIDTH;
+  const needsAnim =
+    open &&
+    hasRaf &&
+    !isPlaceholder &&
+    text.length > 0 &&
+    cursorRef.current < settledTarget - 0.05 &&
+    activeText.length <= EXPANDED_INK_MAX_ACTIVE_CHARS;
+
+  if (!needsAnim && open && cursorRef.current < settledTarget) {
+    cursorRef.current = settledTarget;
+    settledFloorRef.current = totalCpRef.current;
+    frozenRef.current = {
+      text: "",
+      activeStartUtf16: 0,
+      activeCpOffset: 0,
+      gapLines: 0,
+      paragraphIndex: 0,
+    };
+  }
+
+  const needsAnimRef = useRef<boolean>(needsAnim);
+  needsAnimRef.current = needsAnim;
+
+  useEffect(() => {
+    return () => {
+      if (rafRef.current !== null && typeof globalThis.cancelAnimationFrame === "function") {
+        globalThis.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      lastFrameRef.current = 0;
+    };
+  }, [resetKey]);
+
+  useEffect(() => {
+    if (!needsAnim) {
+      if (rafRef.current !== null && typeof globalThis.cancelAnimationFrame === "function") {
+        globalThis.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      lastFrameRef.current = 0;
+      return;
+    }
+    if (rafRef.current !== null) return;
+
+    let lastEmitAt = 0;
+    const tick = (now: number) => {
+      rafRef.current = null;
+      if (!needsAnimRef.current) {
+        lastFrameRef.current = 0;
+        return;
+      }
+      const dt = lastFrameRef.current === 0 ? STREAM_FRAME_INTERVAL_MS : Math.max(1, now - lastFrameRef.current);
+      lastFrameRef.current = now;
+      const target = totalCpRef.current;
+      const next = advanceExpandedInkCursor(cursorRef.current, target, dt, EXPANDED_BLOOM_WAVE_WIDTH);
+      cursorRef.current = next;
+      const done = next >= target + EXPANDED_BLOOM_WAVE_WIDTH - 0.05;
+      if (done) {
+        cursorRef.current = target + EXPANDED_BLOOM_WAVE_WIDTH;
+        settledFloorRef.current = target;
+        frozenRef.current = {
+          text: "",
+          activeStartUtf16: 0,
+          activeCpOffset: 0,
+          gapLines: 0,
+          paragraphIndex: 0,
+        };
+        lastFrameRef.current = 0;
+        setTick((v) => (v + 1) & 0x7fffffff);
+        return;
+      }
+      if (lastEmitAt === 0 || now - lastEmitAt >= STREAM_FRAME_INTERVAL_MS) {
+        lastEmitAt = now;
+        setTick((v) => (v + 1) & 0x7fffffff);
+      }
+      rafRef.current = globalThis.requestAnimationFrame(tick);
+    };
+
+    lastFrameRef.current = 0;
+    rafRef.current = globalThis.requestAnimationFrame(tick);
+  }, [needsAnim, text, resetKey]);
+
+  if (!needsAnim) {
+    return {
+      active: false,
+      frozenText: "",
+      activeText: "",
+      localProgress: Number.POSITIVE_INFINITY,
+      localSettledFloor: 0,
+      gapLines: 0,
+      paragraphIndex: 0,
+    };
+  }
+
+  return {
+    active: true,
+    frozenText: frozenRef.current.text,
+    activeText,
+    localProgress: Math.max(0, cursorRef.current - frozenRef.current.activeCpOffset),
+    localSettledFloor: Math.max(0, settledFloorRef.current - frozenRef.current.activeCpOffset),
+    gapLines: frozenRef.current.gapLines,
+    paragraphIndex: frozenRef.current.paragraphIndex,
+  };
+}
+
+/**
+ * Render an expanded thinking tail using true `rgba(...)` text colors so iOS
+ * React Native `NSAttributedString` (which ignores `opacity` on nested `<Text>`)
+ * fades newly arrived phrases smoothly from their front half to their tail.
+ */
+function renderExpandedBloomText(
+  text: string,
+  progress: number,
+  baseColor: string,
+  settledFloor: number,
+) {
+  const segments = buildExpandedBloomSegments(
+    text,
+    progress,
+    EXPANDED_BLOOM_WAVE_WIDTH,
+    settledFloor,
+  );
+  if (segments.length === 0) return "";
+  if (segments.length === 1 && segments[0]!.alpha >= 0.995) {
+    return segments[0]!.text;
+  }
+  return segments.map((seg, idx) => {
+    if (seg.alpha >= 0.995) return seg.text;
+    if (seg.alpha <= 0.005) {
+      return (
+        <Text key={idx} style={{ color: "transparent" }}>
+          {seg.text}
+        </Text>
+      );
+    }
+    const tinted = withAlpha(baseColor, seg.alpha);
+    return (
+      <Text
+        key={idx}
+        style={tinted !== "transparent" ? { color: tinted } : { opacity: seg.alpha }}
+      >
+        {seg.text}
+      </Text>
+    );
+  });
 }
 
 /** Distance (px) from the bottom edge that still counts as following the tail. */
@@ -985,32 +2096,163 @@ export function InlineThinking({
   const copy = useLocaleText();
   const isZhLocale = currentLocale() === "zh-CN";
   const settledPreview = reasoningPreview(text, false);
-  const previewReady = isZhLocale && isPreviewReadyForTranslation(text, settledPreview, phase);
-  const translatedPreview = useTranslatedThinking(settledPreview, previewReady);
   const isSingleLineThought = text.trim() === settledPreview.trim();
-  const fullReady = isZhLocale && open && phase === "complete" && !isSingleLineThought;
-  const translatedFull = useTranslatedThinking(text, fullReady);
-  const effectiveFullTranslation = isSingleLineThought ? translatedPreview : translatedFull;
+  const effectivePhase: "streaming" | "complete" = growing ? "streaming" : phase;
+  const wasStreamingTranslateRef = useRef<boolean>(phase === "streaming" || effectivePhase === "streaming");
+  const prevTranslateKeyRef = useRef<string | undefined>(durationKey);
+  const translateRowEpochRef = useRef<number>(0);
+  if (prevTranslateKeyRef.current !== durationKey) {
+    if (!continuedKeyShift) {
+      wasStreamingTranslateRef.current = phase === "streaming" || effectivePhase === "streaming";
+      translateRowEpochRef.current += 1;
+    }
+    prevTranslateKeyRef.current = durationKey;
+  }
+  if (phase === "streaming" || effectivePhase === "streaming") {
+    wasStreamingTranslateRef.current = true;
+  }
+  const translateRowEpoch = translateRowEpochRef.current;
+  const translateRowKey = durationKey !== undefined ? `${translateRowEpoch}` : undefined;
+  // Translate short/medium settled thoughts (<=1500 chars) in full while collapsed
+  // so clicking to expand renders Chinese in 0ms instead of showing a loading placeholder.
+  const eagerFullEligible =
+    phase === "complete" && text.length <= EAGER_FULL_TRANSLATE_MAX_CHARS;
+  const streamingTranslateEnabled =
+    isZhLocale &&
+    (phase === "streaming" ||
+      open ||
+      wasStreamingTranslateRef.current ||
+      eagerFullEligible);
+  const {
+    translated: liveTranslatedFull,
+    latestTranslatedLine,
+    pending: translationPending,
+  } = useStreamingTranslatedThinking(
+    text,
+    phase,
+    streamingTranslateEnabled,
+    translateRowKey,
+  );
+  const previewReady =
+    isZhLocale &&
+    !streamingTranslateEnabled &&
+    isPreviewReadyForTranslation(text, settledPreview, phase);
+  const fallbackTranslatedPreview = useTranslatedThinking(settledPreview, previewReady);
+  const translatedPreview =
+    liveTranslatedFull !== ""
+      ? reasoningPreview(liveTranslatedFull, false)
+      : fallbackTranslatedPreview;
+  const effectiveFullTranslation =
+    liveTranslatedFull !== ""
+      ? liveTranslatedFull
+      : isSingleLineThought
+        ? fallbackTranslatedPreview
+        : "";
   const [showOriginal, setShowOriginal] = useState(false);
-  const displayText = effectiveFullTranslation !== "" && !showOriginal ? effectiveFullTranslation : text;
+  useEffect(() => {
+    setShowOriginal(false);
+  }, [translateRowEpoch]);
+  const pendingPlaceholder =
+    translationPending && !showOriginal
+      ? effectivePhase === "streaming"
+        ? "推理中…"
+        : "正在加载译文…"
+      : "";
+  const displayText =
+    effectiveFullTranslation !== "" && !showOriginal
+      ? effectiveFullTranslation
+      : pendingPlaceholder !== ""
+        ? fallbackTranslatedPreview !== ""
+          ? `${fallbackTranslatedPreview}\n\n…`
+          : pendingPlaceholder
+        : text;
+  const isBodyPlaceholder =
+    effectiveFullTranslation === "" &&
+    pendingPlaceholder !== "" &&
+    fallbackTranslatedPreview === "";
+  const bodyInk = useExpandedBodyInkReveal(
+    displayText,
+    open,
+    growing,
+    isBodyPlaceholder,
+    `${translateRowEpoch}:${showOriginal ? "orig" : "zh"}`,
+  );
 
 
-  // While streaming the collapsed line is a **tail window**: it advances with
-  // every arrived character instead of waiting for a paragraph to finish, which
-  // is what made it lag the expanded view. Once `phase` flips to `"complete"`
-  // the collapsed summary snaps immediately to DSH's completed first-line rule
-  // (avoiding a 300ms tail hold or an empty first frame on short unmeasured
-  // thoughts), while the status icon, shimmer, and duration still keep the
-  // 300ms `growing` debounce.
+  // While streaming the collapsed line is a **tail window** advancing character
+  // by character to the left — identical for both DSH native streams and
+  // Antigravity translated Chinese streams. Keyed on `growing` (not the host's
+  // flickering `phase`) on real devices so brief chunk-settle `complete` frames
+  // never reset the scroll cursor or skip mid-thought characters.
+  const hasRaf = typeof globalThis.requestAnimationFrame === "function";
+  const isWebSmoothMarquee = Platform?.OS === "web" && hasRaf;
+  const isNativeSmoothMarquee =
+    typeof Platform?.OS === "string" &&
+    Platform.OS !== "web" &&
+    typeof Animated?.Value === "function" &&
+    typeof Animated?.timing === "function" &&
+    typeof Animated?.View !== "undefined" &&
+    typeof Easing?.linear === "function";
+  const hasLiveMarquee = hasRaf || isNativeSmoothMarquee;
+  const isLiveCollapsedStream =
+    growing && (hasLiveMarquee ? true : phase === "streaming") && !open && lineWidth > 0;
+  const rowLineHeight = Math.min(ROW_LINE_HEIGHT, style.toolRowMinHeight);
+  const scrollSource =
+    liveTranslatedFull !== "" && !showOriginal
+      ? liveTranslatedFull
+      : pendingPlaceholder !== ""
+        ? ""
+        : text;
+  const webMarquee = useSmoothWebMarquee(
+    scrollSource,
+    isLiveCollapsedStream && scrollSource !== "",
+    growing,
+    translateRowEpoch,
+  );
+  const nativeMarquee = useNativeSmoothMarquee(
+    scrollSource,
+    isLiveCollapsedStream && scrollSource !== "",
+    growing,
+    lineWidth,
+    rowLineHeight,
+    translateRowEpoch,
+  );
+  const useFallbackLeftScroll = !isWebSmoothMarquee && !isNativeSmoothMarquee;
+  const pacedStream = useLeftScrollText(
+    scrollSource,
+    useFallbackLeftScroll && isLiveCollapsedStream && scrollSource !== "",
+    useFallbackLeftScroll && growing,
+    translateRowEpoch,
+  );
   const rawLine =
     growing && phase === "streaming" && lineWidth > 0
       ? streamingTail(text, lineWidth, ROW_FONT_SIZE)
       : reasoningPreview(text, growing && phase === "streaming");
+  const streamingScrolledLine =
+    isLiveCollapsedStream && pacedStream.text !== ""
+      ? streamingTail(pacedStream.text, lineWidth, ROW_FONT_SIZE)
+      : "";
+  const streamingTranslatedFallback =
+    growing && phase === "streaming" && !showOriginal && latestTranslatedLine !== ""
+      ? latestTranslatedLine
+      : "";
   const line =
-    !(growing && phase === "streaming") && translatedPreview !== "" && !showOriginal
-      ? translatedPreview
-      : rawLine;
-  const tailSliding = growing && phase === "streaming" && lineWidth > 0 && line.endsWith("…");
+    streamingScrolledLine !== ""
+      ? streamingScrolledLine
+      : streamingTranslatedFallback !== ""
+        ? streamingTranslatedFallback
+        : !(growing && phase === "streaming") && translatedPreview !== "" && !showOriginal
+          ? translatedPreview
+          : pendingPlaceholder !== ""
+            ? pendingPlaceholder
+            : rawLine;
+  const tailSliding =
+    growing &&
+    lineWidth > 0 &&
+    (webMarquee.active ||
+      nativeMarquee.active ||
+      pacedStream.active ||
+      (phase === "streaming" && line.endsWith("…")));
   const stream = useInkStreamReveal({
     agentId,
     timestamp,
@@ -1022,7 +2264,6 @@ export function InlineThinking({
   });
 
   const styles = useMemo(() => {
-    const rowLineHeight = Math.min(ROW_LINE_HEIGHT, style.toolRowMinHeight);
     return {
       // DSH renders a thought and a tool call through the same DisclosureRow, so
       // the two rows must not disagree about their rhythm: same 24px line, same
@@ -1089,6 +2330,18 @@ export function InlineThinking({
     };
   }, [theme, layout.compact, growing, style, expandedMaxHeight]);
 
+  const bodyLineHeight = layout.compact ? 19 : 21;
+  const frozenBodyElement = useMemo(
+    () =>
+      bodyInk.active && bodyInk.frozenText !== "" ? (
+        <Text style={styles.full} selectable>
+          {bodyInk.frozenText}
+        </Text>
+      ) : null,
+    [bodyInk.active, bodyInk.frozenText, styles.full],
+  );
+
+  const thinkingPulseOwner = useIsPulseOwner(agentId, growing && !open);
   const thinkingIconStatus = resolveThinkingIconStatus(growing);
   const thinkingStatusLabel =
     thinkingIconStatus === "idle" ? "" : copy.rowStatus[thinkingIconStatus];
@@ -1112,6 +2365,16 @@ export function InlineThinking({
               : `${open ? copy.collapseThinking : copy.expandThinking} · ${thinkingStatusLabel}`
           }
           onPress={() => setManual((value) => !(value ?? false))}
+          onPressIn={() => {
+            if (isZhLocale && !open && effectiveFullTranslation === "") {
+              prefetchThinkingTranslation(text);
+            }
+          }}
+          onHoverIn={() => {
+            if (isZhLocale && !open && effectiveFullTranslation === "") {
+              prefetchThinkingTranslation(text);
+            }
+          }}
           style={styles.row}
           onLayout={(event) => setRowWidth(event.nativeEvent.layout.width)}
         >
@@ -1130,7 +2393,7 @@ export function InlineThinking({
           </RowStatusIcon>
           <View style={styles.main}>
             <TextShimmer
-              active={growing && !open}
+              active={growing && !open && thinkingPulseOwner}
               contentStyle={styles.textRow}
               highlightColor={theme.colors.foreground}
               surfaceColor={theme.colors.surface0}
@@ -1145,21 +2408,48 @@ export function InlineThinking({
                     style={[styles.label, color === null ? null : { color }]}
                     onLayout={(event) => setLabelWidth(event.nativeEvent.layout.width)}
                   >
-                    {renderInkTrailText(copy.thinking, stream.labelProgress, theme.colors.foreground, color)}
+                    {renderInkTrailText(
+                      copy.thinking,
+                      stream.labelProgress,
+                      theme.colors.foreground,
+                      color,
+                      0,
+                      theme.colors.foregroundMuted,
+                    )}
                   </Text>
                   {!open ? (
-                    <Text
-                      style={[styles.line, color === null ? null : { color }]}
-                      numberOfLines={1}
-                    >
-                      {renderInkTrailText(line, stream.summaryProgress, theme.colors.foreground, color)}
-                    </Text>
+                    webMarquee.active ? (
+                      <SmoothMarqueeLine
+                        controller={webMarquee}
+                        style={[styles.line, color === null ? null : { color }]}
+                      />
+                    ) : nativeMarquee.active ? (
+                      <NativeSmoothMarqueeLine
+                        controller={nativeMarquee}
+                        style={[styles.line, color === null ? null : { color }]}
+                        measure={color === null}
+                      />
+                    ) : (
+                      <Text
+                        style={[styles.line, color === null ? null : { color }]}
+                        numberOfLines={1}
+                      >
+                        {renderInkTrailText(
+                          line,
+                          stream.summaryProgress,
+                          theme.colors.foreground,
+                          color,
+                          0,
+                          theme.colors.foregroundMuted,
+                        )}
+                      </Text>
+                    )
                   ) : null}
                 </>
               )}
             </TextShimmer>
           </View>
-          {open && effectiveFullTranslation !== "" ? (
+          {open && (effectiveFullTranslation !== "" || translationPending) ? (
             <Pressable
               accessibilityRole="button"
               onPress={(event: { stopPropagation?: () => void }) => {
@@ -1208,13 +2498,118 @@ export function InlineThinking({
               accessibilityLabel={copy.collapseThinking}
               onPress={collapseBody}
             >
-              <Text style={styles.full} selectable>
-                {displayText}
-              </Text>
+              {bodyInk.active ? (
+                <>
+                  {frozenBodyElement}
+                  <AnimatedBodyParagraph
+                    key={bodyInk.paragraphIndex}
+                    animate={bodyInk.paragraphIndex > 0}
+                    fromOpacity={0.35}
+                    durationMs={480}
+                  >
+                    <Text
+                      style={
+                        bodyInk.frozenText !== "" && bodyInk.gapLines > 0
+                          ? [styles.full, { marginTop: bodyInk.gapLines * bodyLineHeight }]
+                          : styles.full
+                      }
+                      selectable
+                    >
+                      {renderExpandedBloomText(
+                        bodyInk.activeText,
+                        bodyInk.localProgress,
+                        theme.colors.foregroundMuted,
+                        bodyInk.localSettledFloor,
+                      )}
+                    </Text>
+                  </AnimatedBodyParagraph>
+                </>
+              ) : (
+                <Text style={styles.full} selectable>
+                  {displayText}
+                </Text>
+              )}
             </Pressable>
           </ScrollView>
         ) : null}
       </View>
     </RowEntrance>
+  );
+}
+
+function NativeSmoothMarqueeLine({
+  controller,
+  style,
+  measure,
+}: {
+  controller: NativeMarqueeController;
+  style: StyleProp<TextStyle>;
+  measure: boolean;
+}) {
+  if (!controller.clipX || !controller.innerX) return null;
+  return (
+    <View
+      style={{
+        flex: 1,
+        minWidth: 0,
+        height: controller.rowLineHeight,
+        overflow: "hidden",
+      }}
+    >
+      <Animated.View
+        style={{
+          position: "absolute",
+          left: 0,
+          top: 0,
+          bottom: 0,
+          width: controller.lineWidth,
+          overflow: "hidden",
+          transform: [{ translateX: controller.clipX }],
+        }}
+      >
+        <Animated.View
+          style={{
+            position: "absolute",
+            left: 0,
+            top: 0,
+            bottom: 0,
+            width: controller.trackWidth,
+            flexDirection: "row",
+            alignItems: "center",
+            transform: [{ translateX: controller.innerX }],
+          }}
+        >
+          {controller.retiredWidth > 0 ? (
+            <View
+              style={{
+                width: controller.retiredWidth,
+                height: 1,
+                flexShrink: 0,
+              }}
+            />
+          ) : null}
+          {controller.mountedChunks.map((chunk, localIdx) => {
+            const chunkIndex = controller.retiredCount + localIdx;
+            return (
+              <Text
+                key={chunkIndex}
+                style={[style, { flex: 0, flexGrow: 0, flexShrink: 0 }]}
+                onLayout={
+                  measure
+                    ? (event) =>
+                        controller.onChunkLayout(
+                          chunkIndex,
+                          event.nativeEvent.layout.width,
+                        )
+                    : undefined
+                }
+              >
+                {chunk}
+              </Text>
+            );
+          })}
+        </Animated.View>
+      </Animated.View>
+    </View>
   );
 }

@@ -32,6 +32,7 @@ import {
   normalizeRowTimestamp,
   noteMountCandidate,
 } from "./newest";
+import { claimCascadeDelay } from "./row-cascade";
 import {
   STREAM_FRAME_INTERVAL_MS,
   STREAM_LEAD_DELAY_MS,
@@ -43,6 +44,7 @@ import {
   splitRowStreamProgress,
   streamCursorAt,
 } from "./stream-reveal";
+import { withAlpha } from "./tokens";
 
 /**
  * Commit-phase effect hook: uses `useLayoutEffect` in real React so live
@@ -54,6 +56,8 @@ const useCommitEffect =
 
 /** `testID` hook that triggers the CSS entrance animation on Web. */
 export const ROW_ENTER_TEST_ID = "dsh-row-enter";
+/** `testID` hook that triggers smooth whole-paragraph float-in on Web. */
+export const BODY_PARA_ENTER_TEST_ID = "dsh-body-para-enter";
 /** `testID` hook that enables `overscroll-behavior-y: contain` on overflowing Web scroll boxes. */
 export const SCROLL_BOX_TEST_ID = "dsh-scroll-box";
 /** DOM attribute toggled on Web scroll boxes only while content actually overflows vertically. */
@@ -86,8 +90,7 @@ export function shouldCollapseOnBodyPress(event?: unknown): boolean {
 
 const STYLE_ID = "dsh-paseo-row-entrance";
 const SCROLL_BOX_SELECTOR = `[data-testid="${SCROLL_BOX_TEST_ID}"]`;
-const ENTRANCE_DURATION_MS = 220;
-const ENTRANCE_OFFSET_Y = 5;
+const ENTRANCE_DURATION_MS = 300;
 
 /** Minimal DOM surface to inject one stylesheet & observe scroll overflow without DOM lib. */
 interface WebStyleElement {
@@ -146,17 +149,29 @@ interface WebMutationObserver {
 const ROW_ENTRANCE_CSS = `
 [data-testid="${ROW_ENTER_TEST_ID}"] {
   animation: dsh-row-enter ${ENTRANCE_DURATION_MS}ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  will-change: opacity, transform;
+  will-change: opacity;
 }
 
 @keyframes dsh-row-enter {
   from {
     opacity: 0;
-    transform: translateY(${ENTRANCE_OFFSET_Y}px);
   }
   to {
     opacity: 1;
-    transform: translateY(0);
+  }
+}
+
+[data-testid="${BODY_PARA_ENTER_TEST_ID}"] {
+  animation: dsh-body-para-enter 480ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  will-change: opacity;
+}
+
+@keyframes dsh-body-para-enter {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
   }
 }
 
@@ -165,7 +180,8 @@ const ROW_ENTRANCE_CSS = `
 }
 
 @media (prefers-reduced-motion: reduce) {
-  [data-testid="${ROW_ENTER_TEST_ID}"] {
+  [data-testid="${ROW_ENTER_TEST_ID}"],
+  [data-testid="${BODY_PARA_ENTER_TEST_ID}"] {
     animation: none !important;
     will-change: auto !important;
   }
@@ -582,6 +598,10 @@ export interface RowEntranceProps {
   timestamp?: Date | string | number;
   rowKey?: string;
   liveHint?: boolean;
+  /** Optional fade-in duration override (ms). Defaults to `300`. */
+  durationMs?: number;
+  /** Optional handoff wait ceiling (ms) when waiting on an upstream reply bloom. */
+  maxHandoffDelayMs?: number;
   children: ReactNode;
 }
 
@@ -594,27 +614,34 @@ export function RowEntrance({
   timestamp,
   rowKey,
   liveHint,
+  durationMs = ENTRANCE_DURATION_MS,
+  maxHandoffDelayMs,
   children,
 }: RowEntranceProps): ReactElement {
   const at = normalizeRowTimestamp(timestamp);
+  const live = liveHint === true;
+  const cascadeKey = rowKey !== undefined && rowKey !== "" ? rowKey : String(at);
   const committedRef = useRef(false);
   // Register this mounting row in the current render pass so commit-phase
   // evaluation can suppress multi-row history/bulk mounts on the very first
-  // frame with zero flicker.
+  // frame with zero flicker, while still recognizing live parallel bursts.
   if (!committedRef.current && agentId !== undefined && agentId !== "") {
-    noteMountCandidate(agentId, at, rowKey);
+    noteMountCandidate(agentId, at, rowKey, undefined, live);
   }
 
   // Start statically so batch-mounted historical rows render full-opacity on
-  // frame 0; single genuine live arrivals flip `animate` to true synchronously
-  // in `useCommitEffect` before paint.
+  // frame 0; genuine live arrivals flip `animate` to true synchronously in
+  // `useCommitEffect` before paint with their coordinated cascade delay.
   const [animate, setAnimate] = useState(false);
+  const [delayMs, setDelayMs] = useState(0);
 
   useCommitEffect(() => {
     if (committedRef.current) return;
     committedRef.current = true;
     if (agentId === undefined || agentId === "") return;
-    if (commitMountEntrance(agentId, at, liveHint ?? false, rowKey)) {
+    if (commitMountEntrance(agentId, at, live, rowKey, undefined, live) && !prefersReducedMotion()) {
+      const slotDelay = claimCascadeDelay(agentId, cascadeKey, undefined, maxHandoffDelayMs);
+      setDelayMs(slotDelay);
       setAnimate(true);
     }
   }, []);
@@ -633,19 +660,12 @@ export function RowEntrance({
     animate &&
     typeof Animated?.View !== "undefined" &&
     typeof Animated?.Value === "function" &&
-    typeof Animated?.timing === "function" &&
-    typeof Animated?.parallel === "function";
+    typeof Animated?.timing === "function";
 
-  const valuesRef = useRef<{
-    opacity: InstanceType<typeof Animated.Value>;
-    translateY: InstanceType<typeof Animated.Value>;
-  } | null>(null);
+  const opacityRef = useRef<InstanceType<typeof Animated.Value> | null>(null);
 
-  if (canNativeAnimate && valuesRef.current === null) {
-    valuesRef.current = {
-      opacity: new Animated.Value(0),
-      translateY: new Animated.Value(ENTRANCE_OFFSET_Y),
-    };
+  if (canNativeAnimate && opacityRef.current === null) {
+    opacityRef.current = new Animated.Value(0);
   }
 
   useEffect(() => {
@@ -653,47 +673,116 @@ export function RowEntrance({
   }, [web]);
 
   useEffect(() => {
-    if (!canNativeAnimate || valuesRef.current === null) return;
-    const { opacity, translateY } = valuesRef.current;
+    if (!canNativeAnimate || opacityRef.current === null) return;
+    const opacity = opacityRef.current;
     const easing =
       typeof Easing?.out === "function" && Easing?.cubic ? Easing.out(Easing.cubic) : undefined;
-    const timingBase = {
-      duration: ENTRANCE_DURATION_MS,
+    const fade = Animated.timing(opacity, {
+      toValue: 1,
+      duration: durationMs,
       useNativeDriver: true,
       ...(easing !== undefined ? { easing } : {}),
-    };
-    const anim = Animated.parallel(
-      [
-        Animated.timing(opacity, { ...timingBase, toValue: 1 }),
-        Animated.timing(translateY, { ...timingBase, toValue: 0 }),
-      ],
-      { stopTogether: true },
-    );
+    });
+    const anim =
+      delayMs > 0 &&
+      typeof Animated.sequence === "function" &&
+      typeof Animated.delay === "function"
+        ? Animated.sequence([Animated.delay(delayMs), fade])
+        : fade;
     anim.start();
     return () => {
       anim.stop();
     };
-  }, [canNativeAnimate]);
+  }, [canNativeAnimate, delayMs, durationMs]);
 
   if (web) {
-    return animate ? <View testID={ROW_ENTER_TEST_ID}>{children}</View> : <View>{children}</View>;
+    if (!animate) return <View>{children}</View>;
+    const webStyle: Record<string, string> = {};
+    if (delayMs > 0) webStyle.animationDelay = `${delayMs}ms`;
+    if (durationMs !== ENTRANCE_DURATION_MS) webStyle.animationDuration = `${durationMs}ms`;
+    return (
+      <View
+        testID={ROW_ENTER_TEST_ID}
+        style={Object.keys(webStyle).length > 0 ? (webStyle as never) : undefined}
+      >
+        {children}
+      </View>
+    );
   }
 
-  if (canNativeAnimate && valuesRef.current !== null) {
+  if (canNativeAnimate && opacityRef.current !== null) {
+    const AnimatedView = Animated.View;
+    return <AnimatedView style={{ opacity: opacityRef.current }}>{children}</AnimatedView>;
+  }
+
+  return <View>{children}</View>;
+}
+
+/**
+ * Gently fades in a newly arrived block (`opacity` only — zero vertical
+ * jumping) on iOS/Android CoreAnimation (`useNativeDriver: true`) and Web CSS,
+ * with zero JS animation ticks and safe fallback in headless Node.
+ */
+export function AnimatedBodyParagraph({
+  animate,
+  fromOpacity = 0,
+  durationMs = 480,
+  children,
+}: {
+  animate: boolean;
+  fromOpacity?: number;
+  durationMs?: number;
+  children: ReactNode;
+}): ReactElement {
+  const web = isWebPlatform();
+  const canNative =
+    !web &&
+    animate &&
+    typeof Animated?.View !== "undefined" &&
+    typeof Animated?.Value === "function" &&
+    typeof Animated?.timing === "function";
+
+  const opacityRef = useRef<InstanceType<typeof Animated.Value> | null>(null);
+  if (canNative && opacityRef.current === null) {
+    opacityRef.current = new Animated.Value(fromOpacity);
+  }
+
+  useEffect(() => {
+    if (web && animate) ensureRowEntranceStyles();
+  }, [web, animate]);
+
+  useEffect(() => {
+    if (!canNative || opacityRef.current === null) return;
+    const easing =
+      typeof Easing?.out === "function" && Easing?.cubic
+        ? Easing.out(Easing.cubic)
+        : undefined;
+    const anim = Animated.timing(opacityRef.current, {
+      toValue: 1,
+      duration: durationMs,
+      useNativeDriver: true,
+      ...(easing !== undefined ? { easing } : {}),
+    });
+    anim.start();
+    return () => {
+      anim.stop();
+    };
+  }, [canNative, durationMs]);
+
+  if (web && animate) {
+    return <View testID={BODY_PARA_ENTER_TEST_ID}>{children}</View>;
+  }
+
+  if (canNative && opacityRef.current !== null) {
     const AnimatedView = Animated.View;
     return (
-      <AnimatedView
-        style={{
-          opacity: valuesRef.current.opacity,
-          transform: [{ translateY: valuesRef.current.translateY }],
-        }}
-      >
+      <AnimatedView style={{ opacity: opacityRef.current }}>
         {children}
       </AnimatedView>
     );
   }
 
-  return <View>{children}</View>;
+  return <>{children}</>;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -725,6 +814,18 @@ export interface InkStreamOptions {
   summary: string;
   /** When false, only the left action label streams while summary renders live as-is. */
   streamSummary?: boolean;
+  /**
+   * When true (default), transitioning `liveHint` from `true -> false` snaps
+   * immediately to full text. Set false on normal tool completions so fast
+   * 10–50ms tools finish their gentle bloom instead of teleporting in.
+   */
+  snapOnSettle?: boolean;
+  /** Force an immediate snap to full text (e.g. when a tool fails or is canceled). */
+  snapNow?: boolean;
+  /** Soft trailing fade width in code points (defaults to `STREAM_TRAIL_WIDTH`). */
+  trailWidth?: number;
+  /** Lead-in delay (ms) after the cascade slot opens (defaults to `STREAM_LEAD_DELAY_MS`). */
+  leadDelayMs?: number;
 }
 
 export interface InkStreamState {
@@ -750,56 +851,67 @@ export function useInkStreamReveal({
   label,
   summary,
   streamSummary = true,
+  snapOnSettle = true,
+  snapNow = false,
+  trailWidth = STREAM_TRAIL_WIDTH,
+  leadDelayMs = STREAM_LEAD_DELAY_MS,
 }: InkStreamOptions): InkStreamState {
   const at = normalizeRowTimestamp(timestamp);
   const live = liveHint === true;
+  const cascadeKey = rowKey !== undefined && rowKey !== "" ? rowKey : String(at);
   const committedRef = useRef(false);
   if (!committedRef.current && agentId !== undefined && agentId !== "") {
-    noteMountCandidate(agentId, at, rowKey);
+    noteMountCandidate(agentId, at, rowKey, undefined, live);
   }
 
   // Start settled (`Infinity`) so multi-row history mounts display full titles
-  // immediately on frame 0 without flashing empty; single genuine live rows
-  // activate at `cursor = 0` synchronously in `useCommitEffect` before paint.
+  // immediately on frame 0 without flashing empty; genuine live rows activate
+  // at `cursor = 0` synchronously in `useCommitEffect` before paint.
   const [animate, setAnimate] = useState(false);
+  const [delayMs, setDelayMs] = useState(0);
   const [cursor, setCursor] = useState<number>(Number.POSITIVE_INFINITY);
   const prevLiveHintRef = useRef<boolean>(live);
+  const prevSnapNowRef = useRef<boolean>(snapNow);
   const cancelPendingRef = useRef<(() => void) | null>(null);
-  const targetRef = useRef({ label, summary, streamSummary });
-  targetRef.current = { label, summary, streamSummary };
+  const targetRef = useRef({ label, summary, streamSummary, trailWidth, leadDelayMs });
+  targetRef.current = { label, summary, streamSummary, trailWidth, leadDelayMs };
 
   useCommitEffect(() => {
     if (committedRef.current) return;
     committedRef.current = true;
     if (agentId === undefined || agentId === "") return;
-    const allowed = commitMountEntrance(agentId, at, live, rowKey);
+    const allowed = commitMountEntrance(agentId, at, live, rowKey, undefined, live);
     if (allowed && !prefersReducedMotion()) {
+      const slotDelay = claimCascadeDelay(agentId, cascadeKey);
+      setDelayMs(slotDelay);
       setAnimate(true);
       setCursor(0);
     }
   }, []);
 
-  // When a live row settles into a terminal state (`liveHint: true -> false`,
-  // e.g. a tool finishes or fails early while still revealing), immediately
-  // cancel any queued RAF/timer and snap to `Infinity` so the final headline
-  // and failure/result summary appear in full without delay.
+  // Immediately snap to `Infinity` when required (error/cancel via `snapNow`,
+  // or terminal transition when `snapOnSettle` is enabled). Normal fast tool
+  // completions with `snapOnSettle: false` keep gliding smoothly to the end.
   useCommitEffect(() => {
     const wasLive = prevLiveHintRef.current;
+    const wasSnapNow = prevSnapNowRef.current;
     prevLiveHintRef.current = live;
-    if (wasLive && !live) {
+    prevSnapNowRef.current = snapNow;
+    const shouldSnap = (snapOnSettle && wasLive && !live) || (!wasSnapNow && snapNow);
+    if (shouldSnap) {
       cancelPendingRef.current?.();
       cancelPendingRef.current = null;
       setAnimate(false);
       setCursor(Number.POSITIVE_INFINITY);
     }
-  }, [live]);
+  }, [live, snapOnSettle, snapNow]);
 
   useEffect(() => {
     if (!animate) return;
     let cancelled = false;
     let rafId: number | null = null;
     let timerId: ReturnType<typeof setTimeout> | null = null;
-    const startAt = nowMs() + STREAM_LEAD_DELAY_MS;
+    const startAt = nowMs() + delayMs + targetRef.current.leadDelayMs;
     let lastEmitAt = 0;
 
     const raf = (globalThis as {
@@ -865,7 +977,7 @@ export function useInkStreamReveal({
             streamMs,
             totalChars,
             STREAM_TAIL_SETTLE_MS,
-            STREAM_TRAIL_WIDTH,
+            current.trailWidth,
           ),
         );
       }
@@ -880,11 +992,19 @@ export function useInkStreamReveal({
         cancelPendingRef.current = null;
       }
     };
-  }, [animate]);
+  }, [animate, delayMs]);
 
-  const effectiveCursor =
-    prevLiveHintRef.current && !live ? Number.POSITIVE_INFINITY : cursor;
-  const split = splitRowStreamProgress(label, summary, effectiveCursor, streamSummary);
+  const snapped =
+    (snapOnSettle && prevLiveHintRef.current && !live) || (!prevSnapNowRef.current && snapNow);
+  const effectiveCursor = snapped ? Number.POSITIVE_INFINITY : cursor;
+  const split = splitRowStreamProgress(
+    label,
+    summary,
+    effectiveCursor,
+    streamSummary,
+    STREAM_MAX_VISIBLE_CHARS,
+    trailWidth,
+  );
   return {
     active: Number.isFinite(effectiveCursor),
     labelProgress: split.labelProgress,
@@ -895,21 +1015,42 @@ export function useInkStreamReveal({
 }
 
 /**
- * Render `text` with a soft 5–6 character fade-in trail while `progress` is
- * finite, or return the plain `text` string once settled.
+ * Multiply a color's existing alpha (if `rgba(...)`) by `alpha`, or apply
+ * `withAlpha` to solid `#hex`/`rgb(...)` colors so nested `<Text>` spans fade
+ * natively on iOS `NSAttributedString` (where `style.opacity` is ignored).
+ */
+function tintWithAlpha(color: string, alpha: number): string {
+  const clamped = Math.max(0, Math.min(1, alpha));
+  const rgbaMatch =
+    /^rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9.]+)\s*\)$/i.exec(color.trim());
+  if (rgbaMatch !== null) {
+    const baseA = Number.parseFloat(rgbaMatch[4]);
+    const nextA = Number.isFinite(baseA) ? Math.max(0, Math.min(1, baseA * clamped)) : clamped;
+    return `rgba(${rgbaMatch[1]}, ${rgbaMatch[2]}, ${rgbaMatch[3]}, ${Number(nextA.toFixed(3))})`;
+  }
+  return withAlpha(color, Number(clamped.toFixed(3)));
+}
+
+/**
+ * Render `text` with a soft fade-in trail while `progress` is finite, or
+ * return the plain `text` string once settled.
  *
- * Uses nested `<Text>` spans so the effect is 100% identical on iOS React
- * Native and Web, with zero hardcoded colours (highlights with the theme's
- * `highlightColor`, or preserves `overrideColor` when painted inside a shimmer).
+ * Uses true `rgba(...)` color alpha whenever `baseColor`, `highlightColor`, or
+ * `overrideColor` is parseable so nested `<Text>` fades smoothly on iOS UIKit
+ * (`NSAttributedString` ignores `opacity` on virtual `<Text>` spans), falling
+ * back to `opacity` only when no color can be resolved.
  */
 export function renderInkTrailText(
   text: string,
   progress: number,
   highlightColor: string,
   overrideColor: string | null,
+  settledFloor = 0,
+  baseColor?: string,
+  trailWidth = STREAM_TRAIL_WIDTH,
 ): ReactNode {
   if (!Number.isFinite(progress)) return text;
-  const segments = buildInkTrailSegments(text, progress);
+  const segments = buildInkTrailSegments(text, progress, trailWidth, settledFloor);
   if (segments.length === 0) return "";
   if (
     segments.length === 1 &&
@@ -922,23 +1063,32 @@ export function renderInkTrailText(
     if (seg.opacity >= 1 && seg.highlight === 0) {
       return seg.text;
     }
-    const segOpacity =
+    // Remap [0.14, 1] -> [0.04, 1] so leading glyphs dissolve gently out of
+    // mist instead of starting visibly bright on iOS rgba text.
+    const visualAlpha =
+      seg.opacity >= 1
+        ? 1
+        : Math.max(0.04, Math.min(1, (seg.opacity - 0.14) / 0.86));
+    const segAlpha =
       seg.highlight === 1
-        ? Number((seg.opacity * 0.88).toFixed(3))
-        : seg.opacity;
-    const segColor =
+        ? Number((visualAlpha * 0.92).toFixed(3))
+        : Number(visualAlpha.toFixed(3));
+    const rawColor =
       overrideColor !== null
         ? overrideColor
         : seg.highlight > 0
           ? highlightColor
-          : undefined;
+          : baseColor;
+    const tinted = rawColor !== undefined ? tintWithAlpha(rawColor, segAlpha) : "transparent";
     return (
       <Text
         key={idx}
         style={
-          segColor !== undefined
-            ? { opacity: segOpacity, color: segColor }
-            : { opacity: segOpacity }
+          tinted !== "transparent"
+            ? { color: tinted }
+            : rawColor !== undefined
+              ? { opacity: segAlpha, color: rawColor }
+              : { opacity: segAlpha }
         }
       >
         {seg.text}

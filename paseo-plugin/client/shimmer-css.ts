@@ -70,14 +70,36 @@ ${r(SHIMMER_DECORATION)} {
   user-select: none !important;
 }
 
+${r(SHIMMER_ROOT)}:has(${r(SHIMMER_DECORATION)}) > ${r(SHIMMER_CONTENT)} {
+  opacity: 0.78 !important;
+}
+
+/* 4 repeating beam periods across 133.3333% width (-33.3333%..100%), shifting
+   by exactly 1 period (+25% of self = +33.3333% of row) every 0.5s (= 1.5s full
+   row transit) for a pixel-seamless, 100% evenly spaced 3-beam conveyor. */
 ${r(SHIMMER_SWEEP)} {
   position: absolute !important;
-  inset: 0 !important;
+  top: 0 !important;
+  bottom: 0 !important;
+  left: -33.333333% !important;
+  width: 133.333333% !important;
   overflow: hidden !important;
   color: var(${COLOR_VAR}) !important;
-  mask-image: linear-gradient(105deg, transparent 0%, black 40% 60%, transparent 100%) !important;
-  -webkit-mask-image: linear-gradient(105deg, transparent 0%, black 40% 60%, transparent 100%) !important;
-  transform: translateX(-100%);
+  mask-image: linear-gradient(
+    105deg,
+    transparent 0%, rgba(0, 0, 0, 0.18) 5%, rgba(0, 0, 0, 0.72) 9%, black 12.5%, rgba(0, 0, 0, 0.72) 16%, rgba(0, 0, 0, 0.18) 20%, transparent 25%,
+    rgba(0, 0, 0, 0.18) 30%, rgba(0, 0, 0, 0.72) 34%, black 37.5%, rgba(0, 0, 0, 0.72) 41%, rgba(0, 0, 0, 0.18) 45%, transparent 50%,
+    rgba(0, 0, 0, 0.18) 55%, rgba(0, 0, 0, 0.72) 59%, black 62.5%, rgba(0, 0, 0, 0.72) 66%, rgba(0, 0, 0, 0.18) 70%, transparent 75%,
+    rgba(0, 0, 0, 0.18) 80%, rgba(0, 0, 0, 0.72) 84%, black 87.5%, rgba(0, 0, 0, 0.72) 91%, rgba(0, 0, 0, 0.18) 95%, transparent 100%
+  ) !important;
+  -webkit-mask-image: linear-gradient(
+    105deg,
+    transparent 0%, rgba(0, 0, 0, 0.18) 5%, rgba(0, 0, 0, 0.72) 9%, black 12.5%, rgba(0, 0, 0, 0.72) 16%, rgba(0, 0, 0, 0.18) 20%, transparent 25%,
+    rgba(0, 0, 0, 0.18) 30%, rgba(0, 0, 0, 0.72) 34%, black 37.5%, rgba(0, 0, 0, 0.72) 41%, rgba(0, 0, 0, 0.18) 45%, transparent 50%,
+    rgba(0, 0, 0, 0.18) 55%, rgba(0, 0, 0, 0.72) 59%, black 62.5%, rgba(0, 0, 0, 0.72) 66%, rgba(0, 0, 0, 0.18) 70%, transparent 75%,
+    rgba(0, 0, 0, 0.18) 80%, rgba(0, 0, 0, 0.72) 84%, black 87.5%, rgba(0, 0, 0, 0.72) 91%, rgba(0, 0, 0, 0.18) 95%, transparent 100%
+  ) !important;
+  transform: translateX(0%);
   animation-name: dsh-row-shimmer-sweep;
 }
 
@@ -86,30 +108,34 @@ ${r(SHIMMER_SWEEP)} * {
   color: inherit !important;
 }
 
-/* Opposite transforms keep every glyph aligned while their shared mask moves. */
+/* Opposite transform keeps every glyph locked to the row while the 4-period mask glides. */
 ${r(SHIMMER_HIGHLIGHT)} {
-  width: 100% !important;
+  position: absolute !important;
+  top: 0 !important;
+  bottom: 0 !important;
+  left: 25% !important;
+  width: 75% !important;
   height: 100% !important;
-  transform: translateX(100%);
+  transform: translateX(0%);
   animation-name: dsh-row-shimmer-highlight;
 }
 
 ${r(SHIMMER_SWEEP)},
 ${r(SHIMMER_HIGHLIGHT)} {
   animation-duration: 1.5s;
-  animation-delay: 0.3s;
-  animation-timing-function: steps(48, end);
+  animation-delay: 0.12s;
+  animation-timing-function: linear;
   animation-iteration-count: infinite;
 }
 
 @keyframes dsh-row-shimmer-sweep {
-  0% { transform: translateX(-100%); }
-  66.6667%, 100% { transform: translateX(100%); }
+  0% { transform: translateX(0%); }
+  100% { transform: translateX(25%); }
 }
 
 @keyframes dsh-row-shimmer-highlight {
-  0% { transform: translateX(100%); }
-  66.6667%, 100% { transform: translateX(-100%); }
+  0% { transform: translateX(0%); }
+  100% { transform: translateX(-33.333333%); }
 }
 
 @media (prefers-reduced-motion: reduce) {

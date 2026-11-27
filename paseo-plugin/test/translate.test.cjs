@@ -9,6 +9,8 @@ const { test } = require("node:test");
 const { translateThinkingRpc } = require("../shared/translate.ts");
 const {
   MAX_TRANSLATE_TEXT_LENGTH,
+  needsChineseTranslation,
+  splitStreamingThinkingSegments,
   splitTranslationChunks,
 } = require("../shared/translate-text.ts");
 const { ThinkingTranslator } = require("../server/translate.ts");
@@ -29,9 +31,43 @@ function createReactStub() {
         inst.states[idx] = typeof init === "function" ? init() : init;
       }
       const setState = (next) => {
-        inst.states[idx] = typeof next === "function" ? next(inst.states[idx]) : next;
+        const prev = inst.states[idx];
+        const value = typeof next === "function" ? next(prev) : next;
+        inst.states[idx] = value;
+        if (inst.autoRerender && !inst.unmounted && !Object.is(prev, value) && !inst.scheduled) {
+          inst.scheduled = true;
+          queueMicrotask(() => {
+            inst.scheduled = false;
+            if (!inst.unmounted) inst.render();
+          });
+        }
       };
       return [inst.states[idx], setState];
+    },
+    useRef(init) {
+      const inst = activeInst;
+      const idx = inst.cursor++;
+      if (!(idx in inst.refs)) {
+        inst.refs[idx] = { current: init };
+      }
+      return inst.refs[idx];
+    },
+    useMemo(fn, deps) {
+      const inst = activeInst;
+      const idx = inst.cursor++;
+      const prev = inst.memos[idx];
+      const changed =
+        !prev ||
+        !deps ||
+        !prev.deps ||
+        deps.length !== prev.deps.length ||
+        deps.some((d, i) => !Object.is(d, prev.deps[i]));
+      if (changed) {
+        const value = fn();
+        inst.memos[idx] = { deps, value };
+        return value;
+      }
+      return prev.value;
     },
     useEffect(fn, deps) {
       const inst = activeInst;
@@ -48,9 +84,22 @@ function createReactStub() {
       }
     },
   };
-  function mount(renderFn) {
-    const inst = { cursor: 0, states: [], effects: [], pendingEffects: [], lastResult: undefined };
+  function mount(renderFn, { autoRerender = false } = {}) {
+    const inst = {
+      cursor: 0,
+      states: [],
+      refs: [],
+      memos: [],
+      effects: [],
+      pendingEffects: [],
+      lastResult: undefined,
+      autoRerender,
+      scheduled: false,
+      unmounted: false,
+      render: null,
+    };
     const render = () => {
+      if (inst.unmounted) return inst.lastResult;
       inst.cursor = 0;
       inst.pendingEffects = [];
       activeInst = inst;
@@ -66,12 +115,14 @@ function createReactStub() {
       }
       return inst.lastResult;
     };
+    inst.render = render;
     const unmount = () => {
+      inst.unmounted = true;
       for (const eff of inst.effects) eff?.cleanup?.();
       inst.effects = [];
     };
     render();
-    return { render, unmount };
+    return { render, unmount, current: () => inst.lastResult };
   }
   return { stub, mount };
 }
@@ -149,7 +200,7 @@ test("ThinkingTranslator defaults to allowPublicFallback=false and never calls M
   t.after(() => noDsh.dispose());
   await assert.rejects(
     () => noDsh.translate("Inspecting private workspace logic carefully.", "zh-CN"),
-    /No local DSH translation endpoint configured/,
+    /No DSH translation endpoint configured/,
   );
   assert.deepEqual(calledUrls, [], "must not issue any HTTP request when DSH is absent and public fallback is off");
 
@@ -162,7 +213,7 @@ test("ThinkingTranslator defaults to allowPublicFallback=false and never calls M
       "- id: llm-pi-ai",
       "  config:",
       "    providers:",
-      "      local:",
+      "      primary:",
       "        api: openai-completions",
       "        apiKeyEnv: TEST_LOCAL_KEY",
       "        baseURL: https://example.test/v1",
@@ -352,4 +403,529 @@ test("client/thinking-translate.ts short-circuits oversized text, cools down emp
   assert.equal(seen.length, countBeforeProbe + 1, "oldest cooldown entry beyond 200 cap must have been evicted");
   assert.equal(hOldest.render(), `译:${echoText}`);
   hOldest.unmount();
+});
+
+test("shared/translate-text.ts preserves trailing unclosed code fences as isCode and excludes them from needsChineseTranslation", () => {
+  // 1. Trailing opening fence line without body must not be dropped.
+  const openFenceOnly = "Inspecting module layout\n```ts";
+  const segs1 = splitStreamingThinkingSegments(openFenceOnly, "streaming");
+  assert.equal(segs1.length, 2);
+  assert.deepEqual(segs1[0], { text: "Inspecting module layout", sep: "\n", closed: true });
+  assert.deepEqual(segs1[1], { text: "```ts", sep: "", closed: false, isCode: true });
+  assert.equal(segs1.map((s) => s.text + s.sep).join(""), openFenceOnly);
+
+  // 2. Trailing unclosed fence with newline or body preserves exact text and marks isCode: true.
+  const openFenceBody = "Checking snippet\n```ts\nconst answer = computeTotal();";
+  const segs2Streaming = splitStreamingThinkingSegments(openFenceBody, "streaming");
+  assert.equal(segs2Streaming.length, 2);
+  assert.equal(segs2Streaming[1].isCode, true);
+  assert.equal(segs2Streaming[1].closed, false);
+  assert.equal(segs2Streaming[1].text, "```ts\nconst answer = computeTotal();");
+  assert.equal(segs2Streaming.map((s) => s.text + s.sep).join(""), openFenceBody);
+
+  const segs2Complete = splitStreamingThinkingSegments(openFenceBody, "complete");
+  assert.equal(segs2Complete[1].isCode, true);
+  assert.equal(segs2Complete[1].closed, true);
+
+  const trailingNewlineFence = "Header line\n```bash\n";
+  const segs3 = splitStreamingThinkingSegments(trailingNewlineFence, "streaming");
+  assert.equal(segs3.length, 2);
+  assert.equal(segs3[1].isCode, true);
+  assert.equal(segs3[1].text, "```bash\n");
+  assert.equal(segs3.map((s) => s.text + s.sep).join(""), trailingNewlineFence);
+
+  // 3. needsChineseTranslation strips trailing unclosed fenced code blocks cleanly.
+  assert.equal(
+    needsChineseTranslation("```ts\nfunction evaluateLongEnglishIdentifierName() { return true; }"),
+    false,
+    "unclosed fenced code block alone must never be sent for translation",
+  );
+  assert.equal(
+    needsChineseTranslation("中文说明：\n```ts\nconst englishVariableName = calculateSomething();"),
+    false,
+    "Chinese prose followed by unclosed code fence must not trigger translation",
+  );
+  assert.equal(
+    needsChineseTranslation("Evaluating the outer English explanation before code.\n```ts\nconst x = 1;"),
+    true,
+    "English prose outside the unclosed fence still qualifies for translation",
+  );
+});
+
+test("client/thinking-translate.ts useStreamingTranslatedThinking preserves failed segments & leading spaces on complete, keeps in-flight liveTail across token growth, and resets on rowKey switch", async (t) => {
+  const { stub, mount } = createReactStub();
+  const originalLoad = Module._load;
+  const modPath = require.resolve("../client/thinking-translate.ts");
+  delete require.cache[modPath];
+  Module._load = function patchedLoad(id, parent, isMain) {
+    if (id === "react") return stub;
+    return originalLoad.call(this, id, parent, isMain);
+  };
+  let mod;
+  try {
+    mod = require(modPath);
+  } finally {
+    Module._load = originalLoad;
+  }
+  t.after(() => {
+    delete require.cache[modPath];
+  });
+
+  // Scenario A: Partial segment failure on complete must fall back verbatim (no dropped segment) and keep leading spaces.
+  const seg1 = "  First indented thought line that translates.";
+  const seg2 = "  Second indented thought line that fails.";
+  const fullTwoLines = `${seg1}\n${seg2}`;
+  const unregisterA = mod.registerThinkingTranslator(async (text) => {
+    if (text.includes("Second indented")) throw new Error("transient failure");
+    return "第一条缩进思考译文。";
+  });
+  t.after(() => unregisterA());
+
+  let phaseA = "streaming";
+  let textA = `${seg1}\n`;
+  const hA = mount(() => mod.useStreamingTranslatedThinking(textA, phaseA, true, "row-partial"), {
+    autoRerender: true,
+  });
+  t.after(() => hA.unmount());
+
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(hA.current().translated, "  第一条缩进思考译文。\n");
+
+  // Transition to complete with second indented line that fails into cooldown.
+  textA = fullTwoLines;
+  phaseA = "complete";
+  hA.render();
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(
+    hA.current().translated,
+    "  第一条缩进思考译文。\n  Second indented thought line that fails.",
+    "completed thought must never drop failed segment and must preserve leading spaces on both translated and fallback segments",
+  );
+  hA.unmount();
+  unregisterA();
+
+  // Scenario B: Growing the same liveTail sentence must NOT cancel the in-flight RPC, and must follow up with the newer tail.
+  const pendingCalls = [];
+  const unregisterB = mod.registerThinkingTranslator(
+    (text) =>
+      new Promise((resolve) => {
+        pendingCalls.push({ text, resolve });
+      }),
+  );
+  t.after(() => unregisterB());
+
+  let textB = "Checking streaming tail prefix";
+  let phaseB = "streaming";
+  let rowKeyB = "row-live-1";
+  const hB = mount(() => mod.useStreamingTranslatedThinking(textB, phaseB, true, rowKeyB), {
+    autoRerender: true,
+  });
+  t.after(() => hB.unmount());
+
+  // Wait past initial 40ms live-tail delay so first RPC is in flight.
+  await new Promise((r) => setTimeout(r, 65));
+  assert.equal(pendingCalls.length, 1);
+  assert.equal(pendingCalls[0].text, "Checking streaming tail prefix");
+
+  // Grow the SAME sentence while the first RPC is still in flight.
+  textB = "Checking streaming tail prefix with more tokens";
+  hB.render();
+
+  // Resolve the first in-flight RPC: result must NOT be discarded by effect cleanup.
+  pendingCalls[0].resolve("正在检查流式尾部前缀");
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(hB.current().translated, "正在检查流式尾部前缀");
+
+  // Follow-up tail RPC is scheduled automatically from `finally` for the longer text.
+  await new Promise((r) => setTimeout(r, 220));
+  assert.equal(pendingCalls.length, 2, "finally must schedule follow-up translation for newly arrived tail tokens");
+  assert.equal(pendingCalls[1].text, "Checking streaming tail prefix with more tokens");
+  pendingCalls[1].resolve("正在检查包含更多令牌的流式尾部前缀");
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(hB.current().translated, "正在检查包含更多令牌的流式尾部前缀");
+
+  // Scenario C: Switching rowKey immediately isolates/resets transient liveTail state on the very first frame.
+  rowKeyB = "row-live-2";
+  textB = "Fresh";
+  phaseB = "streaming";
+  const afterSwitch = hB.render();
+  assert.equal(afterSwitch.translated, "", "switching rowKey must not leak previous row's liveTail translation");
+  assert.equal(afterSwitch.pending, true, "new short English streaming row starts in pending placeholder state");
+
+  hB.unmount();
+  unregisterB();
+
+  // Scenario D: Fast burst where sentence 2 finishes translating before sentence 1 must hold
+  // strict in-order prefix output (no out-of-order insertion flash) and suppress liveTail RPCs
+  // while earlier closed sentences are still queued.
+  const burstCalls = [];
+  const unregisterD = mod.registerThinkingTranslator(
+    (text) =>
+      new Promise((resolve) => {
+        burstCalls.push({ text, resolve });
+      }),
+  );
+  t.after(() => unregisterD());
+
+  const fastBurst =
+    "First longer sentence that takes a bit more time to translate.\n" +
+    "Second quick sentence.\n" +
+    "Third unclosed trailing clause still streaming quickly without punctuation yet";
+  const hD = mount(
+    () => mod.useStreamingTranslatedThinking(fastBurst, "streaming", true, "row-fast-burst"),
+    { autoRerender: true },
+  );
+  t.after(() => hD.unmount());
+
+  // Wait past live-tail delay: only the 2 closed sentences should be dispatched (liveTail yields!).
+  await new Promise((r) => setTimeout(r, 70));
+  assert.equal(burstCalls.length, 2, "must not waste RPC concurrency on liveTail while closed sentences are pending");
+
+  // Resolve sentence 2 BEFORE sentence 1: output must stay pending (never jump ahead with sentence 2 alone).
+  burstCalls[1].resolve("第二句快译文。");
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(hD.current().translated, "", "must hold sentence 2 behind unresolved sentence 1 to prevent rewrite flash");
+  assert.equal(hD.current().pending, true);
+
+  // Now resolve sentence 1: both sentence 1 and cached sentence 2 append cleanly in exact order!
+  burstCalls[0].resolve("第一句较长译文。");
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(hD.current().pending, false);
+  assert.equal(hD.current().translated, "第一句较长译文。\n第二句快译文。…");
+
+  hD.unmount();
+  unregisterD();
+});
+
+test("ThinkingTranslator translates long DSH texts in parallel chunks and retries transient HTTP 502 once", async (t) => {
+  const { ThinkingTranslator } = require("../server/translate.ts");
+  const dir = makeTempDir(t, "paseo-dsh-parallel-");
+  const patchFile = path.join(dir, "profiles", "paseo", "cordis.patch.yml");
+  fs.mkdirSync(path.dirname(patchFile), { recursive: true });
+  fs.writeFileSync(
+    patchFile,
+    [
+      "- id: llm-pi-ai",
+      "  config:",
+      "    providers:",
+      "      local:",
+      "        api: openai-completions",
+      "        apiKeyEnv: TEST_PARALLEL_KEY",
+      "        baseURL: https://example.test/v1",
+      "        models:",
+      "          - id: fast-model",
+    ].join("\n"),
+  );
+  fs.writeFileSync(path.join(dir, ".credentials.yaml"), 'TEST_PARALLEL_KEY: "dummy-token"\n');
+
+  let active = 0;
+  let maxActive = 0;
+  let transient502Remaining = 1;
+  const mockFetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    const userText = body.messages[1].content;
+    if (userText.includes("Transient 502 probe") && transient502Remaining > 0) {
+      transient502Remaining -= 1;
+      return { ok: false, status: 502, json: async () => ({}) };
+    }
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await new Promise((r) => setTimeout(r, 30));
+    active -= 1;
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        choices: [{ finish_reason: "stop", message: { content: `译:${userText.slice(0, 12)}` } }],
+      }),
+    };
+  };
+
+  const translator = new ThinkingTranslator({
+    cacheFile: path.join(dir, "cache.json"),
+    fetchImpl: mockFetch,
+    dshHomeDir: dir,
+    profile: "paseo",
+    allowPublicFallback: false,
+  });
+  t.after(() => translator.dispose());
+
+  // 1. Transient HTTP 502 self-heals on single retry
+  const retried = await translator.translate("Transient 502 probe sentence for retry check.", "zh-CN");
+  assert.equal(retried.provider, "dsh");
+  assert.equal(transient502Remaining, 0);
+
+  // 2. Long text (>1600 chars) splits and executes chunks concurrently while preserving paragraph order
+  const p1 = "Paragraph one. " + "Alpha testing parallel translation throughput. ".repeat(18);
+  const p2 = "Paragraph two. " + "Beta verifying chunk order preservation cleanly. ".repeat(18);
+  const p3 = "Paragraph three. " + "Gamma confirming bounded concurrency execution. ".repeat(18);
+  const longResult = await translator.translate(`${p1}\n\n${p2}\n\n${p3}`, "zh-CN");
+  assert.equal(longResult.provider, "dsh");
+  assert.ok(maxActive >= 2, `expected concurrent chunk execution, got maxActive=${maxActive}`);
+  assert.equal(longResult.translated, "译:Paragraph on\n\n译:Paragraph tw\n\n译:Paragraph th");
+});
+
+test("client/thinking-translate.ts progressively renders long settled thoughts paragraph-by-paragraph and supports prefetchThinkingTranslation", async (t) => {
+  const { stub, mount } = createReactStub();
+  const originalLoad = Module._load;
+  const modPath = require.resolve("../client/thinking-translate.ts");
+  delete require.cache[modPath];
+  Module._load = function patchedLoad(id, parent, isMain) {
+    if (id === "react") return stub;
+    return originalLoad.call(this, id, parent, isMain);
+  };
+  let mod;
+  try {
+    mod = require(modPath);
+  } finally {
+    Module._load = originalLoad;
+  }
+  t.after(() => {
+    delete require.cache[modPath];
+  });
+
+  const resolvers = [];
+  const unregister = mod.registerThinkingTranslator(
+    (text) =>
+      new Promise((resolve) => {
+        resolvers.push({ text, resolve });
+      }),
+  );
+  t.after(() => unregister());
+
+  const p1 = "Paragraph alpha. " + "Inspecting progressive translation rendering behavior. ".repeat(12);
+  const p2 = "Paragraph beta. " + "Confirming second paragraph arrives smoothly afterward. ".repeat(12);
+  const longSettled = `${p1}\n\n${p2}`;
+
+  const h = mount(() => mod.useStreamingTranslatedThinking(longSettled, "complete", true, "row-long-settled"), {
+    autoRerender: true,
+  });
+  t.after(() => h.unmount());
+
+  // Both paragraph chunks are dispatched concurrently on mount.
+  assert.equal(resolvers.length, 2);
+  assert.equal(h.current().pending, true);
+
+  // Resolving paragraph 1 immediately renders Chinese + trailing ellipsis while paragraph 2 is still in flight.
+  resolvers[0].resolve("第一段长思考译文。");
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(h.current().pending, false);
+  assert.equal(h.current().translated, "第一段长思考译文。…");
+
+  // Resolving paragraph 2 completes the full translation with exact paragraph spacing.
+  resolvers[1].resolve("第二段长思考译文。");
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(h.current().translated, "第一段长思考译文。\n\n第二段长思考译文。");
+
+  // prefetchThinkingTranslation warms cache for short settled thought before mount.
+  mod.prefetchThinkingTranslation("Short thought prefetched on hover before click.");
+  assert.equal(resolvers.length, 3);
+  resolvers[2].resolve("悬停预取的短思考译文。");
+  await new Promise((r) => setTimeout(r, 15));
+
+  const h2 = mount(
+    () =>
+      mod.useStreamingTranslatedThinking(
+        "Short thought prefetched on hover before click.",
+        "complete",
+        true,
+        "row-prefetched",
+      ),
+    { autoRerender: true },
+  );
+  t.after(() => h2.unmount());
+  assert.equal(h2.current().pending, false);
+  assert.equal(h2.current().translated, "悬停预取的短思考译文。");
+  assert.equal(resolvers.length, 3, "mounted row must hit prefetched cache synchronously with zero extra RPC");
+});
+
+test("client/thinking-text.ts left-scroll stream normalizer and adaptive cursor pace both DSH and Antigravity identically", () => {
+  const {
+    advanceLeftScrollCursor,
+    normalizeLeftScrollStream,
+    streamingTail,
+  } = require("../client/thinking-text.ts");
+
+  assert.equal(
+    normalizeLeftScrollStream("**先检查**第一段。\n\n再检查第二段…"),
+    "先检查第一段。 再检查第二段",
+  );
+
+  // Small backlog advances at calm readable pace (~14 chars/sec -> ~0.7 char per 50ms)
+  const step1 = advanceLeftScrollCursor(0, 10, 50);
+  assert.ok(step1 > 0.5 && step1 < 1.0, `expected calm pace ~0.7 char per 50ms, got ${step1}`);
+
+  // Large backlog accelerates gently, strictly capped at <=1 char/frame
+  const burstStep = advanceLeftScrollCursor(0, 100, 32);
+  assert.ok(burstStep > 0.5 && burstStep <= 1.0, `expected gentle <=1 char step, got ${burstStep}`);
+
+  // Clamps huge dtMs (background tab resume) and never skips more than 1 char in a single frame
+  assert.ok(advanceLeftScrollCursor(0, 200, 5000) <= 1.0, "single frame step must stay <=1 char so text stays readable");
+
+  // Sub-pixel GPU marquee velocity advances smoothly by a few pixels per 60fps frame
+  const {
+    advanceSmoothPixelOffset,
+    computeSmoothMarqueeDurationMs,
+    splitNativeMarqueeChunks,
+  } = require("../client/thinking-text.ts");
+  const { isLikelyStartingEnglish } = require("../shared/translate-text.ts");
+  const px1 = advanceSmoothPixelOffset(0, 100, 16);
+  assert.ok(px1 > 2.0 && px1 < 4.5, `expected ~2.5-3.5px per 60fps frame, got ${px1}`);
+  const pxBurst = advanceSmoothPixelOffset(0, 2000, 16);
+  assert.ok(pxBurst > px1 && pxBurst <= 5.0, `expected capped <=5px per 60fps frame, got ${pxBurst}`);
+  assert.equal(advanceSmoothPixelOffset(200, 150, 16), 150);
+  assert.equal(advanceLeftScrollCursor(10, 10, 50), 10);
+  assert.equal(advanceLeftScrollCursor(25, 10, 50), 10);
+
+  // Native iOS/Android marquee duration matches the exact same calm velocity curve
+  assert.equal(computeSmoothMarqueeDurationMs(0), 0);
+  const shortDur = computeSmoothMarqueeDurationMs(145);
+  assert.ok(shortDur > 600 && shortDur <= 1050, `expected ~740ms for 145px, got ${shortDur}`);
+  const longDur = computeSmoothMarqueeDurationMs(3000);
+  assert.equal(longDur, 10000, "large backlog caps cleanly at 300px/sec (3000px -> 10s)");
+
+  // Code-point-safe chunk splitting never splits surrogate-pair emoji
+  const emojiStream = "🚀".repeat(25) + "测试";
+  const chunks = splitNativeMarqueeChunks(emojiStream, 24);
+  assert.equal(chunks.length, 2);
+  assert.equal(Array.from(chunks[0]).length, 24);
+  assert.equal(chunks[1], "🚀测试");
+
+  // isLikelyStartingEnglish catches real English starts without false-triggering on DSH code/symbols
+  assert.equal(isLikelyStartingEnglish("The"), true);
+  assert.equal(isLikelyStartingEnglish("Let's check"), true);
+  assert.equal(isLikelyStartingEnglish("I need"), true);
+  assert.equal(isLikelyStartingEnglish("Analyzing"), true);
+  assert.equal(isLikelyStartingEnglish("DSH"), false);
+  assert.equal(isLikelyStartingEnglish("iOS"), false);
+  assert.equal(isLikelyStartingEnglish("inline-thinking.tsx"), false);
+  assert.equal(isLikelyStartingEnglish("`useGrowing`"), false);
+  assert.equal(isLikelyStartingEnglish("/home/user/project"), false);
+  assert.equal(isLikelyStartingEnglish("useNativeDriver"), false);
+  assert.equal(isLikelyStartingEnglish("foo_bar"), false);
+  assert.equal(isLikelyStartingEnglish("DSH 的思考"), false);
+
+  // Advancing 1 char at a time shifts streamingTail smoothly leftward once width is filled
+  const zhStream = "正在检查为什么子智能体胶囊动画在初始挂载时延迟并核对后端轮询状态。";
+  const chars = Array.from(zhStream);
+  const w1 = streamingTail(chars.slice(0, 22).join(""), 180, 13);
+  const w2 = streamingTail(chars.slice(0, 23).join(""), 180, 13);
+  assert.notEqual(w1, w2);
+  assert.ok(w1.endsWith("…") && w2.endsWith("…"));
+  assert.equal(w2.slice(-2, -1), chars[22], "newest character enters at the right edge as older chars scroll left");
+
+  // Expanded thinking body ink-bloom helpers: code-point counting, calm wave cursor, and paragraph freeze split
+  const {
+    EXPANDED_BLOOM_WAVE_WIDTH,
+    advanceExpandedInkCursor,
+    buildExpandedBloomSegments,
+    countCodePoints,
+    findSettledBodySplit,
+  } = require("../client/thinking-text.ts");
+  assert.equal(countCodePoints("你好🚀world"), 8);
+  const ink1 = advanceExpandedInkCursor(0, 30, 16, EXPANDED_BLOOM_WAVE_WIDTH);
+  assert.ok(ink1 > 0.2 && ink1 < 0.8, `expected slow front-emergence advance per 60fps frame, got ${ink1}`);
+  const inkBurst = advanceExpandedInkCursor(0, 500, 16, EXPANDED_BLOOM_WAVE_WIDTH);
+  assert.ok(inkBurst > ink1 && inkBurst <= 0.8, `expected calm capped <=0.8 chars/frame under burst, got ${inkBurst}`);
+  const inkSettle = advanceExpandedInkCursor(30, 30, 40, EXPANDED_BLOOM_WAVE_WIDTH);
+  assert.ok(inkSettle > 30 && inkSettle < 30 + EXPANDED_BLOOM_WAVE_WIDTH);
+
+  // buildExpandedBloomSegments pre-places lookahead at alpha=0 and fades smoothly from front half
+  const bloomMid = buildExpandedBloomSegments("已定格内容接下来缓慢浮现出来", 9, 24, 5, 48);
+  assert.equal(bloomMid[0].text, "已定格内容");
+  assert.equal(bloomMid[0].alpha, 1);
+  const fadingAlphas = bloomMid.filter((s) => s.alpha > 0 && s.alpha < 1).map((s) => s.alpha);
+  assert.ok(fadingAlphas.length >= 3, "front half emerges gradually across multiple soft alpha steps");
+  assert.ok(fadingAlphas[0] > fadingAlphas[fadingAlphas.length - 1], "alpha decreases smoothly front-to-back");
+  const tailSeg = bloomMid[bloomMid.length - 1];
+  assert.equal(tailSeg.alpha, 0, "un-emerged tail stays pre-placed invisibly at alpha=0");
+  assert.equal(bloomMid.map((s) => s.text).join(""), "已定格内容接下来缓慢浮现出来");
+
+  const splitBlank = findSettledBodySplit("第一段内容\n\n第二段新内容", 8);
+  assert.deepEqual(splitBlank, {
+    frozenDelta: "第一段内容",
+    nextActiveStart: 7,
+    consumedCodePoints: 7,
+    gapLines: 1,
+  });
+  const splitSingle = findSettledBodySplit("第一行\r\n第二行正在输入", 6);
+  assert.deepEqual(splitSingle, {
+    frozenDelta: "第一行",
+    nextActiveStart: 5,
+    consumedCodePoints: 5,
+    gapLines: 0,
+  });
+  assert.equal(findSettledBodySplit("第一行\n\n", 10), null, "never split when nothing follows the newline");
+  assert.equal(findSettledBodySplit("无换行短句", 3), null);
+
+  // settledFloor keeps already-settled prefix at opacity 1 while newly appended chars bloom from char 0
+  const { buildInkTrailSegments } = require("../client/stream-reveal.ts");
+  const segsFrame0 = buildInkTrailSegments("已定格内容新增", 5, 5.5, 5);
+  assert.deepEqual(segsFrame0, [{ text: "已定格内容", opacity: 1, highlight: 0 }]);
+  const segsFrame1 = buildInkTrailSegments("已定格内容新增", 6.2, 5.5, 5);
+  assert.equal(segsFrame1[0].text, "已定格内容");
+  assert.equal(segsFrame1[0].opacity, 1);
+  assert.equal(segsFrame1[1].text, "新");
+  assert.ok(segsFrame1[1].opacity < 0.5 && segsFrame1[1].highlight === 2);
+
+  // Global assistant Markdown block splitter preserves fenced code blocks and skips standalone images
+  const {
+    isStandaloneMarkdownImage,
+    splitAssistantMarkdownBlocks,
+  } = require("../client/thinking-text.ts");
+  assert.equal(isStandaloneMarkdownImage("![preview](file:///tmp/a.png)"), true);
+  assert.equal(isStandaloneMarkdownImage("说明文字\n![preview](file:///tmp/a.png)"), false);
+  const mdBlocks = splitAssistantMarkdownBlocks(
+    "第一段正文。\n\n### 标题\n- 列表1\n- 列表2\n\n```ts\nconst a = 1;\n\nconst b = 2;\n```\n\n最后一段",
+  );
+  assert.deepEqual(mdBlocks, [
+    "第一段正文。",
+    "### 标题",
+    "- 列表1\n- 列表2",
+    "```ts\nconst a = 1;\n\nconst b = 2;\n```",
+    "最后一段",
+  ]);
+  // Unclosed streaming code fence stays intact as one single block
+  const unclosedFence = splitAssistantMarkdownBlocks("开场\n\n```py\nx = 1\n\ny = 2");
+  assert.deepEqual(unclosedFence, ["开场", "```py\nx = 1\n\ny = 2"]);
+
+  // Streaming inline Markdown tokenizer + continuous rgba front-to-back bloom runs
+  const {
+    buildStyledBloomRuns,
+    isRichMarkdownBlock,
+    parseInlineMarkdownRuns,
+  } = require("../client/thinking-text.ts");
+  assert.equal(isRichMarkdownBlock("普通段落含 **粗体** 和 `code`"), false);
+  assert.equal(isRichMarkdownBlock("```ts\nconst x = 1;\n```"), true);
+  assert.equal(isRichMarkdownBlock("| a | b |\n|---|---|\n| 1 | 2 |"), true);
+
+  const inlineRuns = parseInlineMarkdownRuns("- **按序屏障**：查看 [file.ts](file:///tmp/file.ts) 的 `code`");
+  assert.deepEqual(inlineRuns, [
+    { text: "• ", kind: "plain" },
+    { text: "按序屏障", kind: "bold" },
+    { text: "：查看 ", kind: "plain" },
+    { text: "file.ts", kind: "link" },
+    { text: " 的 ", kind: "plain" },
+    { text: "code", kind: "code" },
+  ]);
+  // Unclosed streaming bold/link markers never leak raw syntax
+  const unclosedBoldRuns = parseInlineMarkdownRuns("正在输出 **粗体文字");
+  assert.deepEqual(unclosedBoldRuns, [
+    { text: "正在输出 ", kind: "plain" },
+    { text: "粗体文字", kind: "bold" },
+  ]);
+  const unclosedLinkRuns = parseInlineMarkdownRuns("查看 [说明](file:///tmp/in-progress");
+  assert.deepEqual(unclosedLinkRuns, [
+    { text: "查看 ", kind: "plain" },
+    { text: "说明", kind: "link" },
+  ]);
+
+  const styledBloom = buildStyledBloomRuns(inlineRuns, 8, 24, 0, 48);
+  assert.equal(
+    styledBloom.map((s) => s.text).join(""),
+    "• 按序屏障：查看 file.ts 的 code",
+    "continuous styled bloom preserves every glyph with zero dropped chars",
+  );
+  assert.ok(styledBloom.some((s) => s.kind === "bold" && s.alpha > 0 && s.alpha < 1));
+  assert.ok(styledBloom.some((s) => s.alpha === 0), "upcoming glyphs pre-placed invisibly");
 });

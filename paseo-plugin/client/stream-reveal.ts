@@ -100,6 +100,7 @@ export function buildInkTrailSegments(
   text: string,
   progressChars: number,
   trailWidth = STREAM_TRAIL_WIDTH,
+  settledFloor = 0,
 ): InkTrailSegment[] {
   if (text.length === 0 || progressChars <= 0) return [];
   if (!Number.isFinite(progressChars)) {
@@ -112,7 +113,11 @@ export function buildInkTrailSegments(
   }
 
   const headEnd = Math.min(len, Math.ceil(progressChars));
-  const settledEnd = Math.max(0, Math.floor(progressChars - trailWidth));
+  const floorEnd = Number.isFinite(settledFloor) ? Math.max(0, Math.floor(settledFloor)) : 0;
+  const settledEnd = Math.min(
+    headEnd,
+    Math.max(floorEnd, Math.floor(progressChars - trailWidth)),
+  );
   const segments: InkTrailSegment[] = [];
 
   if (settledEnd > 0) {

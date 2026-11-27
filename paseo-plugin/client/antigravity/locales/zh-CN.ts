@@ -187,7 +187,7 @@ const zhCN = {
   },
   subagents: {
     title: "子智能体",
-    pill: "子智能体",
+    pill: "智能体",
     pillLabel: "{{running}}/{{total}}",
     pillLabelIdle: "{{total}}",
     workspaceBadge: "子智能体",

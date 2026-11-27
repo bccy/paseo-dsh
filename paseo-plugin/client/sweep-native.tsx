@@ -18,13 +18,13 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Animated, Easing, StyleSheet, View, type StyleProp, type ViewStyle } from "react-native";
 import {
-  SWEEP_BANDS,
-  SWEEP_CYCLE_MS,
+  SWEEP_ACTIVE_BASE_OPACITY,
+  SWEEP_BEAMS,
   SWEEP_DELAY_MS,
-  SWEEP_TRAVEL_FRACTION,
-  bandAlpha,
-  bandLeft,
-  bandWidth,
+  SWEEP_PEAK_OPACITY_DARK,
+  SWEEP_PERIOD_MS,
+  SWEEP_SLICES_PER_BEAM,
+  beamPeriodProfile,
 } from "./sweep-geometry";
 
 interface SweepNativeProps {
@@ -36,6 +36,8 @@ interface SweepNativeProps {
   active: boolean;
   contentStyle?: StyleProp<ViewStyle>;
   highlightColor: string;
+  /** Peak highlight opacity in `[0, 1]` so the native sweep stays subtle. */
+  peakOpacity?: number;
 }
 
 interface Box {
@@ -43,11 +45,40 @@ interface Box {
   height: number;
 }
 
+interface ConveyorSlice {
+  readonly key: string;
+  readonly leftFraction: number;
+  readonly widthFraction: number;
+  readonly alpha: number;
+}
+
+// Precompute 4 repeating periods (beam indices -1, 0, 1, 2 across [-1/3, 1]) so
+// shifting right by exactly +1/3 of row width wraps pixel-for-pixel seamlessly.
+const CONVEYOR_SLICES: readonly ConveyorSlice[] = (() => {
+  const out: ConveyorSlice[] = [];
+  const periodFraction = 1 / SWEEP_BEAMS;
+  const subWidthFraction = periodFraction / SWEEP_SLICES_PER_BEAM;
+  for (let beam = -1; beam < SWEEP_BEAMS; beam += 1) {
+    for (let sub = 0; sub < SWEEP_SLICES_PER_BEAM; sub += 1) {
+      const alpha = beamPeriodProfile((sub + 0.5) / SWEEP_SLICES_PER_BEAM);
+      if (alpha <= 0.015) continue;
+      out.push({
+        key: `${beam}:${sub}`,
+        leftFraction: beam * periodFraction + sub * subWidthFraction,
+        widthFraction: subWidthFraction,
+        alpha,
+      });
+    }
+  }
+  return out;
+})();
+
 export function SweepNative({
   children,
   active,
   contentStyle,
   highlightColor,
+  peakOpacity = SWEEP_PEAK_OPACITY_DARK,
 }: SweepNativeProps) {
   const [box, setBox] = useState<Box | null>(null);
   const progress = useRef(new Animated.Value(0)).current;
@@ -55,17 +86,13 @@ export function SweepNative({
   useEffect(() => {
     if (!active) return;
     const loop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(progress, {
-          toValue: 1,
-          duration: SWEEP_CYCLE_MS * SWEEP_TRAVEL_FRACTION,
-          easing: Easing.linear,
-          useNativeDriver: true,
-        }),
-        Animated.delay(SWEEP_CYCLE_MS * (1 - SWEEP_TRAVEL_FRACTION)),
-      ]),
+      Animated.timing(progress, {
+        toValue: 1,
+        duration: SWEEP_PERIOD_MS,
+        easing: Easing.linear,
+        useNativeDriver: true,
+      }),
     );
-    // DSH's `animation-delay: 0.3s`, which also keeps every row in step.
     const start = setTimeout(() => loop.start(), SWEEP_DELAY_MS);
     return () => {
       clearTimeout(start);
@@ -76,9 +103,9 @@ export function SweepNative({
 
   const width = box?.width ?? 0;
   const height = box?.height ?? 0;
-  const sweepX = progress.interpolate({ inputRange: [0, 1], outputRange: [-width, width] });
-  const counterX = progress.interpolate({ inputRange: [0, 1], outputRange: [width, -width] });
-  const bands = Array.from({ length: SWEEP_BANDS }, (_, index) => index);
+  const periodPx = width / SWEEP_BEAMS;
+  const sweepX = progress.interpolate({ inputRange: [0, 1], outputRange: [0, periodPx] });
+  const counterX = progress.interpolate({ inputRange: [0, 1], outputRange: [0, -periodPx] });
 
   return (
     <View
@@ -92,40 +119,45 @@ export function SweepNative({
         );
       }}
     >
-      {children(null)}
+      <View style={[contentStyle, active ? { opacity: SWEEP_ACTIVE_BASE_OPACITY } : null]}>
+        {children(null)}
+      </View>
       {active && box !== null && width > 0 ? (
-        // `pointer-events: none` in DSH's stylesheet: the row stays tappable.
-        <View style={StyleSheet.absoluteFill} pointerEvents="none" aria-hidden>
-          {bands.map((index) => (
-            <Animated.View
-              key={index}
-              style={{
-                position: "absolute",
-                top: 0,
-                bottom: 0,
-                left: bandLeft(index) * width,
-                width: bandWidth() * width,
-                overflow: "hidden",
-                transform: [{ translateX: sweepX }],
-              }}
-            >
+        // `overflow: "hidden"` clips the entering beam in [-periodPx, 0] and exiting beam past width.
+        <View style={[StyleSheet.absoluteFill, { overflow: "hidden" }]} pointerEvents="none" aria-hidden>
+          {CONVEYOR_SLICES.map((slice) => {
+            const sliceLeft = slice.leftFraction * width;
+            return (
               <Animated.View
+                key={slice.key}
                 style={{
                   position: "absolute",
                   top: 0,
-                  left: -bandLeft(index) * width,
-                  width,
-                  height,
-                  opacity: bandAlpha(index),
-                  transform: [{ translateX: counterX }],
+                  bottom: 0,
+                  left: sliceLeft,
+                  width: slice.widthFraction * width,
+                  overflow: "hidden",
+                  transform: [{ translateX: sweepX }],
                 }}
               >
-                <View style={[contentStyle, { width, height }]}>
-                  {children(highlightColor)}
-                </View>
+                <Animated.View
+                  style={{
+                    position: "absolute",
+                    top: 0,
+                    left: -sliceLeft,
+                    width,
+                    height,
+                    opacity: slice.alpha * peakOpacity,
+                    transform: [{ translateX: counterX }],
+                  }}
+                >
+                  <View style={[contentStyle, { width, height }]}>
+                    {children(highlightColor)}
+                  </View>
+                </Animated.View>
               </Animated.View>
-            </Animated.View>
-          ))}
+            );
+          })}
         </View>
       ) : null}
     </View>

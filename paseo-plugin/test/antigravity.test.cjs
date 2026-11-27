@@ -1928,7 +1928,7 @@ test("translateAntigravity syncs with setLanguageOverride, pluralizes _zero/_one
 
   // zh-CN override
   setLanguageOverride("zh-CN");
-  assert.equal(translateAntigravity("subagents.pill"), "子智能体");
+  assert.equal(translateAntigravity("subagents.pill"), "智能体");
   assert.equal(translateAntigravity("subagents.type.research"), "只读调研");
   assert.equal(translateAntigravity("subagents.type.self"), "通用");
   assert.equal(translateAntigravity("subagents.type.image-generator"), "图像生成");
@@ -1958,7 +1958,7 @@ test("translateAntigravity syncs with setLanguageOverride, pluralizes _zero/_one
   assert.equal(translateAntigravity("switched", { label: "Work" }), "Switched to “Work”");
 
   // Explicit localeOverride parameter + missing param placeholder preservation + missing key fallback
-  assert.equal(translateAntigravity("subagents.pill", undefined, "zh-CN"), "子智能体");
+  assert.equal(translateAntigravity("subagents.pill", undefined, "zh-CN"), "智能体");
   assert.equal(translateAntigravity("subagents.nested", {}), "Started by {{role}}");
   assert.equal(translateAntigravity("nonexistent.nested.key"), "nonexistent.nested.key");
 
@@ -2110,8 +2110,8 @@ test("contributeAntigravityClient & observeAgents keep stable CornerRingIcon ide
     await handle.observation.refreshSubagents();
     const subagentPill = pills.find((p) => p.spec.id === "subagents");
     assert.ok(subagentPill, "subagents composer pill should be registered");
-    assert.equal(subagentPill.current.label, "子智能体");
-    assert.equal(subagentPill.current.title, "子智能体");
+    assert.equal(subagentPill.current.label, "智能体");
+    assert.equal(subagentPill.current.title, "智能体");
     assert.equal(subagentPill.spec.button.behavior.kind, "popover");
     assert.equal(typeof subagentPill.spec.button.behavior.Content, "function");
     const runningIcon = subagentPill.current.icon;
@@ -2239,8 +2239,8 @@ test("Antigravity built-in tool names and mcp_paseo_* prefixes localize cleanly 
     ["swarm_wait", "等待蜂群消息", "Wait for swarm", { type: "unknown" }, "Hourglass"],
     ["list_resources", "列出 MCP 资源", "List MCP resources", { type: "unknown" }, "Server"],
     ["read_resource", "读取 MCP 资源", "Read MCP resource", { type: "unknown" }, "FileText"],
-    ["paseo.get_agent_activity", "查看 agent 活动", "Read agent activity", { type: "unknown" }, "Activity"],
-    ["mcp_paseo_list_agents", "列出 agent", "List agents", { type: "unknown" }, "Bot"],
+    ["paseo.get_agent_activity", "查看智能体活动", "Read agent activity", { type: "unknown" }, "Activity"],
+    ["mcp_paseo_list_agents", "列出智能体", "List agents", { type: "unknown" }, "Bot"],
     ["agy-fast_fast.batch_search", "批量搜索", "Batch search", { type: "unknown" }, "Search"],
     ["mcp_agy-fast_fast_apply_edits", "批量编辑", "Apply edits", { type: "unknown" }, "Pencil"],
     ["fast.read_slices", "分段读取", "Read slices", { type: "unknown" }, "Eye"],
@@ -2503,6 +2503,47 @@ test("ThinkingTranslator prefers dynamically discovered DSH openai-completions f
   const fallbackRes = await translator.translate("Another English paragraph when primary is down.", "zh-CN");
   assert.equal(fallbackRes.provider, "mymemory");
   assert.equal(fallbackRes.translated, "MyMemory 回退译文");
+});
+
+test("translate-text detects starting English and splits streaming thinking segments cleanly", () => {
+  const { isLikelyStartingEnglish, splitStreamingThinkingSegments } = require("../shared/translate-text.ts");
+
+  assert.equal(isLikelyStartingEnglish("The"), true);
+  assert.equal(isLikelyStartingEnglish("Let's check"), true);
+  assert.equal(isLikelyStartingEnglish("正在检查"), false);
+  assert.equal(isLikelyStartingEnglish("A long English sentence that exceeds twenty four chars."), false);
+  assert.equal(isLikelyStartingEnglish("12345"), false);
+
+  // Streaming segment splitter keeps closed sentences stable and marks live tail open
+  const streamingSegs = splitStreamingThinkingSegments(
+    "First closed sentence. Second sentence still typing",
+    "streaming",
+  );
+  assert.deepEqual(streamingSegs, [
+    { text: "First closed sentence.", sep: " ", closed: true },
+    { text: "Second sentence still typing", sep: "", closed: false },
+  ]);
+
+  const completeSegs = splitStreamingThinkingSegments(
+    "First closed sentence. Second sentence done",
+    "complete",
+  );
+  assert.deepEqual(completeSegs, [
+    { text: "First closed sentence.", sep: " ", closed: true },
+    { text: "Second sentence done", sep: "", closed: true },
+  ]);
+
+  const multilineSegs = splitStreamingThinkingSegments(
+    "Line one heading\n\n```ts\nconst x = 1;\n```\nStill streaming line",
+    "streaming",
+  );
+  assert.equal(multilineSegs[0].closed, true);
+  assert.equal(multilineSegs[0].text, "Line one heading");
+  assert.equal(multilineSegs[0].sep, "\n\n");
+  assert.equal(multilineSegs[1].closed, true);
+  assert.equal(multilineSegs[1].text, "```ts\nconst x = 1;\n```");
+  assert.equal(multilineSegs[2].closed, false);
+  assert.equal(multilineSegs[2].text, "Still streaming line");
 });
 
 test("resolveRealHome rejects profile-isolated HOME paths so account switching never creates symlink loops", () => {
@@ -3275,4 +3316,172 @@ test("after-turn deferred switch prevents FallbackController from blaming the ne
     for (const remove of hookRemovers) remove();
     controller.dispose();
   }
+});
+
+test("SubagentReader extracts Chinese swarm displayName from board brief & plan.json while preserving raw roster role, and duration formats zh-CN minutes cleanly", async (t) => {
+  const { duration } = require("../client/antigravity/format.ts");
+
+  // Duration must format minutes in zh-CN cleanly without iOS/Hermes ICU multiplying minutes by 60
+  assert.equal(duration("2026-11-27T08:00:00Z", "2026-11-27T08:00:42Z", "zh-CN"), "42 秒");
+  assert.equal(duration("2026-11-27T08:00:00Z", "2026-11-27T08:29:00Z", "zh-CN"), "29 分钟");
+  assert.equal(duration("2026-11-27T08:00:00Z", "2026-11-27T09:15:00Z", "zh-CN"), "1 小时 15 分");
+  assert.equal(duration("2026-11-27T08:00:00Z", "2026-11-27T10:00:00Z", "zh-CN"), "2 小时");
+
+  // Pure contract helpers
+  assert.equal(
+    agContracts.extractSwarmBriefLabel("@audit-server-ag 你是「Antigravity 服务端审查员」，本阶段只读审查"),
+    "Antigravity 服务端审查员",
+  );
+  assert.equal(
+    agContracts.extractSwarmBriefLabel("@verifier 你是本蜂群的「独立代码复审与验收员（只读，严禁修改任何文件）」"),
+    "独立代码复审与验收员",
+  );
+  assert.equal(
+    agContracts.extractSwarmBriefLabel("@monitor You are this swarm's stall monitor."),
+    null,
+  );
+  assert.equal(
+    agContracts.cleanSwarmPlanLabel("Antigravity 客户端 P1 修复（待复审）"),
+    "Antigravity 客户端 P1 修复",
+  );
+
+  // SubagentReader end-to-end with members.json + plan.json + board.jsonl
+  const cliDir = makeTempDir(t, "paseo-ag-swarm-zh-");
+  const parentId = "11111111-1111-4111-8111-111111111111";
+  const workerA = "22222222-2222-4222-8222-222222222222";
+  const workerB = "33333333-3333-4333-8333-333333333333";
+  const monitorId = "44444444-4444-4444-8444-444444444444";
+
+  const swarmPath = path.join(cliDir, "brain", parentId, ".system_generated", "swarm");
+  writeJson(path.join(swarmPath, "members.json"), {
+    title: "审查未推送改动并修复 P1+ 问题",
+    members: {
+      "audit-server-ag": { conversation_id: workerA, role: "worker", phase: "KILLED", killed: true },
+      "audit-client-ag": { conversation_id: workerB, role: "worker", phase: "KILLED", killed: true },
+      monitor: { conversation_id: monitorId, role: "worker", phase: "KILLED", killed: true },
+    },
+  });
+  writeJson(path.join(swarmPath, "plan.json"), {
+    tasks: {
+      "audit-server-ag": "Antigravity 服务端 P0/P1 修复（待复审）",
+      "audit-client-ag": "Antigravity 客户端 P1 修复（待复审）",
+      monitor: "监控蜂群停滞状态",
+    },
+  });
+  fs.writeFileSync(
+    path.join(swarmPath, "board.jsonl"),
+    [
+      JSON.stringify({ seq: 1, agent: "coordinator", text: "@audit-server-ag 你是「Antigravity 服务端审查员」，只读审查。" }),
+      JSON.stringify({ seq: 2, agent: "coordinator", text: "@audit-client-ag 请检查 client/antigravity 目录。" }),
+      JSON.stringify({ seq: 3, agent: "coordinator", text: "@monitor You are this swarm's stall monitor." }),
+    ].join("\n") + "\n",
+  );
+
+  for (const id of [workerA, workerB, monitorId]) {
+    const log = path.join(cliDir, "brain", id, ".system_generated", "logs", "transcript.jsonl");
+    fs.mkdirSync(path.dirname(log), { recursive: true });
+    fs.writeFileSync(
+      log,
+      JSON.stringify({ step_index: 1, type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-27T08:00:00Z" }) + "\n",
+    );
+  }
+
+  const reader = new SubagentReader(
+    { conversationOf: async () => ({ conversationId: parentId, closed: false }) },
+    cliDir,
+  );
+  const listed = await reader.list({}, "agent-zh");
+  const parsed = agContracts.subagentListSchema.parse(listed);
+  const byRole = new Map(parsed.subagents.map((s) => [s.role, s]));
+  assert.equal(byRole.get("audit-server-ag")?.displayName, "Antigravity 服务端审查员");
+  assert.equal(byRole.get("audit-client-ag")?.displayName, "Antigravity 客户端 P1 修复");
+  // Built-in monitor leaves displayName null so client localizes it to "监工" (zh-CN) / "monitor" (en)
+  assert.equal(byRole.get("monitor")?.displayName, null);
+});
+
+test("swarm displayName helpers and SubagentReader guard against prototype-key collisions and non-string/non-CJK edge cases", async (t) => {
+  // Defensive non-string handling
+  for (const bad of [Object, 123, {}, [], true, null, undefined]) {
+    assert.equal(agContracts.extractSwarmBriefLabel(bad), null);
+    assert.equal(agContracts.cleanSwarmPlanLabel(bad), null);
+  }
+
+  // cleanSwarmPlanLabel strips trailing parens BEFORE checking CJK, matching extractSwarmBriefLabel
+  assert.equal(agContracts.cleanSwarmPlanLabel("Fix bug（中文备注）"), null);
+  assert.equal(agContracts.cleanSwarmPlanLabel("Fix bug (待复审)"), null);
+  assert.equal(agContracts.cleanSwarmPlanLabel("Fix pure English task"), null);
+  const truncated = agContracts.cleanSwarmPlanLabel("这是一个非常非常非常非常非常非常非常非常非常长的中文任务标题");
+  assert.equal(truncated?.length, 28);
+  assert.ok(truncated?.endsWith("…"));
+
+  // Explicit "角色：「...」" syntax
+  assert.equal(agContracts.extractSwarmBriefLabel("@worker-1 角色：「离线门禁验证员」"), "离线门禁验证员");
+
+  // Prototype-key worker names (`constructor`, `toString`) must not collide with Object.prototype in plan.json lookup
+  const cliDir = makeTempDir(t, "paseo-ag-swarm-proto-");
+  const parentId = "55555555-5555-4555-8555-555555555555";
+  const ctorId = "66666666-6666-4666-8666-666666666666";
+  const toStrId = "77777777-7777-4777-8777-777777777777";
+
+  const swarmPath = path.join(cliDir, "brain", parentId, ".system_generated", "swarm");
+  writeJson(path.join(swarmPath, "members.json"), {
+    title: "原型键回归测试",
+    members: {
+      constructor: { conversation_id: ctorId, role: "worker", phase: "KILLED", killed: true },
+      toString: { conversation_id: toStrId, role: "worker", phase: "KILLED", killed: true },
+    },
+  });
+  writeJson(path.join(swarmPath, "plan.json"), {
+    tasks: {
+      "other-worker": "其他成员任务",
+    },
+  });
+  fs.writeFileSync(
+    path.join(swarmPath, "board.jsonl"),
+    [
+      JSON.stringify({ seq: 1, agent: "coordinator", text: "@constructor Inspect build config." }),
+      JSON.stringify({ seq: 2, agent: "coordinator", text: "@toString Inspect formatting helpers." }),
+    ].join("\n") + "\n",
+  );
+
+  for (const id of [ctorId, toStrId]) {
+    const log = path.join(cliDir, "brain", id, ".system_generated", "logs", "transcript.jsonl");
+    fs.mkdirSync(path.dirname(log), { recursive: true });
+    fs.writeFileSync(
+      log,
+      JSON.stringify({ step_index: 1, type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-27T08:00:00Z" }) + "\n",
+    );
+  }
+
+  const reader = new SubagentReader(
+    { conversationOf: async () => ({ conversationId: parentId, closed: false }) },
+    cliDir,
+  );
+  const listed = await reader.list({}, "agent-proto");
+  const parsed = agContracts.subagentListSchema.parse(listed);
+  const byRole = new Map(parsed.subagents.map((s) => [s.role, s]));
+  assert.equal(byRole.get("constructor")?.role, "constructor");
+  assert.equal(byRole.get("constructor")?.displayName, null);
+  assert.equal(byRole.get("toString")?.role, "toString");
+  assert.equal(byRole.get("toString")?.displayName, null);
+});
+
+test("Antigravity UsageSource uses dedicated antigravity-icon.svg packaged at plugin root (not DeepSeek whale icon.svg)", () => {
+  const { createUsageSource } = require("../server/antigravity/usage.ts");
+  const source = createUsageSource({});
+  assert.equal(source.icon, "antigravity-icon.svg");
+
+  const pluginRoot = path.resolve(__dirname, "..");
+  const agyIconPath = path.join(pluginRoot, "antigravity-icon.svg");
+  const dshIconPath = path.join(pluginRoot, "icon.svg");
+  assert.equal(fs.existsSync(agyIconPath), true, "antigravity-icon.svg must exist at plugin root");
+
+  const agySvg = fs.readFileSync(agyIconPath, "utf8");
+  const dshSvg = fs.readFileSync(dshIconPath, "utf8");
+  assert.notEqual(agySvg, dshSvg, "antigravity-icon.svg must not duplicate the DeepSeek whale icon.svg");
+  assert.match(agySvg, /viewBox="8\.8 10\.5 94 94"/);
+  assert.match(agySvg, /id="agy-usage-body"/);
+
+  const pkg = JSON.parse(fs.readFileSync(path.join(pluginRoot, "package.json"), "utf8"));
+  assert.equal(Array.isArray(pkg.files) && pkg.files.includes("antigravity-icon.svg"), true);
 });

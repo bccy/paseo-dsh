@@ -154,7 +154,7 @@ export function relative(timestamp: string | number, now: number, locale: string
   return fallbackRelative(value, unit, locale);
 }
 
-/** Elapsed duration ("12s", "9m", "1h 15m"), safe on Hermes builds without `style: "unit"`. */
+/** Elapsed duration ("12s", "9m", "1h 15m"), safe on Hermes/iOS builds with buggy `style: "unit"`. */
 export function duration(start: string | null, end: string | null, locale: string): string | null {
   const from = start ? Date.parse(start) : NaN;
   const to = end ? Date.parse(end) : NaN;
@@ -162,6 +162,12 @@ export function duration(start: string | null, end: string | null, locale: strin
   const seconds = Math.round((to - from) / 1000);
   const zh = isChineseLocale(locale);
   const formatUnit = (value: number, unit: "second" | "minute" | "hour") => {
+    // Avoid `Intl.NumberFormat({ style: "unit", unit: "minute", unitDisplay: "narrow" })` on zh-CN:
+    // iOS/Hermes ICU renders minutes multiplied by 60 as seconds (e.g. 29m -> "1,740 秒").
+    if (zh) {
+      const suffix = unit === "second" ? " 秒" : unit === "minute" ? " 分钟" : " 小时";
+      return `${value}${suffix}`;
+    }
     if (typeof Intl !== "undefined" && typeof Intl.NumberFormat === "function") {
       try {
         return new Intl.NumberFormat(safeLocale(locale), {
@@ -173,10 +179,6 @@ export function duration(start: string | null, end: string | null, locale: strin
         // Fall through on Hermes builds that reject `style: "unit"`.
       }
     }
-    if (zh) {
-      const suffix = unit === "second" ? "秒" : unit === "minute" ? "分" : "小时";
-      return `${value}${suffix}`;
-    }
     const suffix = unit === "second" ? "s" : unit === "minute" ? "m" : "h";
     return `${value}${suffix}`;
   };
@@ -185,6 +187,9 @@ export function duration(start: string | null, end: string | null, locale: strin
   if (totalMinutes < 60) return formatUnit(totalMinutes, "minute");
   const hours = Math.floor(totalMinutes / 60);
   const minutes = totalMinutes % 60;
+  if (zh) {
+    return minutes ? `${hours} 小时 ${minutes} 分` : `${hours} 小时`;
+  }
   return minutes ? `${formatUnit(hours, "hour")} ${formatUnit(minutes, "minute")}` : formatUnit(hours, "hour");
 }
 

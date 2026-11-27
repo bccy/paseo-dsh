@@ -1,7 +1,10 @@
 import type { PluginClientContext, PluginTimelineItemProps } from "@getpaseo/plugin/client";
-import { Fragment, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { Pressable, Text, View, type TextStyle } from "react-native";
 import { z } from "zod";
+import { normalizeRowTimestamp, yieldRowPulse } from "./newest";
+import { hasRecentLiveActivity } from "./row-cascade";
+import { RowEntrance } from "./row-entrance";
 
 export const streamStatsSchema = z.object({
   firstTokenMs: z.number().optional(),
@@ -68,8 +71,17 @@ function toolsLine(data: StreamStats): string | undefined {
 }
 
 /** One compact line under an answer; tap to expand the full picture. */
-function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamStats>) {
+function StreamStatsRow({ agentId, timestamp, item, theme, layout }: PluginTimelineItemProps<StreamStats>) {
   const [open, setOpen] = useState(false);
+  const liveAtMountRef = useRef<boolean | null>(null);
+  if (liveAtMountRef.current === null) {
+    liveAtMountRef.current = hasRecentLiveActivity(agentId);
+  }
+  useEffect(() => {
+    if (liveAtMountRef.current) {
+      yieldRowPulse(agentId);
+    }
+  }, [agentId]);
   const data = item.data;
   const fontSize = layout.compact ? 10 : 11;
   const muted = theme.colors.foregroundMuted;
@@ -100,33 +112,43 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
   const details = [contextLine(data), tokensLine(data), routeLine(data), toolsLine(data)].filter(
     (line): line is string => line !== undefined,
   );
+  const rowKey = `stream-stats:${normalizeRowTimestamp(timestamp)}:${data.turns ?? ""}:${data.steps ?? ""}:${data.outputTokens ?? ""}`;
 
   return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={open ? "收起回答统计" : "展开回答统计"}
-      onPress={() => setOpen((value) => !value)}
-      style={{ alignSelf: "flex-start", marginTop: 0, marginBottom: 0, paddingLeft: 2 }}
+    <RowEntrance
+      agentId={agentId}
+      timestamp={timestamp}
+      rowKey={rowKey}
+      liveHint={liveAtMountRef.current}
+      durationMs={380}
+      maxHandoffDelayMs={900}
     >
-      <View style={{ flexDirection: "row", alignItems: "center", flexWrap: "wrap" }}>
-        {segments.map((segment, index) => (
-          <Fragment key={segment.text}>
-            {index > 0 ? <Text style={base}> · </Text> : null}
-            <Text style={{ ...base, color: segment.color }}>{segment.text}</Text>
-          </Fragment>
-        ))}
-        <Text style={base}>{open ? " ▴" : " ▾"}</Text>
-      </View>
-      {open ? (
-        <View style={{ marginTop: 2, gap: 1 }}>
-          {details.map((line) => (
-            <Text key={line} style={base}>
-              {line}
-            </Text>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={open ? "收起回答统计" : "展开回答统计"}
+        onPress={() => setOpen((value) => !value)}
+        style={{ alignSelf: "flex-start", marginTop: 0, marginBottom: 0, paddingLeft: 2 }}
+      >
+        <View style={{ flexDirection: "row", alignItems: "center", flexWrap: "wrap" }}>
+          {segments.map((segment, index) => (
+            <Fragment key={segment.text}>
+              {index > 0 ? <Text style={base}> · </Text> : null}
+              <Text style={{ ...base, color: segment.color }}>{segment.text}</Text>
+            </Fragment>
           ))}
+          <Text style={base}>{open ? " ▴" : " ▾"}</Text>
         </View>
-      ) : null}
-    </Pressable>
+        {open ? (
+          <View style={{ marginTop: 2, gap: 1 }}>
+            {details.map((line) => (
+              <Text key={line} style={base}>
+                {line}
+              </Text>
+            ))}
+          </View>
+        ) : null}
+      </Pressable>
+    </RowEntrance>
   );
 }
 

@@ -72,7 +72,7 @@ export function createUsageSource(service: AccountService): UsageSourceRegistrat
   return {
     id: "dsh-paseo-antigravity-accounts",
     label: "Antigravity accounts",
-    icon: "icon.svg",
+    icon: "antigravity-icon.svg",
     input,
     async discover(scope: UsageScope) {
       if (scope.kind !== "global") return [];

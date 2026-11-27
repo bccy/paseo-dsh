@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
+  cleanSwarmPlanLabel,
+  extractSwarmBriefLabel,
   normalizeCommandKey,
   type SubagentArtifactInfo,
   type SubagentDetail,
@@ -497,6 +499,37 @@ async function readSubagentRegistry(cliDir: string, conversationId: string): Pro
   return entries;
 }
 
+/** Reads `.system_generated/swarm/plan.json` task descriptions keyed by roster name. */
+async function readSwarmPlanTasks(cliDir: string, conversationId: string): Promise<Map<string, string>> {
+  const tasks = new Map<string, string>();
+  const file = path.join(swarmDir(cliDir, conversationId), "plan.json");
+  const raw = await fs.readFile(file, "utf8").catch(() => null);
+  if (!raw) return tasks;
+  try {
+    const parsed = JSON.parse(raw) as { tasks?: unknown };
+    if (!parsed?.tasks || typeof parsed.tasks !== "object" || Array.isArray(parsed.tasks)) return tasks;
+    for (const [key, value] of Object.entries(parsed.tasks as Record<string, unknown>)) {
+      const text = nonEmptyString(value);
+      if (text) tasks.set(key, text);
+    }
+    return tasks;
+  } catch {
+    return tasks;
+  }
+}
+
+function resolveSwarmDisplayName(
+  rosterName: string | null,
+  planTask: string | null,
+  brief: string | null,
+): string | null {
+  const explicit = extractSwarmBriefLabel(brief);
+  if (explicit) return explicit;
+  // Let the built-in stall monitor use the localized "监工" / "Monitor" label instead of a long task sentence.
+  if (rosterName && /^monitor(?:-\d+)?$/i.test(rosterName)) return null;
+  return cleanSwarmPlanLabel(planTask);
+}
+
 /** Reads `.system_generated/swarm/board.jsonl` for a conversation. */
 async function readSwarmBoard(cliDir: string, conversationId: string): Promise<BoardPost[]> {
   const file = path.join(swarmDir(cliDir, conversationId), "board.jsonl");
@@ -886,6 +919,7 @@ export class SubagentReader {
     depth: number,
     reported: { at: string | null; content: string } | undefined,
     boardBrief: string | null,
+    planTask: string | null,
     parentClosed: boolean,
   ): Promise<SubagentSummary> {
     const log = await this.rows(child.id);
@@ -1000,11 +1034,15 @@ export class SubagentReader {
       taskText = messageBody(rows.find((row) => row.type === "SYSTEM_MESSAGE")?.content ?? "") || child.task;
     }
 
+    const displayName =
+      child.origin === "swarm" ? resolveSwarmDisplayName(child.role, planTask, taskText) : null;
+
     return {
       id: child.id,
       parentId,
       depth,
       role: child.role,
+      displayName,
       type: child.type,
       origin: child.origin,
       task: oneLine(taskText, 600),
@@ -1032,9 +1070,10 @@ export class SubagentReader {
     const { children, swarmTitle } = await this.discoverChildren(conversationId);
     if (!children.length) return { summaries: [], swarmTitle };
     const hasSwarm = children.some((child) => child.origin === "swarm");
-    const [inbox, boardPosts] = await Promise.all([
+    const [inbox, boardPosts, planTasks] = await Promise.all([
       this.reports(conversationId),
       hasSwarm ? readSwarmBoard(this.cliDir, conversationId) : Promise.resolve([] as BoardPost[]),
+      hasSwarm ? readSwarmPlanTasks(this.cliDir, conversationId) : Promise.resolve(new Map<string, string>()),
     ]);
 
     const nodes: Array<{ summary: SubagentSummary; descendants: SubagentSummary[]; index: number }> = [];
@@ -1047,8 +1086,9 @@ export class SubagentReader {
       }
       const boardReport = child.origin === "swarm" ? findBoardReport(boardPosts, child.role) : null;
       const boardBrief = child.origin === "swarm" ? findBoardBrief(boardPosts, child.role) : null;
+      const planTask = child.origin === "swarm" && child.role ? (planTasks.get(child.role) ?? null) : null;
       const reported = boardReport ?? inbox.get(child.id);
-      const summary = await this.summarize(child, conversationId, depth, reported, boardBrief, parentClosed);
+      const summary = await this.summarize(child, conversationId, depth, reported, boardBrief, planTask, parentClosed);
       const nested = await this.collect(child.id, depth + 1, parentClosed || summary.state === "stopped");
       nodes.push({ summary, descendants: nested.summaries, index });
     }

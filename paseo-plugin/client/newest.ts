@@ -34,6 +34,14 @@
  * @module dsh-paseo/client/newest
  */
 import { useEffect, useRef, useState } from "react";
+import {
+  hasRecentLiveActivity,
+  markAgentLiveActivity,
+  resetRowCascadeForTests,
+} from "./row-cascade";
+
+/** Maximum number of simultaneous `liveHint: true` rows allowed as a parallel live burst. */
+const MAX_LIVE_PARALLEL_BURST = 12;
 
 /** How long the newest row keeps pulsing after it commits. */
 export const PULSE_MS = 6000;
@@ -77,10 +85,14 @@ interface PendingPass {
 interface MountBatch {
   /** Distinct row keys attempting a first mount in the current render pass. */
   keys: Set<string>;
+  /** True only while every candidate registered in this pass carried `liveHint === true`. */
+  allLiveHint: boolean;
   /** Once the first commit effect runs, freeze batch classification & decisions. */
   sealed: boolean;
   /** Whether this render/commit pass mounted >= 2 fresh rows (a history/bulk batch). */
   isBatch: boolean;
+  /** Whether this commit pass is a genuine live parallel burst (e.g. parallel running tools). */
+  isLiveBurst: boolean;
   /** Cached entrance decision per row key so RowEntrance & useInkStreamReveal agree. */
   decisions: Map<string, boolean>;
   /** Last render-candidate timestamp (ms) so abandoned uncommitted renders age out. */
@@ -88,6 +100,8 @@ interface MountBatch {
 }
 
 const rows = new Map<string, AgentRows>();
+/** Active newest-row listeners per agent so a newer commit immediately stops the previous row's shimmer. */
+const pulseListeners = new Map<string, Set<() => void>>();
 /** The current render pass per agent, folded in afterwards. */
 const pending = new Map<string, PendingPass>();
 /** Per-agent mount batch state for entrance/reveal commit-phase coordination. */
@@ -207,7 +221,7 @@ function flush(): void {
       mountBatches.delete(agentId);
       continue;
     }
-    if (batch.keys.size >= 2) {
+    if (batch.keys.size >= 2 && !batch.allLiveHint) {
       const state = stateOf(agentId);
       state.replayUntil = Math.max(state.replayUntil, now + BULK_WINDOW_MS);
     }
@@ -272,6 +286,82 @@ export function noteRender(
   return newest;
 }
 
+function notifyPulseListeners(agentId: string): void {
+  const listeners = pulseListeners.get(agentId);
+  if (listeners === undefined || listeners.size === 0) return;
+  for (const listener of Array.from(listeners)) {
+    listener();
+  }
+}
+
+function subscribePulseHandover(agentId: string, listener: () => void): () => void {
+  let listeners = pulseListeners.get(agentId);
+  if (listeners === undefined) {
+    listeners = new Set();
+    pulseListeners.set(agentId, listeners);
+  }
+  listeners.add(listener);
+  return () => {
+    const current = pulseListeners.get(agentId);
+    if (current === undefined) return;
+    current.delete(listener);
+    if (current.size === 0) pulseListeners.delete(agentId);
+  };
+}
+
+/**
+ * Hand off the active row pulse when a non-pulsing live row (such as a
+ * streaming assistant reply or turn stats footer) starts below the last
+ * tool/thinking row, so the row above immediately stops shimmering.
+ */
+export function yieldRowPulse(agentId: string | undefined): void {
+  if (agentId === undefined || agentId === "") return;
+  const state = rows.get(agentId);
+  if (state === undefined) return;
+  seqCounter += 1;
+  state.seq = seqCounter;
+  notifyPulseListeners(agentId);
+}
+
+/**
+ * Claim exclusive pulse ownership for a live streaming row that manages its
+ * own active state (e.g. `InlineThinking`). Returns true while this row still
+ * holds the latest `seq` for `agentId`, and flips to false the instant any
+ * newer tool row, thinking row, or assistant reply commits below it.
+ */
+export function useIsPulseOwner(agentId: string | undefined, active: boolean): boolean {
+  const claimedSeqRef = useRef<number | null>(null);
+  const [, setTick] = useState(0);
+
+  useEffect(() => {
+    if (!active || agentId === undefined || agentId === "") {
+      claimedSeqRef.current = null;
+      return;
+    }
+    const state = stateOf(agentId);
+    seqCounter += 1;
+    const mySeq = seqCounter;
+    state.seq = mySeq;
+    claimedSeqRef.current = mySeq;
+    notifyPulseListeners(agentId);
+    const unsub = subscribePulseHandover(agentId, () => {
+      if (rows.get(agentId)?.seq !== mySeq) {
+        setTick((n) => (n + 1) & 0x7fffffff);
+      }
+    });
+    return () => {
+      unsub();
+    };
+  }, [agentId, active]);
+
+  if (!active) return false;
+  if (agentId === undefined || agentId === "") return true;
+  const mySeq = claimedSeqRef.current;
+  if (mySeq === null) return true;
+  const currentSeq = rows.get(agentId)?.seq;
+  return currentSeq === undefined || currentSeq === mySeq;
+}
+
 /** Commit-time half: this row is now the last one to have committed. */
 export function noteCommit(agentId: string, now: number): Commit {
   const state = stateOf(agentId);
@@ -282,6 +372,7 @@ export function noteCommit(agentId: string, now: number): Commit {
   seqCounter += 1;
   state.seq = seqCounter;
   state.seenAt = now;
+  notifyPulseListeners(agentId);
   return { seq: state.seq, seenAt: now, bulk, replay };
 }
 
@@ -359,6 +450,7 @@ export function noteMountCandidate(
   at: number,
   rowKey?: string,
   now = Date.now(),
+  liveHint?: boolean,
 ): void {
   if (agentId === "") return;
   const key = rowAnimationKey(at, rowKey);
@@ -367,14 +459,17 @@ export function noteMountCandidate(
   if (batch === undefined || batch.sealed || now - batch.updatedAt >= BULK_WINDOW_MS) {
     batch = {
       keys: new Set<string>(),
+      allLiveHint: liveHint === true,
       sealed: false,
       isBatch: false,
+      isLiveBurst: false,
       decisions: new Map<string, boolean>(),
       updatedAt: now,
     };
     mountBatches.set(agentId, batch);
   } else {
     batch.updatedAt = now;
+    if (liveHint !== true) batch.allLiveHint = false;
   }
   batch.keys.add(key);
   scheduleFlush();
@@ -386,10 +481,15 @@ export function noteMountCandidate(
  *
  * Seals the current render pass's mount batch on first commit, suppressing
  * every row (and extending `replayUntil`) when >= 2 fresh rows mounted in the
- * same pass. Caches the per-key decision for the duration of the sealed commit
- * so both `RowEntrance` and `useInkStreamReveal` on the same row agree even
- * though child layout effects commit before parent layout effects, while still
- * marking the row animated so any subsequent remount renders statically.
+ * same pass — EXCEPT when `allowLiveBurst` is enabled and every row in a small
+ * active-session pass carries `liveHint === true` (genuine parallel tool calls
+ * launched together in one turn, which should cascade smoothly rather than
+ * popping in un-animated).
+ *
+ * Caches the per-key decision for the duration of the sealed commit so both
+ * `RowEntrance` and `useInkStreamReveal` on the same row agree even though
+ * child layout effects commit before parent layout effects, while still marking
+ * the row animated so any subsequent remount renders statically.
  */
 export function commitMountEntrance(
   agentId: string,
@@ -397,6 +497,7 @@ export function commitMountEntrance(
   liveHint = false,
   rowKey?: string,
   now = Date.now(),
+  allowLiveBurst = false,
 ): boolean {
   if (agentId === "") return false;
   const key = rowAnimationKey(at, rowKey);
@@ -404,8 +505,10 @@ export function commitMountEntrance(
   if (batch === undefined) {
     batch = {
       keys: new Set<string>([key]),
+      allLiveHint: liveHint === true,
       sealed: false,
       isBatch: false,
+      isLiveBurst: false,
       decisions: new Map<string, boolean>(),
       updatedAt: now,
     };
@@ -415,7 +518,21 @@ export function commitMountEntrance(
   if (!batch.sealed) {
     batch.sealed = true;
     const passFresh = passFreshCount(pending.get(agentId));
-    batch.isBatch = batch.keys.size >= 2 || passFresh >= 2;
+    const existingState = rows.get(agentId);
+    const inReplayCooldown = existingState !== undefined && now < existingState.replayUntil;
+    const sessionActive = existingState !== undefined || hasRecentLiveActivity(agentId, now);
+    const multiRow = batch.keys.size >= 2 || passFresh >= 2;
+    const liveParallel =
+      allowLiveBurst &&
+      liveHint === true &&
+      batch.allLiveHint &&
+      !inReplayCooldown &&
+      sessionActive &&
+      batch.keys.size <= MAX_LIVE_PARALLEL_BURST &&
+      passFresh <= MAX_LIVE_PARALLEL_BURST;
+
+    batch.isLiveBurst = liveParallel;
+    batch.isBatch = multiRow && !liveParallel;
     if (batch.isBatch) {
       const state = stateOf(agentId);
       state.replayUntil = Math.max(state.replayUntil, now + BULK_WINDOW_MS);
@@ -428,9 +545,23 @@ export function commitMountEntrance(
   const cached = batch.decisions.get(key);
   if (cached !== undefined) return cached;
 
-  const decision = batch.isBatch ? false : shouldEnterLive(agentId, at, liveHint, rowKey, now);
+  let decision: boolean;
+  if (batch.isBatch) {
+    decision = false;
+  } else if (batch.isLiveBurst) {
+    const alreadyAnimated = animatedKeys.get(agentId)?.has(key) === true;
+    const existingState = rows.get(agentId);
+    const staleTimestamp = existingState !== undefined && at < existingState.at;
+    decision = !alreadyAnimated && !staleTimestamp;
+  } else {
+    decision = shouldEnterLive(agentId, at, liveHint, rowKey, now);
+  }
+
   batch.decisions.set(key, decision);
   rememberAnimatedKey(agentId, key);
+  if (decision) {
+    markAgentLiveActivity(agentId, now);
+  }
   return decision;
 }
 
@@ -477,10 +608,17 @@ export function shouldEnterLive(
   return false;
 }
 
+/** Number of active pulse-handover listeners registered for `agentId` (for offline tests). */
+export function pulseListenerCountForTests(agentId: string): number {
+  return pulseListeners.get(agentId)?.size ?? 0;
+}
+
 /** Clear per-agent (or all) module state. Intended for offline tests. */
 export function resetNewestForTests(agentId?: string): void {
+  resetRowCascadeForTests(agentId);
   if (agentId === undefined) {
     rows.clear();
+    pulseListeners.clear();
     pending.clear();
     mountBatches.clear();
     animatedKeys.clear();
@@ -489,6 +627,7 @@ export function resetNewestForTests(agentId?: string): void {
     return;
   }
   rows.delete(agentId);
+  pulseListeners.delete(agentId);
   pending.delete(agentId);
   mountBatches.delete(agentId);
   animatedKeys.delete(agentId);
@@ -500,13 +639,9 @@ export function resetNewestForTests(agentId?: string): void {
  * `newest` is read during render (safe: a running maximum); `fresh` needs the
  * commit, so it is set from an effect and costs one extra render.
  *
- * Nothing else re-renders a pulsing row. The sweep animates through
- * `Animated.loop` on native and through CSS on web, and the 50ms state timer
- * that used to drive a re-render went away with the opacity pulse — so a row
- * has to schedule its own wake-up for the moment its window closes. Without it
- * a short command keeps shimmering until some unrelated timeline update happens
- * to re-render it, and a row that stops being the last one keeps its
- * `newest` claim for just as long.
+ * Subscribes while active so the moment a newer row commits (or an assistant
+ * reply begins streaming below via `yieldRowPulse`), this row wakes immediately
+ * and yields the shimmer — never leaving two rows shimmering together.
  */
 export function useRowPulse(
   agentId: string,
@@ -516,24 +651,51 @@ export function useRowPulse(
   const at = normalizeRowTimestamp(timestamp);
   const instanceTokenRef = useRef<object | null>(null);
   if (instanceTokenRef.current === null) instanceTokenRef.current = {};
-  // A row that has never committed calls this for the first time: that is what
-  // `flush` counts to tell a history load (several first paints in one pass)
-  // from live activity (one row per pass). Passing a stable row identity keeps
-  // React StrictMode double renders of a single row from inflating the batch count.
-  const [commit, setCommit] = useState<Commit | null>(null);
   const identity = rowKey !== undefined && rowKey !== "" ? rowKey : instanceTokenRef.current;
-  const newest = noteRender(agentId, at, commit === null, identity);
+
+  // Freeze this row's birth timestamp per `(agentId, identity)` so when Paseo
+  // updates an older slow tool's `timestamp` upon completion, the older row
+  // never bumps `state.at` or re-commits `noteCommit` to steal shimmer away
+  // from the genuinely newest row at the bottom of the timeline.
+  const birthRef = useRef<{ agentId: string; identity: unknown; at: number } | null>(null);
+  if (
+    birthRef.current === null ||
+    birthRef.current.agentId !== agentId ||
+    birthRef.current.identity !== identity
+  ) {
+    birthRef.current = { agentId, identity, at };
+  }
+  const birthAt = birthRef.current.at;
+
+  const [commit, setCommit] = useState<Commit | null>(null);
+  const rawNewest = noteRender(agentId, birthAt, commit === null, identity);
   const [, setTick] = useState(0);
   useEffect(() => {
+    const currentAt = rows.get(agentId)?.at;
+    // A scroll-back remount of an older historical row (`birthAt < currentAt`)
+    // must never claim `seq` or steal the active shimmer from the newest row.
+    if (currentAt !== undefined && birthAt < currentAt) return;
     setCommit(noteCommit(agentId, Date.now()));
-  }, [agentId, at]);
+  }, [agentId, identity]);
+  const currentSeq = rows.get(agentId)?.seq;
+  const superseded = commit !== null && currentSeq !== undefined && currentSeq !== commit.seq;
+  const newest = rawNewest && !superseded;
   const fresh = commit !== null && isPulsing(agentId, commit, Date.now());
   useEffect(() => {
-    if (commit === null) return;
+    if (!newest && !fresh) return;
+    const mySeq = commit?.seq;
+    return subscribePulseHandover(agentId, () => {
+      if (mySeq === undefined || rows.get(agentId)?.seq !== mySeq) {
+        setTick((n) => (n + 1) & 0x7fffffff);
+      }
+    });
+  }, [agentId, newest, fresh, commit?.seq]);
+  useEffect(() => {
+    if (commit === null || !fresh) return;
     const remaining = pulseRemainingMs(commit, Date.now());
     if (remaining <= 0) return;
     // One frame past the window, so the re-render reads an expired window.
-    const timer = setTimeout(() => setTick((n) => n + 1), remaining + 16);
+    const timer = setTimeout(() => setTick((n) => (n + 1) & 0x7fffffff), remaining + 16);
     return () => clearTimeout(timer);
   }, [commit, fresh]);
   return { newest, fresh };

@@ -29,6 +29,7 @@ import {
   isLightColor,
   setShimmerColor,
 } from "./shimmer-css";
+import { SWEEP_PEAK_OPACITY_DARK, SWEEP_PEAK_OPACITY_LIGHT } from "./sweep-geometry";
 import { SweepNative } from "./sweep-native";
 
 interface TextShimmerProps {
@@ -70,16 +71,24 @@ export function TextShimmer({
   highlightColor,
   surfaceColor,
 }: TextShimmerProps) {
+  const peakOpacity = isLightColor(surfaceColor)
+    ? SWEEP_PEAK_OPACITY_LIGHT
+    : SWEEP_PEAK_OPACITY_DARK;
+
   useEffect(() => {
     if (!SHIMMER_SUPPORTED) return;
     ensureShimmerStyles();
-    // DSH mixes its highlight at 45% on dark and 30% on light.
-    setShimmerColor(highlightColor, isLightColor(surfaceColor) ? 30 : 45);
-  }, [highlightColor, surfaceColor]);
+    setShimmerColor(highlightColor, Math.round(peakOpacity * 100));
+  }, [highlightColor, peakOpacity]);
 
   if (!SHIMMER_SUPPORTED || forceNativeSweep()) {
     return (
-      <SweepNative active={active} contentStyle={contentStyle} highlightColor={highlightColor}>
+      <SweepNative
+        active={active}
+        contentStyle={contentStyle}
+        highlightColor={highlightColor}
+        peakOpacity={peakOpacity}
+      >
         {children}
       </SweepNative>
     );

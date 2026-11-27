@@ -25,22 +25,24 @@ import { dshHome } from "./bootstrap";
 import { needsChineseTranslation, splitTranslationChunks } from "../shared/translate-text";
 
 const MAX_CACHE_ENTRIES = 600;
-const MAX_CONCURRENT_REQUESTS = 6;
+const MAX_CONCURRENT_REQUESTS = 8;
 const MAX_QUEUE_SIZE = 64;
 const QUEUE_WAIT_TIMEOUT_MS = 15_000;
 const DSH_TIMEOUT_MS = 12_000;
-const DSH_SINGLE_SHOT_MAX_CHARS = 3_000;
-const DSH_CHUNK_MAX_CHARS = 2_400;
+const DSH_SINGLE_SHOT_MAX_CHARS = 1_600;
+const DSH_CHUNK_MAX_CHARS = 1_100;
+const DSH_CHUNK_CONCURRENCY = 4;
+const DSH_TRANSIENT_RETRY_DELAY_MS = 80;
+const DSH_TRANSIENT_STATUSES = new Set([502, 504]);
 const MYMEMORY_TIMEOUT_MS = 8_000;
 const MYMEMORY_TOTAL_BUDGET_MS = 25_000;
 const SAVE_DEBOUNCE_MS = 500;
-const ENDPOINT_CACHE_TTL_MS = 30_000;
+const ENDPOINT_CACHE_TTL_MS = 120_000;
 const CACHE_VERSION = "v2";
 const MYMEMORY_WARNING_RE = /MYMEMORY WARNING/i;
 const FAST_MODEL_RE = /(?:flash|mini|lite|haiku|small|fast)/i;
 
-const SYSTEM_PROMPT =
-  "将用户给出的英文思考内容翻译成简洁自然的简体中文。保留原有分段、代码标识符、文件路径、命令和专有名词不翻译，只输出译文，不要加任何解释或前缀。";
+const SYSTEM_PROMPT = "英译简中，保留分段、代码、路径和标识符，只输出译文。";
 
 function defaultCacheFile(): string {
   return path.join(paseoHome(), "plugin-data", "dsh-paseo", "thinking-translations.json");
@@ -66,7 +68,7 @@ export interface ThinkingTranslatorOptions {
   profile?: string;
   /**
    * Explicitly allow falling back to the public MyMemory GET endpoint when no
-   * local DSH OpenAI-compatible endpoint is available or when DSH fails.
+   * DSH OpenAI-compatible endpoint is available or when DSH fails.
    * Defaults to `false` unless `PASEO_DSH_ALLOW_PUBLIC_TRANSLATE=1`.
    */
   allowPublicFallback?: boolean;
@@ -449,31 +451,40 @@ export class ThinkingTranslator {
     endpoint: DshEndpoint,
     text: string,
   ): Promise<{ translated: string; truncated: boolean }> {
-    const response = await this.fetchWithTimeout(
-      `${endpoint.baseURL}/chat/completions`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${endpoint.apiKey}`,
+    const requestBody = JSON.stringify({
+      model: endpoint.model,
+      temperature: 0,
+      max_tokens:
+        text.length <= 240
+          ? Math.min(280, Math.max(96, Math.ceil(text.length * 1.5)))
+          : Math.min(4096, Math.max(512, Math.ceil(text.length * 1.6))),
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: text },
+      ],
+    });
+
+    let response: Response | null = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      response = await this.fetchWithTimeout(
+        `${endpoint.baseURL}/chat/completions`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${endpoint.apiKey}`,
+          },
+          body: requestBody,
         },
-        body: JSON.stringify({
-          model: endpoint.model,
-          temperature: 0.1,
-          max_tokens:
-            text.length <= 240
-              ? Math.min(320, Math.max(96, Math.ceil(text.length * 1.6)))
-              : Math.min(4096, Math.max(512, Math.ceil(text.length * 1.8))),
-          messages: [
-            { role: "system", content: SYSTEM_PROMPT },
-            { role: "user", content: text },
-          ],
-        }),
-      },
-      DSH_TIMEOUT_MS,
-    );
-    if (!response.ok) {
-      throw new Error(`DSH translation HTTP ${response.status}`);
+        DSH_TIMEOUT_MS,
+      );
+      if (response.ok || attempt === 1 || !DSH_TRANSIENT_STATUSES.has(response.status)) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, DSH_TRANSIENT_RETRY_DELAY_MS));
+    }
+    if (!response || !response.ok) {
+      throw new Error(`DSH translation HTTP ${response?.status ?? "unknown"}`);
     }
     const payload = (await response.json()) as {
       choices?: Array<{
@@ -492,21 +503,39 @@ export class ThinkingTranslator {
     };
   }
 
-  private async translateChunkedWithDsh(endpoint: DshEndpoint, text: string): Promise<string> {
-    const { pieces, seps } = splitTranslationChunks(text, DSH_CHUNK_MAX_CHARS);
-    if (pieces.length === 0) return text;
-    const translatedPieces: string[] = [];
-    for (const piece of pieces) {
+  private async translatePiecesInParallelWithDsh(
+    endpoint: DshEndpoint,
+    pieces: readonly string[],
+    seps: readonly string[],
+  ): Promise<string> {
+    const translatedPieces = new Array<string>(pieces.length);
+    const pendingIndices: number[] = [];
+    for (let i = 0; i < pieces.length; i += 1) {
+      const piece = pieces[i]!;
       if (!needsChineseTranslation(piece)) {
-        translatedPieces.push(piece);
-        continue;
+        translatedPieces[i] = piece;
+      } else {
+        pendingIndices.push(i);
       }
-      const chunkResult = await this.translateChunkWithDsh(endpoint, piece);
-      if (chunkResult.truncated) {
-        throw new Error("DSH translation output truncated");
-      }
-      translatedPieces.push(chunkResult.translated);
     }
+
+    if (pendingIndices.length > 0) {
+      let cursor = 0;
+      const workerCount = Math.min(DSH_CHUNK_CONCURRENCY, pendingIndices.length);
+      const workers = Array.from({ length: workerCount }, async () => {
+        while (cursor < pendingIndices.length) {
+          const idx = pendingIndices[cursor]!;
+          cursor += 1;
+          const chunkResult = await this.translateChunkWithDsh(endpoint, pieces[idx]!);
+          if (chunkResult.truncated) {
+            throw new Error("DSH translation output truncated");
+          }
+          translatedPieces[idx] = chunkResult.translated;
+        }
+      });
+      await Promise.all(workers);
+    }
+
     let combined = "";
     for (let i = 0; i < translatedPieces.length; i += 1) {
       combined += translatedPieces[i]! + (seps[i] ?? "");
@@ -518,6 +547,12 @@ export class ThinkingTranslator {
     return result;
   }
 
+  private async translateChunkedWithDsh(endpoint: DshEndpoint, text: string): Promise<string> {
+    const { pieces, seps } = splitTranslationChunks(text, DSH_CHUNK_MAX_CHARS);
+    if (pieces.length === 0) return text;
+    return this.translatePiecesInParallelWithDsh(endpoint, pieces, seps);
+  }
+
   private async translateWithDsh(endpoint: DshEndpoint, text: string): Promise<string> {
     if (text.length > DSH_SINGLE_SHOT_MAX_CHARS) {
       return this.translateChunkedWithDsh(endpoint, text);
@@ -527,27 +562,10 @@ export class ThinkingTranslator {
       return single.translated;
     }
     // Never cache a length-truncated single-shot response; retry via smaller chunks
-    // if splitting actually produces multiple pieces, otherwise fail cleanly.
+    // in parallel if splitting actually produces multiple pieces, otherwise fail cleanly.
     const plan = splitTranslationChunks(text, Math.min(DSH_CHUNK_MAX_CHARS, Math.max(400, Math.floor(text.length / 2))));
     if (plan.pieces.length > 1) {
-      const translatedPieces: string[] = [];
-      for (const piece of plan.pieces) {
-        if (!needsChineseTranslation(piece)) {
-          translatedPieces.push(piece);
-          continue;
-        }
-        const chunkResult = await this.translateChunkWithDsh(endpoint, piece);
-        if (chunkResult.truncated) {
-          throw new Error("DSH translation output truncated");
-        }
-        translatedPieces.push(chunkResult.translated);
-      }
-      let combined = "";
-      for (let i = 0; i < translatedPieces.length; i += 1) {
-        combined += translatedPieces[i]! + (plan.seps[i] ?? "");
-      }
-      const result = combined.trim();
-      if (result) return result;
+      return this.translatePiecesInParallelWithDsh(endpoint, plan.pieces, plan.seps);
     }
     throw new Error("DSH translation output truncated");
   }
@@ -637,7 +655,7 @@ export class ThinkingTranslator {
           // Explicitly opted-in fallback to MyMemory when the DSH endpoint fails.
         }
       } else if (!this.allowPublicFallback) {
-        throw new Error("No local DSH translation endpoint configured");
+        throw new Error("No DSH translation endpoint configured");
       }
       const translated = await this.translateWithMyMemory(text, target);
       this.remember(entryHash, translated);

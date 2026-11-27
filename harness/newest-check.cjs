@@ -104,6 +104,9 @@ async function main() {
     const second = noteCommit(agent, base + 50);
     check("the first row stops", isPulsing(agent, first, base + 50) === false);
     check("the second row pulses", isPulsing(agent, second, base + 50) === true);
+    const { yieldRowPulse } = require("./client/newest.js");
+    yieldRowPulse(agent);
+    check("yieldRowPulse immediately stops the last row when a reply streams below", isPulsing(agent, second, base + 55) === false);
   }
 
   console.log("live pair vs replayed history");
@@ -1754,6 +1757,414 @@ async function main() {
         global.document = prevDoc;
         global.ResizeObserver = prevRO;
         global.MutationObserver = prevMO;
+      }
+    }
+
+    // 7. Row cascade continuity, live parallel tool bursts, fast-tool smooth glide, and iOS rgba trail.
+    console.log("row-cascade: handoff, parallel live burst stagger, fast-tool glide, and iOS rgba");
+    {
+      const {
+        BLOOM_HANDOFF_MAX_DELAY_MS,
+        ROW_CASCADE_MAX_DELAY_MS,
+        ROW_CASCADE_STAGGER_MS,
+        claimCascadeDelay,
+        clearActiveBloom,
+        markAgentLiveActivity,
+        reportActiveBloom,
+        resetRowCascadeForTests,
+      } = require("./client/row-cascade.js");
+
+      const cascadeAgent = "cascade-handoff-agent";
+      resetRowCascadeForTests(cascadeAgent);
+      let boosted = false;
+      const t0 = 10_000;
+      reportActiveBloom(cascadeAgent, 400, () => {
+        boosted = true;
+      }, t0);
+      const d1 = claimCascadeDelay(cascadeAgent, "tool:1", t0);
+      const d1Again = claimCascadeDelay(cascadeAgent, "tool:1", t0 + 2);
+      const d2 = claimCascadeDelay(cascadeAgent, "tool:2", t0 + 2);
+      const d3 = claimCascadeDelay(cascadeAgent, "tool:3", t0 + 2);
+      const dHuge = claimCascadeDelay(cascadeAgent, "tool:8", t0 + 2);
+      check(
+        "arriving tool nudges upstream bloom and claims capped handoff delay",
+        boosted === true && d1 > 0 && d1 <= BLOOM_HANDOFF_MAX_DELAY_MS,
+        JSON.stringify({ boosted, d1, max: BLOOM_HANDOFF_MAX_DELAY_MS }),
+      );
+      check(
+        "paired RowEntrance + useInkStreamReveal on same rowKey receive identical phase-locked delay",
+        Math.abs(d1Again - (d1 - 2)) <= 1,
+        JSON.stringify({ d1, d1Again }),
+      );
+      check(
+        "parallel tool rows stagger sequentially and clamp to ROW_CASCADE_MAX_DELAY_MS",
+        d2 >= d1 + ROW_CASCADE_STAGGER_MS - 5 &&
+          d3 > d2 &&
+          dHuge <= ROW_CASCADE_MAX_DELAY_MS,
+        JSON.stringify({ d1, d2, d3, dHuge }),
+      );
+      // End-of-turn stats footer can pass a larger maxHandoffDelayMs so it waits
+      // for a longer upstream reply bloom to finish instead of popping early.
+      const footerAgent = "cascade-footer-agent";
+      resetRowCascadeForTests(footerAgent);
+      reportActiveBloom(footerAgent, 1200, undefined, t0);
+      const footerDelay = claimCascadeDelay(footerAgent, "stream-stats:1", t0, 900);
+      check(
+        "footer row with larger maxHandoffDelayMs waits past default tool cap for upstream reply bloom",
+        footerDelay > BLOOM_HANDOFF_MAX_DELAY_MS && footerDelay <= 900,
+        JSON.stringify({ footerDelay }),
+      );
+      clearActiveBloom(footerAgent);
+      resetRowCascadeForTests(footerAgent);
+      clearActiveBloom(cascadeAgent);
+      resetRowCascadeForTests(cascadeAgent);
+
+      // Live parallel burst of 3 running tools on an active session all animate with stagger,
+      // while a mixed/completed history batch still stays 0 animations.
+      const prevDoc = global.document;
+      const prevWin = global.window;
+      global.document = {
+        getElementById: () => null,
+        createElement: (tag) => ({ tag, id: "", textContent: "" }),
+        head: { appendChild: () => {} },
+      };
+      global.window = {};
+      const burstHarness = createMiniReactHarness({ includeLayoutEffect: true });
+      const burstAgent = "live-parallel-burst-3";
+      resetNewestForTests(burstAgent);
+      try {
+        markAgentLiveActivity(burstAgent, Date.now());
+        const mod = loadRowEntrance(
+          { Platform: { OS: "web" }, View: "View", Text: "Text" },
+          burstHarness.hooks,
+        );
+        const { RowEntrance, ROW_ENTER_TEST_ID, useInkStreamReveal, renderInkTrailText } = mod;
+
+        const parallelRows = [0, 1, 2].map((i) => ({
+          key: `live-tool-${i}`,
+          ts: base + 500,
+          label: "读取文件",
+          summary: `file-${i}.ts`,
+        }));
+        function ParallelRow({ row }) {
+          const s = useInkStreamReveal({
+            agentId: burstAgent,
+            timestamp: row.ts,
+            rowKey: row.key,
+            liveHint: true,
+            label: row.label,
+            summary: row.summary,
+            snapOnSettle: false,
+            snapNow: false,
+            trailWidth: 9,
+          });
+          return {
+            type: RowEntrance,
+            props: {
+              agentId: burstAgent,
+              timestamp: row.ts,
+              rowKey: row.key,
+              liveHint: true,
+              children: { type: "RowOut", props: { active: s.active, key: row.key } },
+            },
+          };
+        }
+        function ParallelList() {
+          return {
+            type: "List",
+            props: {
+              children: parallelRows.map((row) => ({
+                type: ParallelRow,
+                key: row.key,
+                props: { row },
+              })),
+            },
+          };
+        }
+        const burstTree = burstHarness.render(ParallelList, {});
+        const burstEnters = findAllNodes(burstTree, (n) => n.props?.testID === ROW_ENTER_TEST_ID);
+        const burstOuts = findAllNodes(burstTree, (n) => n.type === "RowOut");
+        check(
+          "live parallel burst of 3 running tools on active agent animates all 3 with staggered delays",
+          burstEnters.length === 3 &&
+            burstOuts.length === 3 &&
+            burstOuts.every((o) => o.props.active === true) &&
+            burstEnters[1].props.style?.animationDelay !== undefined &&
+            burstEnters[2].props.style?.animationDelay !== burstEnters[1].props.style?.animationDelay,
+          JSON.stringify({
+            enters: burstEnters.map((e) => e.props.style),
+            actives: burstOuts.map((o) => o.props.active),
+          }),
+        );
+
+        // renderInkTrailText uses true rgba(...) color on nested <Text> when baseColor is supplied.
+        const rgbaNodes = renderInkTrailText("读取文件", 2.5, "#ffffff", null, 0, "#94a3b8", 9);
+        const tintedSpans = Array.isArray(rgbaNodes)
+          ? rgbaNodes.filter((n) => typeof n === "object" && n !== null && typeof n.props?.style?.color === "string")
+          : [];
+        check(
+          "renderInkTrailText emits true rgba(...) colors instead of iOS-ignored opacity-only spans",
+          tintedSpans.length >= 2 &&
+            tintedSpans.every((n) => /^rgba\(\d+, \d+, \d+, [0-9.]+\)$/.test(n.props.style.color)) &&
+            tintedSpans.every((n) => n.props.style.opacity === undefined),
+          JSON.stringify(tintedSpans.map((n) => n.props.style)),
+        );
+
+        // Fast tool completion with snapOnSettle=false keeps blooming smoothly; snapNow=true snaps immediately.
+        const fastAgent = "fast-tool-glide";
+        resetNewestForTests(fastAgent);
+        await pass(fastAgent, [base]);
+        let fastState = null;
+        function FastToolProbe({ liveHint, snapNow }) {
+          fastState = useInkStreamReveal({
+            agentId: fastAgent,
+            timestamp: base + 100,
+            rowKey: "fast-1",
+            liveHint,
+            label: "读取文件",
+            summary: "index.ts",
+            snapOnSettle: false,
+            snapNow,
+            trailWidth: 9,
+          });
+          return { type: "FastOut", props: fastState };
+        }
+        burstHarness.render(FastToolProbe, { liveHint: true, snapNow: false });
+        const activeWhileRunning = fastState.active;
+        burstHarness.render(FastToolProbe, { liveHint: false, snapNow: false });
+        const stillGlidingAfterFastComplete = fastState.active;
+        burstHarness.render(FastToolProbe, { liveHint: false, snapNow: true });
+        const snappedOnFailure = fastState.active === false && fastState.labelProgress === Number.POSITIVE_INFINITY;
+        check(
+          "fast tool completion (snapOnSettle=false) glides smoothly while snapNow=true snaps immediately on error",
+          activeWhileRunning === true && stillGlidingAfterFastComplete === true && snappedOnFailure === true,
+          JSON.stringify({ activeWhileRunning, stillGlidingAfterFastComplete, snappedOnFailure }),
+        );
+        burstHarness.unmountAll();
+        resetNewestForTests(fastAgent);
+
+        // Hook-level exclusive pulse ownership: thinking row yields when a tool
+        // commits below it, an older slow tool updating its timestamp never
+        // steals shimmer back from the bottom row, and unmount releases all listeners.
+        const pulseHarness = createMiniReactHarness({ includeLayoutEffect: true });
+        const pulseAgent = "hook-pulse-handover";
+        const originalLoadPulse = Module._load;
+        for (const key of Object.keys(require.cache)) {
+          if (key.endsWith("newest.js")) delete require.cache[key];
+        }
+        let newestMod;
+        Module._load = function load(request, parent, isMain) {
+          if (request === "react") return pulseHarness.hooks;
+          return originalLoadPulse.call(this, request, parent, isMain);
+        };
+        try {
+          newestMod = require(join(__dirname, "client", "newest.js"));
+        } finally {
+          Module._load = originalLoadPulse;
+        }
+        newestMod.resetNewestForTests(pulseAgent);
+        // Settle an initial pass so subsequent rows are live.
+        newestMod.noteRender(pulseAgent, base);
+        await settle();
+
+        let thinkingOwns = false;
+        let tool1Pulse = null;
+        let tool2Pulse = null;
+        function PulseScene({ showTool1, tool1Ts, showTool2, tool2Ts, thinkingActive }) {
+          thinkingOwns = newestMod.useIsPulseOwner(pulseAgent, thinkingActive);
+          return {
+            type: "Scene",
+            props: {
+              children: [
+                showTool1
+                  ? {
+                      type: function Tool1Probe({ ts }) {
+                        tool1Pulse = newestMod.useRowPulse(pulseAgent, ts, "tool:slow-1");
+                        return { type: "T1", props: tool1Pulse };
+                      },
+                      key: "t1",
+                      props: { ts: tool1Ts },
+                    }
+                  : null,
+                showTool2
+                  ? {
+                      type: function Tool2Probe({ ts }) {
+                        tool2Pulse = newestMod.useRowPulse(pulseAgent, ts, "tool:newest-2");
+                        return { type: "T2", props: tool2Pulse };
+                      },
+                      key: "t2",
+                      props: { ts: tool2Ts },
+                    }
+                  : null,
+              ],
+            },
+          };
+        }
+
+        // Step 1: Thinking row is active -> owns pulse.
+        pulseHarness.render(PulseScene, {
+          thinkingActive: true,
+          showTool1: false,
+          tool1Ts: base + 100,
+          showTool2: false,
+          tool2Ts: base + 200,
+        });
+        const thinkingInitiallyOwned = thinkingOwns;
+
+        // Step 2: Tool 1 mounts below thinking row -> thinking yields, Tool 1 owns.
+        pulseHarness.render(PulseScene, {
+          thinkingActive: true,
+          showTool1: true,
+          tool1Ts: base + 100,
+          showTool2: false,
+          tool2Ts: base + 200,
+        });
+        await settle();
+        const thinkingYieldedToTool1 = thinkingOwns === false;
+        const tool1OwnedBeforeTool2 = tool1Pulse?.newest === true && tool1Pulse?.fresh === true;
+
+        // Step 3: Tool 2 mounts below Tool 1 -> Tool 1 yields immediately, Tool 2 owns.
+        pulseHarness.render(PulseScene, {
+          thinkingActive: true,
+          showTool1: true,
+          tool1Ts: base + 100,
+          showTool2: true,
+          tool2Ts: base + 200,
+        });
+        await settle();
+        const tool1YieldedToTool2 = tool1Pulse?.newest === false && tool1Pulse?.fresh === false;
+        const tool2Owned = tool2Pulse?.newest === true && tool2Pulse?.fresh === true;
+
+        // Step 4: Older slow Tool 1 finishes and Paseo jumps its timestamp to base + 900.
+        // Frozen birthRef must keep Tool 1 superseded and Tool 2 as the exclusive newest row.
+        pulseHarness.render(PulseScene, {
+          thinkingActive: false,
+          showTool1: true,
+          tool1Ts: base + 900,
+          showTool2: true,
+          tool2Ts: base + 200,
+        });
+        await settle();
+        const slowFinishDidNotSteal =
+          tool1Pulse?.newest === false &&
+          tool1Pulse?.fresh === false &&
+          tool2Pulse?.newest === true &&
+          tool2Pulse?.fresh === true;
+
+        // Step 4b: Virtual-list scroll-back remounts a single older historical row
+        // (`ts = base + 500`) alone while the live bottom row (`ts = base + 2000`)
+        // is pulsing. The older row must stay silent (`shouldPulse === false`) and
+        // must NOT steal `seq` or interrupt the live row's pulse.
+        const scrollAgent = "hook-scroll-remount-no-steal";
+        let liveRowPulse = null;
+        let histRowPulse = null;
+        const scrollHarness = createMiniReactHarness({ includeLayoutEffect: true });
+        for (const key of Object.keys(require.cache)) {
+          if (key.endsWith("newest.js")) delete require.cache[key];
+        }
+        let scrollNewestMod;
+        Module._load = function load(request, parent, isMain) {
+          if (request === "react") return scrollHarness.hooks;
+          return originalLoadPulse.call(this, request, parent, isMain);
+        };
+        try {
+          scrollNewestMod = require(join(__dirname, "client", "newest.js"));
+        } finally {
+          Module._load = originalLoadPulse;
+        }
+        scrollNewestMod.resetNewestForTests(scrollAgent);
+        scrollNewestMod.noteRender(scrollAgent, base);
+        await settle();
+        function ScrollTestScene({ mountOld }) {
+          return {
+            type: "Root",
+            props: {
+              children: [
+                mountOld
+                  ? {
+                      type: function HistRow() {
+                        histRowPulse = scrollNewestMod.useRowPulse(scrollAgent, base + 500, "tool:hist-500");
+                        return { type: "Hist", props: histRowPulse };
+                      },
+                      key: "hist",
+                      props: {},
+                    }
+                  : null,
+                {
+                  type: function LiveRow() {
+                    liveRowPulse = scrollNewestMod.useRowPulse(scrollAgent, base + 2000, "tool:live-2000");
+                    return { type: "Live", props: liveRowPulse };
+                  },
+                  key: "live",
+                  props: {},
+                },
+              ],
+            },
+          };
+        }
+        scrollHarness.render(ScrollTestScene, { mountOld: false });
+        await settle();
+        const livePulsingBeforeScroll =
+          liveRowPulse !== null && scrollNewestMod.shouldPulse("running", liveRowPulse);
+        scrollHarness.render(ScrollTestScene, { mountOld: true });
+        await settle();
+        const oldRowSilentOnRemount =
+          histRowPulse !== null &&
+          histRowPulse.newest === false &&
+          histRowPulse.fresh === false &&
+          scrollNewestMod.shouldPulse("completed", histRowPulse) === false;
+        const liveStillPulsingAfterOldRemount =
+          liveRowPulse !== null &&
+          liveRowPulse.newest === true &&
+          liveRowPulse.fresh === true &&
+          scrollNewestMod.shouldPulse("running", liveRowPulse) === true;
+        scrollHarness.unmountAll();
+        scrollNewestMod.resetNewestForTests(scrollAgent);
+        check(
+          "scroll-back single old historical row remount stays silent and never steals pulse from live newest row",
+          livePulsingBeforeScroll === true &&
+            oldRowSilentOnRemount === true &&
+            liveStillPulsingAfterOldRemount === true,
+          JSON.stringify({
+            livePulsingBeforeScroll,
+            oldRowSilentOnRemount,
+            liveStillPulsingAfterOldRemount,
+            histRowPulse,
+            liveRowPulse,
+          }),
+        );
+
+        // Step 5: Unmount releases every handover listener cleanly.
+        const listenersBeforeUnmount = newestMod.pulseListenerCountForTests(pulseAgent);
+        pulseHarness.unmountAll();
+        const listenersAfterUnmount = newestMod.pulseListenerCountForTests(pulseAgent);
+        newestMod.resetNewestForTests(pulseAgent);
+
+        check(
+          "hook handover: thinking yields to tool 1, tool 1 yields to tool 2, slow finish never steals pulse, unmount leaks 0 listeners",
+          thinkingInitiallyOwned === true &&
+            thinkingYieldedToTool1 === true &&
+            tool1OwnedBeforeTool2 === true &&
+            tool1YieldedToTool2 === true &&
+            tool2Owned === true &&
+            slowFinishDidNotSteal === true &&
+            listenersBeforeUnmount >= 1 &&
+            listenersAfterUnmount === 0,
+          JSON.stringify({
+            thinkingInitiallyOwned,
+            thinkingYieldedToTool1,
+            tool1OwnedBeforeTool2,
+            tool1YieldedToTool2,
+            tool2Owned,
+            slowFinishDidNotSteal,
+            listenersBeforeUnmount,
+            listenersAfterUnmount,
+          }),
+        );
+      } finally {
+        global.document = prevDoc;
+        global.window = prevWin;
+        resetNewestForTests(burstAgent);
       }
     }
   }

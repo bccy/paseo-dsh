@@ -18,6 +18,7 @@ import {
   type ScrollView as NativeScrollView,
 } from "react-native";
 import {
+  extractSwarmBriefLabel,
   isAntigravityProvider,
   listSubagentsRpc,
   subagentArtifactRpc,
@@ -243,13 +244,81 @@ function metaLine(
   return parts.join(" · ");
 }
 
-function localizeActivity(activity: string | null): string | null {
+const SWARM_ACTION_LABELS_ZH: ReadonlyMap<string, string> = new Map([
+  ["add", "添加成员"],
+  ["kill", "停止成员"],
+  ["kill_all", "停止全部"],
+  ["status", "查看状态"],
+  ["title", "设置主题"],
+  ["model", "切换模型"],
+  ["models", "查看模型"],
+  ["list", "查看列表"],
+]);
+
+const SWARM_ROLE_LABELS_ZH: ReadonlyMap<string, string> = new Map([
+  ["monitor", "监工"],
+  ["verifier", "复审员"],
+  ["reviewer", "复审员"],
+  ["auditor", "审查员"],
+  ["audit", "审查员"],
+  ["researcher", "调研员"],
+  ["research", "调研员"],
+  ["implementer", "实现员"],
+  ["builder", "实现员"],
+  ["coder", "实现员"],
+  ["developer", "开发员"],
+  ["fixer", "修复员"],
+  ["tester", "测试员"],
+  ["qa", "测试员"],
+  ["planner", "规划员"],
+  ["writer", "文档员"],
+  ["docs", "文档员"],
+  ["worker", "蜂群成员"],
+  ["coordinator", "协调者"],
+]);
+
+function localizeSwarmRosterName(name: string | null | undefined, locale: string): string | null {
+  if (!name) return null;
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+  if (!locale.toLowerCase().startsWith("zh")) return trimmed;
+  const lower = trimmed.toLowerCase();
+  const exact = SWARM_ROLE_LABELS_ZH.get(lower);
+  if (exact) return exact;
+  const numbered = /^([a-z][a-z0-9_-]*?)[-_](\d+)$/.exec(lower);
+  if (numbered) {
+    const base = SWARM_ROLE_LABELS_ZH.get(numbered[1]!);
+    if (base) return `${base} ${numbered[2]}`;
+  }
+  return trimmed;
+}
+
+function displaySubagentName(
+  subagent: Pick<SubagentSummary, "id" | "role" | "displayName" | "type" | "origin">,
+  t: Translate,
+  locale: string,
+): string {
+  const custom = subagent.displayName?.trim();
+  if (custom) return custom;
+  if (subagent.origin === "swarm" && subagent.role) {
+    return localizeSwarmRosterName(subagent.role, locale) ?? subagent.role;
+  }
+  const typeLabel = subagentTypeLabel(subagent.type, t);
+  return subagent.role ?? typeLabel ?? subagent.id.slice(0, 8);
+}
+
+function localizeActivity(activity: string | null, locale: string): string | null {
   if (!activity) return null;
   const sep = " · ";
   const idx = activity.indexOf(sep);
   if (idx === -1) return toolLabel(activity);
   const head = activity.slice(0, idx);
-  const tail = activity.slice(idx + sep.length);
+  const rawTail = activity.slice(idx + sep.length);
+  const mappedTail =
+    locale.toLowerCase().startsWith("zh") && (head === "swarm" || head === "manage_subagents")
+      ? SWARM_ACTION_LABELS_ZH.get(rawTail.toLowerCase())
+      : undefined;
+  const tail = mappedTail ?? rawTail;
   return `${toolLabel(head)}${sep}${tail}`;
 }
 
@@ -264,10 +333,10 @@ function subagentTypeLabel(type: string | null | undefined, t: Translate): strin
   return type;
 }
 
-function activityLine(summary: SubagentSummary | undefined, t: Translate): string | null {
+function activityLine(summary: SubagentSummary | undefined, t: Translate, locale: string): string | null {
   if (!summary) return null;
   if (summary.state === "running" && summary.phase === "thinking") return t("subagents.thinking");
-  return localizeActivity(summary.activity);
+  return localizeActivity(summary.activity, locale);
 }
 
 function transcriptToMarkdown(
@@ -275,10 +344,10 @@ function transcriptToMarkdown(
   entries: readonly TranscriptEntry[],
   report: string | null,
   t: Translate,
+  locale: string,
 ): string {
-  const displayType = subagentTypeLabel(summary.type, t);
   const lines: string[] = [
-    `# ${summary.role ?? displayType ?? summary.id}`,
+    `# ${displaySubagentName(summary, t, locale)}`,
     "",
     `- **ID**: \`${summary.id}\``,
     `- **${t("subagents.markdown.state")}**: ${t(`subagents.state.${summary.state}`)}`,
@@ -393,12 +462,16 @@ export function createSubagentViews(client: PluginClientContext) {
     const state = shownState(summary, card.status);
     const statusTone = STATE_TONE[state];
     const statusColor = toneColor(colors, statusTone);
-    const activity = activityLine(summary, t);
+    const activity = activityLine(summary, t, locale);
     const thinking = summary?.state === "running" && summary.phase === "thinking";
     const resolvedRole = summary?.role ?? card.role ?? null;
     const isSwarm = summary?.origin === "swarm" || card.origin === "swarm";
     const typeLabel = subagentTypeLabel(summary?.type ?? card.type, t);
-    const title = resolvedRole ?? typeLabel ?? t("subagents.title");
+    const title = summary
+      ? displaySubagentName(summary, t, locale)
+      : (isSwarm ? extractSwarmBriefLabel(card.task) ?? localizeSwarmRosterName(card.role, locale) : card.role) ??
+        typeLabel ??
+        t("subagents.title");
     const targetId = summary?.id || card.id || undefined;
 
     const detailQuery = useQuery({
@@ -631,12 +704,23 @@ export function createSubagentViews(client: PluginClientContext) {
 
   // ---- Timeline: the row of a `manage_subagents` / `swarm` control call ------------------------
 
-  function SubagentCheckRow({ item, theme }: PluginTimelineItemProps<SubagentCheck>) {
+  function SubagentCheckRow({ agentId, item, theme }: PluginTimelineItemProps<SubagentCheck>) {
     const { colors } = theme;
-    const { t } = useAntigravityTranslation();
+    const { t, locale } = useAntigravityTranslation();
     const check = item.data;
     const killed = check.action === "kill" || check.action === "kill_all" || check.action === "swarm:kill";
     const isSwarm = check.action.startsWith("swarm:");
+    const showNames = killed || check.action === "swarm:model";
+    const subagentsQuery = useSubagents(agentId, showNames && isSwarm);
+    const swarmDisplayByKey = useMemo(() => {
+      const map = new Map<string, string>();
+      for (const s of subagentsQuery.data?.subagents ?? []) {
+        const label = displaySubagentName(s, t, locale);
+        map.set(s.id, label);
+        if (s.role) map.set(s.role, label);
+      }
+      return map;
+    }, [subagentsQuery.data?.subagents, t, locale]);
     const title =
       check.action === "kill_all"
         ? check.states.length > 0
@@ -664,7 +748,6 @@ export function createSubagentViews(client: PluginClientContext) {
         : check.action === "swarm:model"
           ? "Cpu"
           : "ListChecks";
-    const showNames = killed || check.action === "swarm:model";
     const counts = new Map<string, number>();
     if (!showNames) for (const entry of check.states) counts.set(entry.state, (counts.get(entry.state) ?? 0) + 1);
     const chips = [...counts].map(([state, count]) => {
@@ -674,7 +757,17 @@ export function createSubagentViews(client: PluginClientContext) {
     });
     const names = showNames
       ? check.states
-          .map((entry) => entry.role ?? (entry.id.startsWith("#") ? "" : entry.id.slice(0, 8)))
+          .map((entry) => {
+            if (isSwarm) {
+              return (
+                swarmDisplayByKey.get(entry.id) ??
+                (entry.role ? swarmDisplayByKey.get(entry.role) : undefined) ??
+                localizeSwarmRosterName(entry.role, locale) ??
+                (entry.id.startsWith("#") ? "" : entry.id.slice(0, 8))
+              );
+            }
+            return entry.role ?? (entry.id.startsWith("#") ? "" : entry.id.slice(0, 8));
+          })
           .filter(Boolean)
           .join(" · ")
       : "";
@@ -1010,7 +1103,8 @@ export function createSubagentViews(client: PluginClientContext) {
         if (filter === "failed" && subagent.state !== "failed") return false;
         if (!q) return true;
         return (
-          (subagent.role ?? "").toLowerCase().includes(q) ||
+          (subagent.displayName ?? "").toLowerCase().includes(q) ||
+        (subagent.role ?? "").toLowerCase().includes(q) ||
           (subagent.type ?? "").toLowerCase().includes(q) ||
           (subagentTypeLabel(subagent.type, t) ?? "").toLowerCase().includes(q) ||
           subagent.task.toLowerCase().includes(q)
@@ -1308,8 +1402,8 @@ function PopoverSubagentRow({
   const isRunning = subagent.state === "running";
   const isSwarm = subagent.origin === "swarm";
   const typeLabel = subagentTypeLabel(subagent.type, t);
-  const title = subagent.role ?? typeLabel ?? subagent.id.slice(0, 8);
-  const activity = activityLine(subagent, t);
+  const title = displaySubagentName(subagent, t, locale);
+  const activity = activityLine(subagent, t, locale);
   const thinking = isRunning && subagent.phase === "thinking";
   const fact = isRunning && activity ? activity : metaLine(subagent, t, locale, pricing);
   const isToolActivity = isRunning && Boolean(activity) && !thinking;
@@ -1475,10 +1569,11 @@ function ListRow({
   const { locale } = useAntigravityTranslation();
   const pricing = useUnifiedPricing();
   const color = toneColor(colors, STATE_TONE[subagent.state]);
-  const activity = activityLine(subagent, t);
+  const activity = activityLine(subagent, t, locale);
   const isSwarm = subagent.origin === "swarm";
   const typeLabel = subagentTypeLabel(subagent.type, t);
-  const parentTypeLabel = parent ? subagentTypeLabel(parent.type, t) : null;
+  const displayName = displaySubagentName(subagent, t, locale);
+  const parentDisplayName = parent ? displaySubagentName(parent, t, locale) : null;
   return (
     <Pressable
       accessibilityRole="button"
@@ -1508,7 +1603,7 @@ function ListRow({
       <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: space.xs }}>
           <Text numberOfLines={1} style={{ ...font.small, fontWeight: "600", color: colors.foreground, flexShrink: 1 }}>
-            {subagent.role ?? typeLabel ?? subagent.id.slice(0, 8)}
+            {displayName}
           </Text>
           {isSwarm ? (
             <Badge colors={colors} label={t("subagents.swarmTag")} tone="neutral" style={{ flexShrink: 0 }} />
@@ -1518,9 +1613,9 @@ function ListRow({
             </Text>
           ) : null}
         </View>
-        {parent ? (
+        {parent && parentDisplayName ? (
           <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted }}>
-            {t("subagents.nested", { role: parent.role ?? parentTypeLabel ?? parent.id.slice(0, 8) })}
+            {t("subagents.nested", { role: parentDisplayName })}
           </Text>
         ) : null}
         {activity ? (
@@ -1684,12 +1779,13 @@ function Detail({
     .join(" · ");
 
   const typeLabel = subagentTypeLabel(summary.type, t);
+  const title = displaySubagentName(summary, t, locale);
 
   return (
     <ScrollView ref={scrollRef} style={{ flex: 1 }} contentContainerStyle={{ padding: pad, paddingBottom: pad + 56, gap: space.xl }}>
       <View style={{ gap: space.sm }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, flexWrap: "wrap" }}>
-          <Text style={{ ...font.title, color: colors.foreground }}>{summary.role ?? typeLabel ?? summary.id.slice(0, 8)}</Text>
+          <Text style={{ ...font.title, color: colors.foreground }}>{title}</Text>
           {summary.origin === "swarm" ? (
             <Badge colors={colors} label={t("subagents.swarmTag")} tone="neutral" />
           ) : typeLabel && summary.role ? (
@@ -1707,7 +1803,7 @@ function Detail({
               accessibilityRole="button"
               accessibilityLabel={t("subagents.copyTranscript")}
               onPress={() => {
-                const md = transcriptToMarkdown(summary, entries, detail?.report ?? null, t);
+                const md = transcriptToMarkdown(summary, entries, detail?.report ?? null, t, locale);
                 void copyText(md).then(() => toast.show(t("subagents.transcriptCopied"), { durationMs: 2500 }));
               }}
               style={{ flexDirection: "row", alignItems: "center", gap: 4, padding: space.xs }}
@@ -2202,7 +2298,7 @@ function PopoverSubagentDetail({
     .filter(Boolean)
     .join(" · ");
   const typeLabel = subagentTypeLabel(summary.type, t);
-  const title = summary.role ?? typeLabel ?? summary.id.slice(0, 8);
+  const title = displaySubagentName(summary, t, locale);
   const pillTone = popoverStatePillTone(summary.state);
   const pillLeading =
     summary.state === "running" ? (
