@@ -55,7 +55,15 @@ export interface LiveBloomTracker {
 export interface LiveBloomState {
   /** Whether this reply has ever streamed live in the current session. */
   everStreamed: boolean;
-  /** Block indices that have already started/completed their GPU entrance fade. */
+  /** Floating-point code-point cursor along the assistant reply. */
+  cursor: number;
+  /** Settled code-point floor so already-revealed glyphs never regress in alpha. */
+  settledFloor: number;
+  /** Smoothed streaming velocity (code points / sec) preserved across remounts. */
+  velocity: number;
+  /** Once true, the completed reply has finished blooming and swapped to `<Markdown>`. */
+  unifiedSettled: boolean;
+  /** Block indices that have already completed reveal. */
   readonly revealedBlocks: Set<number>;
 }
 

@@ -764,7 +764,11 @@ test("client/thinking-text.ts left-scroll stream normalizer and adaptive cursor 
 
   // Sub-pixel GPU marquee velocity advances smoothly by a few pixels per 60fps frame
   const {
+    MARQUEE_LEFT_FADE_PX,
+    MARQUEE_RIGHT_FADE_PX,
     advanceSmoothPixelOffset,
+    buildHermiteEdgeFadeAlphas,
+    buildSmoothMarqueeMask,
     computeSmoothMarqueeDurationMs,
     splitNativeMarqueeChunks,
   } = require("../client/thinking-text.ts");
@@ -790,6 +794,35 @@ test("client/thinking-text.ts left-scroll stream normalizer and adaptive cursor 
   assert.equal(chunks.length, 2);
   assert.equal(Array.from(chunks[0]).length, 24);
   assert.equal(chunks[1], "🚀测试");
+
+  // Dual-edge Hermite smoothstep marquee fade eliminates hard left/right cut lines and Mach bands
+  assert.equal(MARQUEE_LEFT_FADE_PX, 36);
+  assert.equal(MARQUEE_RIGHT_FADE_PX, 28);
+  assert.equal(buildSmoothMarqueeMask(0, 0), "");
+  const revealOnlyMask = buildSmoothMarqueeMask(0, 28);
+  assert.ok(revealOnlyMask.includes("black 0px") && revealOnlyMask.includes("transparent 100%"));
+  const dualMask = buildSmoothMarqueeMask(36, 28);
+  assert.ok(
+    dualMask.includes("transparent 0px") &&
+      dualMask.includes("rgba(0, 0, 0, 0.5) 18px") &&
+      dualMask.includes("black 36px") &&
+      dualMask.includes("black calc(100% - 28px)") &&
+      dualMask.includes("rgba(0, 0, 0, 0.5) calc(100% - 14px)") &&
+      dualMask.includes("transparent 100%"),
+    `expected smoothstep stops on both left and right edges, got: ${dualMask}`,
+  );
+  const leftBands = buildHermiteEdgeFadeAlphas(16, "left");
+  const rightBands = buildHermiteEdgeFadeAlphas(14, "right");
+  assert.equal(leftBands.length, 16);
+  assert.equal(rightBands.length, 14);
+  assert.ok(leftBands[0] > 0.99 && leftBands[leftBands.length - 1] < 0.01);
+  assert.ok(rightBands[0] < 0.01 && rightBands[rightBands.length - 1] > 0.99);
+  for (let i = 1; i < leftBands.length; i += 1) {
+    assert.ok(leftBands[i - 1] > leftBands[i], "left Hermite curtain strictly fades out rightward");
+  }
+  for (let i = 1; i < rightBands.length; i += 1) {
+    assert.ok(rightBands[i - 1] < rightBands[i], "right Hermite curtain strictly fades in rightward");
+  }
 
   // isLikelyStartingEnglish catches real English starts without false-triggering on DSH code/symbols
   assert.equal(isLikelyStartingEnglish("The"), true);
@@ -871,9 +904,12 @@ test("client/thinking-text.ts left-scroll stream normalizer and adaptive cursor 
   // Global assistant Markdown block splitter preserves fenced code blocks, Setext headings,
   // list-to-paragraph transitions, and skips standalone images
   const {
-    ACTIVE_BLOCK_THROTTLE_MS,
+    ASSISTANT_INK_TRAIL_WIDTH,
+    advanceAssistantInkCursor,
+    buildStyledInkTrailSegments,
     isStandaloneMarkdownImage,
-    shouldFlushActiveBlockImmediately,
+    parseAssistantBloomBlock,
+    parseInlineMarkdownRuns,
     shouldMergeToUnifiedMarkdown,
     shouldStartAssistantBloomFromZero,
     splitAssistantMarkdownBlocks,
@@ -939,7 +975,7 @@ test("client/thinking-text.ts left-scroll stream normalizer and adaptive cursor 
       activeBlock: "    const x = 1;\n    const y = 2;",
     },
   );
-  // P1-B: double-buffered unified <Markdown> merge triggers only on completed, settled, multi-block replies
+  // Double-buffered unified <Markdown> merge triggers on completed, settled replies (1+ blocks)
   assert.equal(
     shouldMergeToUnifiedMarkdown({ phase: "streaming", tailSettling: false, blockCount: 3 }),
     false,
@@ -949,9 +985,13 @@ test("client/thinking-text.ts left-scroll stream normalizer and adaptive cursor 
     false,
   );
   assert.equal(
-    shouldMergeToUnifiedMarkdown({ phase: "complete", tailSettling: false, blockCount: 1 }),
+    shouldMergeToUnifiedMarkdown({ phase: "complete", tailSettling: false, blockCount: 0 }),
     false,
-    "single-block replies already render one unified <Markdown> and need no merge",
+  );
+  assert.equal(
+    shouldMergeToUnifiedMarkdown({ phase: "complete", tailSettling: false, blockCount: 1 }),
+    true,
+    "single-block replies (e.g. code fence or link paragraph) also hand off cleanly to <Markdown>",
   );
   assert.equal(
     shouldMergeToUnifiedMarkdown({ phase: "complete", tailSettling: false, blockCount: 2 }),
@@ -978,52 +1018,101 @@ test("client/thinking-text.ts left-scroll stream normalizer and adaptive cursor 
     activeBlock: "```ts\nconst a = 1;",
   });
 
-  // Streaming throttle boundary: immediate flush on complete / newly closed block / first non-empty text
-  assert.equal(ACTIVE_BLOCK_THROTTLE_MS, 64);
+  // Tool-call-aligned ink-trail segments & calm sub-linear cursor (never rushes on fast bursts)
+  assert.equal(ASSISTANT_INK_TRAIL_WIDTH, 15);
+  const inlineRuns = parseInlineMarkdownRuns("请检查 **配置** 与 `config.json` 及 [说明](https://example.com/path)");
+  assert.deepEqual(
+    inlineRuns.map((r) => ({ text: r.text, kind: r.kind })),
+    [
+      { text: "请检查 ", kind: "plain" },
+      { text: "配置", kind: "bold" },
+      { text: " 与 ", kind: "plain" },
+      { text: "config.json", kind: "code" },
+      { text: " 及 ", kind: "plain" },
+      { text: "说明", kind: "link" },
+    ],
+  );
+  // Unclosed trailing inline markers during streaming never leak raw `**` or `(https://...`
+  const streamingRuns = parseInlineMarkdownRuns("正在输入 **加粗半截与 [链接](https://example.com/unclosed");
+  assert.deepEqual(
+    streamingRuns.map((r) => ({ text: r.text, kind: r.kind })),
+    [
+      { text: "正在输入 ", kind: "plain" },
+      { text: "加粗半截与 [链接](https://example.com/unclosed", kind: "bold" },
+    ],
+  );
+  const streamingLinkRuns = parseInlineMarkdownRuns("查看 [文档标题](https://example.com/half");
+  assert.deepEqual(
+    streamingLinkRuns.map((r) => ({ text: r.text, kind: r.kind })),
+    [
+      { text: "查看 ", kind: "plain" },
+      { text: "文档标题", kind: "link" },
+    ],
+  );
+
+  // Intra-word ASCII lookahead prevents mid-word line-wrap jumps without CJK multi-line blank boxes
+  const wordRuns = parseInlineMarkdownRuns("测试 implementation 稳定性");
+  const midWordSegs = buildStyledInkTrailSegments(wordRuns, 7.2, 10, 0);
+  assert.equal(midWordSegs[midWordSegs.length - 1].alpha, 0, "remaining letters of active English word pre-layout transparently");
   assert.equal(
-    shouldFlushActiveBlockImmediately({
-      prevSettledCount: 1,
-      nextSettledCount: 1,
+    midWordSegs.map((s) => s.text).join(""),
+    "测试 implementation",
+    "lookahead stops strictly at the end of the current ASCII word",
+  );
+  const cjkRuns = parseInlineMarkdownRuns("逐字墨迹晕染不会预留整段空白高度");
+  const midCjkSegs = buildStyledInkTrailSegments(cjkRuns, 5.4, 10, 0);
+  assert.ok(
+    midCjkSegs.every((s) => s.alpha > 0),
+    "CJK prose has zero invisible lookahead ahead of the ink-trail tip",
+  );
+  assert.equal(midCjkSegs.map((s) => s.text).join(""), "逐字墨迹晕染");
+
+  // Fast burst streaming (e.g. 25 chars every 60ms = ~416 chars/sec) stays calm (~1–1.6 chars/frame) without rushing
+  let cur = 0;
+  let vel = 0;
+  let target = 0;
+  for (let frame = 0; frame < 30; frame += 1) {
+    if (frame % 4 === 0) target += 25;
+    const prev = cur;
+    const step = advanceAssistantInkCursor({
+      current: cur,
+      target,
+      velocity: vel,
+      dtMs: 16,
       phase: "streaming",
-      hasCommittedText: true,
-      nextActiveText: "继续追加 token",
-    }),
-    false,
-    "steady streaming within the same active block honors the 64ms throttle",
+    });
+    assert.ok(step.cursor > prev, "every 16ms frame advances continuously without stalling");
+    assert.ok(step.cursor - prev < 2.2, "fast burst stays calm (<2.2 chars/frame) instead of rushing");
+    cur = step.cursor;
+    vel = step.velocity;
+  }
+  // Even when a fast model finishes all 160 chars immediately (`phase: "complete"`), bloom stays unhurried
+  const completeBurstStep = advanceAssistantInkCursor({
+    current: 10,
+    target: 160,
+    velocity: 45,
+    dtMs: 16,
+    phase: "complete",
+  });
+  assert.ok(completeBurstStep.velocity < 90, "completed fast burst does not rocket to hundreds of chars/sec");
+  assert.ok(completeBurstStep.cursor - 10 < 1.6, "completed fast burst still advances ~1 char/frame");
+  const codePlan = parseAssistantBloomBlock("```ts\nconst x = 1;\n```");
+  assert.equal(codePlan.kind, "code");
+  assert.equal(codePlan.lang, "ts");
+  assert.equal(codePlan.cpCount, "const x = 1;".length);
+  // Trail alpha decreases monotonically from settled left to leading tip right
+  const trailMonoSegs = buildStyledInkTrailSegments(
+    parseInlineMarkdownRuns("工具调用同款逐字墨迹晕染渐显测试文本"),
+    12.3,
+    10,
+    0,
   );
-  assert.equal(
-    shouldFlushActiveBlockImmediately({
-      prevSettledCount: 1,
-      nextSettledCount: 2,
-      phase: "streaming",
-      hasCommittedText: true,
-      nextActiveText: "新块开头",
-    }),
-    true,
-    "closing a settled block flushes immediately",
-  );
-  assert.equal(
-    shouldFlushActiveBlockImmediately({
-      prevSettledCount: 1,
-      nextSettledCount: 1,
-      phase: "complete",
-      hasCommittedText: true,
-      nextActiveText: "最终定稿",
-    }),
-    true,
-    "phase=complete always flushes synchronously with zero dropped chars",
-  );
-  assert.equal(
-    shouldFlushActiveBlockImmediately({
-      prevSettledCount: 0,
-      nextSettledCount: 0,
-      phase: "streaming",
-      hasCommittedText: false,
-      nextActiveText: "首批文字",
-    }),
-    true,
-    "first non-empty chunk commits immediately without waiting 64ms",
-  );
+  for (let idx = 1; idx < trailMonoSegs.length; idx += 1) {
+    assert.ok(
+      trailMonoSegs[idx - 1].alpha >= trailMonoSegs[idx].alpha,
+      "ink-trail alpha never increases toward the leading edge",
+    );
+  }
 
   // Idle/reload guard keeps reopened conversations animation-free while allowing live bursts
   assert.equal(
@@ -1096,10 +1185,15 @@ test("client/thinking-text.ts left-scroll stream normalizer and adaptive cursor 
   // Bounded LRU eviction & ghost-state resurrection guard
   writeLiveBloomState("id:m-1", {
     everStreamed: true,
+    cursor: 18.4,
+    settledFloor: 8,
+    velocity: 140,
+    unifiedSettled: false,
     revealedBlocks: new Set([0, 1]),
   });
   assert.equal(tracker.has("id:m-1"), true);
   assert.equal(readLiveBloomState("id:m-1")?.revealedBlocks.has(1), true);
+  assert.equal(readLiveBloomState("id:m-1")?.cursor, 18.4);
   // Add two more live keys -> maxKeys=3 evicts the least-recently-used key (`id:m-1`)
   tracker.resolve({ text: "Third reply", messageId: "m-3" }, "streaming");
   tracker.resolve({ text: "Fourth reply", messageId: "m-4" }, "streaming");
@@ -1109,17 +1203,26 @@ test("client/thinking-text.ts left-scroll stream normalizer and adaptive cursor 
   // Late unmount write for an evicted key must be ignored (no ghost leak)
   writeLiveBloomState("id:m-1", {
     everStreamed: true,
+    cursor: 10,
+    settledFloor: 0,
+    velocity: 60,
+    unifiedSettled: false,
     revealedBlocks: new Set([0]),
   });
   assert.equal(readLiveBloomState("id:m-1"), undefined, "evicted key cannot be resurrected by late write");
 
-  // Re-observing a live state key preserves revealedBlocks across remount
+  // Re-observing a live state key preserves cursor & revealedBlocks across remount
   writeLiveBloomState("id:m-4", {
     everStreamed: true,
+    cursor: 42.5,
+    settledFloor: 32,
+    velocity: 185,
+    unifiedSettled: true,
     revealedBlocks: new Set([0, 2]),
   });
   assert.equal(tracker.has("id:m-4"), true);
   assert.equal(readLiveBloomState("id:m-4")?.revealedBlocks.has(2), true);
+  assert.equal(readLiveBloomState("id:m-4")?.unifiedSettled, true);
 
   tracker.dispose();
   assert.equal(tracker.size, 0);

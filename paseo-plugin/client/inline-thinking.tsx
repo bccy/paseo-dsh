@@ -60,10 +60,14 @@ import {
 import { isPreviewReadyForTranslation } from "../shared/translate-text";
 import {
   EXPANDED_BLOOM_WAVE_WIDTH,
+  MARQUEE_LEFT_FADE_PX,
+  MARQUEE_RIGHT_FADE_PX,
   advanceExpandedInkCursor,
   advanceLeftScrollCursor,
   advanceSmoothPixelOffset,
   buildExpandedBloomSegments,
+  buildHermiteEdgeFadeAlphas,
+  buildSmoothMarqueeMask,
   computeSmoothMarqueeDurationMs,
   countCodePoints,
   findSettledBodySplit,
@@ -323,7 +327,8 @@ const useCommitLayoutEffect =
 /** Maximum trailing characters kept in Native fallback / Web marquee text node. */
 const LEFT_SCROLL_DOM_WINDOW_CHARS = 180;
 const WEB_MARQUEE_MAX_CHARS = 4000;
-const WEB_LEFT_FADE_MASK = "linear-gradient(to right, transparent 0px, black 14px, black 100%)";
+const NATIVE_LEFT_FADE_ALPHAS = buildHermiteEdgeFadeAlphas(16, "left");
+const NATIVE_RIGHT_FADE_ALPHAS = buildHermiteEdgeFadeAlphas(14, "right");
 
 interface WebMarqueeDomNode {
   clientWidth?: number;
@@ -345,7 +350,16 @@ interface WebMarqueeSlot {
 interface SmoothMarqueeController {
   readonly text: string;
   readonly active: boolean;
+  readonly lineWidth: number;
   readonly register: (slot: WebMarqueeSlot) => () => void;
+}
+
+function setDomMask(node: WebMarqueeDomNode, mask: string): void {
+  if (!node.style) return;
+  if ((node.style.maskImage ?? "") !== mask) {
+    node.style.maskImage = mask;
+    node.style.webkitMaskImage = mask;
+  }
 }
 
 /**
@@ -357,6 +371,7 @@ function useSmoothWebMarquee(
   source: string,
   active: boolean,
   keepAlive: boolean,
+  lineWidth: number,
   resetKey: string | number,
 ): SmoothMarqueeController {
   const isWeb =
@@ -373,6 +388,8 @@ function useSmoothWebMarquee(
   const revealedPxRef = useRef<number>(0);
   const lastFrameRef = useRef<number>(0);
   const rafRef = useRef<number | null>(null);
+  const lineWidthRef = useRef<number>(lineWidth);
+  lineWidthRef.current = lineWidth;
   const activeRef = useRef<boolean>(isWeb && active && text !== "");
   const prevResetKeyRef = useRef<string | number>(resetKey);
   const prevKeepAliveRef = useRef<boolean>(keepAlive);
@@ -394,25 +411,28 @@ function useSmoothWebMarquee(
     const clip = slot.clip;
     const inner = slot.inner;
     if (!outer || !clip || !inner || !clip.style || !inner.style || !outer.style) return;
-    const containerW = outer.clientWidth ?? 0;
+    const containerW =
+      lineWidthRef.current > 0 ? lineWidthRef.current : (outer.clientWidth ?? 0);
     const contentW = inner.scrollWidth ?? 0;
     if (containerW <= 0 || contentW <= 0) return;
+
+    const maxLeft = Math.min(MARQUEE_LEFT_FADE_PX, Math.max(12, Math.floor(containerW * 0.28)));
+    const maxRight = Math.min(MARQUEE_RIGHT_FADE_PX, Math.max(12, Math.floor(containerW * 0.24)));
     const clampedRevealed = Math.min(contentW, Math.max(0, revealedPx));
+
     if (clampedRevealed <= containerW) {
       clip.style.width = `${clampedRevealed.toFixed(2)}px`;
       inner.style.transform = "translate3d(0px, 0, 0)";
-      if (outer.style.maskImage) {
-        outer.style.maskImage = "";
-        outer.style.webkitMaskImage = "";
-      }
+      setDomMask(outer, "");
+      const revealRightFade = Math.min(maxRight, clampedRevealed * 0.72);
+      setDomMask(clip, buildSmoothMarqueeMask(0, revealRightFade));
     } else {
       const offsetPx = clampedRevealed - containerW;
       clip.style.width = "100%";
       inner.style.transform = `translate3d(${(-offsetPx).toFixed(2)}px, 0, 0)`;
-      if (outer.style.maskImage !== WEB_LEFT_FADE_MASK) {
-        outer.style.maskImage = WEB_LEFT_FADE_MASK;
-        outer.style.webkitMaskImage = WEB_LEFT_FADE_MASK;
-      }
+      setDomMask(clip, "");
+      const leftFade = Math.min(maxLeft, offsetPx);
+      setDomMask(outer, buildSmoothMarqueeMask(leftFade, maxRight));
     }
   };
 
@@ -498,7 +518,7 @@ function useSmoothWebMarquee(
       return;
     }
     startLoopRef.current();
-  }, [effectiveActive, keepAlive, text, resetKey]);
+  }, [effectiveActive, keepAlive, text, lineWidth, resetKey]);
 
   const register = useMemo(
     () => (slot: WebMarqueeSlot) => {
@@ -513,7 +533,7 @@ function useSmoothWebMarquee(
     [],
   );
 
-  return { text, active: effectiveActive, register };
+  return { text, active: effectiveActive, lineWidth, register };
 }
 
 function SmoothMarqueeLine({
@@ -535,8 +555,9 @@ function SmoothMarqueeLine({
         slotRef.current.outer = node as unknown as WebMarqueeDomNode | null;
       }}
       style={{
-        flex: 1,
-        minWidth: 0,
+        ...(controller.lineWidth > 0
+          ? { width: controller.lineWidth, flexShrink: 0 }
+          : { flex: 1, minWidth: 0 }),
         overflow: "hidden",
         flexDirection: "row",
         alignItems: "center",
@@ -559,7 +580,13 @@ function SmoothMarqueeLine({
           }}
           style={[
             style,
-            { flex: 0, flexShrink: 0, whiteSpace: "nowrap", willChange: "transform" } as unknown as TextStyle,
+            {
+              flex: 0,
+              flexShrink: 0,
+              paddingRight: MARQUEE_RIGHT_FADE_PX,
+              whiteSpace: "nowrap",
+              willChange: "transform",
+            } as unknown as TextStyle,
           ]}
         >
           {controller.text}
@@ -581,9 +608,12 @@ interface NativeMarqueeController {
   readonly retiredCount: number;
   readonly retiredWidth: number;
   readonly mountedChunks: readonly string[];
+  readonly hasTailPad: boolean;
   readonly trackWidth: number;
   readonly clipX: Animated.AnimatedInterpolation<number> | null;
   readonly innerX: Animated.AnimatedInterpolation<number> | null;
+  readonly leftFadeOpacity: Animated.AnimatedInterpolation<number> | null;
+  readonly rightFadeOpacity: Animated.AnimatedInterpolation<number> | null;
   readonly onChunkLayout: (chunkIndex: number, width: number) => void;
 }
 
@@ -731,9 +761,16 @@ function useNativeSmoothMarquee(
     const { retiredCount: rCount, retiredWidth: rWidth } = retireStateRef.current;
     const endIdx = Math.min(allChunksLenRef.current, rCount + NATIVE_MARQUEE_MAX_MOUNTED_CHUNKS);
     let sum = rWidth;
+    let measuredCount = 0;
     for (let i = rCount; i < endIdx; i += 1) {
       const w = chunkWidthsRef.current[i];
-      if (typeof w === "number" && w > 0) sum += w;
+      if (typeof w === "number" && w > 0) {
+        sum += w;
+        measuredCount += 1;
+      }
+    }
+    if (measuredCount > 0 && endIdx >= allChunksLenRef.current) {
+      sum += MARQUEE_RIGHT_FADE_PX;
     }
     return sum;
   };
@@ -920,8 +957,15 @@ function useNativeSmoothMarquee(
   const interpolations = useMemo(() => {
     const revealed = revealedRef.current;
     if (!canUseNative || !revealed || lineWidth <= 0) {
-      return { clipX: null, innerX: null };
+      return {
+        clipX: null,
+        innerX: null,
+        leftFadeOpacity: null,
+        rightFadeOpacity: null,
+      };
     }
+    const leftEdgeW = Math.min(MARQUEE_LEFT_FADE_PX, Math.max(12, Math.floor(lineWidth * 0.28)));
+    const rightEdgeW = Math.min(MARQUEE_RIGHT_FADE_PX, Math.max(12, Math.floor(lineWidth * 0.24)));
     const clipX = revealed.interpolate({
       inputRange: [0, lineWidth],
       outputRange: [-lineWidth, 0],
@@ -934,7 +978,19 @@ function useNativeSmoothMarquee(
       extrapolateLeft: "extend",
       extrapolateRight: "extend",
     });
-    return { clipX, innerX };
+    const leftFadeOpacity = revealed.interpolate({
+      inputRange: [lineWidth, lineWidth + leftEdgeW],
+      outputRange: [0, 1],
+      extrapolateLeft: "clamp",
+      extrapolateRight: "clamp",
+    });
+    const rightFadeOpacity = revealed.interpolate({
+      inputRange: [0, rightEdgeW],
+      outputRange: [0, 1],
+      extrapolateLeft: "clamp",
+      extrapolateRight: "clamp",
+    });
+    return { clipX, innerX, leftFadeOpacity, rightFadeOpacity };
   }, [canUseNative, lineWidth]);
 
   const mountedChunks = useMemo(() => {
@@ -945,10 +1001,19 @@ function useNativeSmoothMarquee(
     );
   }, [effectiveActive, allChunks, effectiveRetiredCount]);
 
+  const hasTailPad =
+    effectiveActive &&
+    mountedChunks.length > 0 &&
+    effectiveRetiredCount + mountedChunks.length >= allChunks.length;
+
   let activeCharCount = 0;
   for (const chunk of mountedChunks) activeCharCount += chunk.length;
   const trackWidth = Math.ceil(
-    effectiveRetiredWidth + activeCharCount * ROW_FONT_SIZE * 1.6 + lineWidth + 200,
+    effectiveRetiredWidth +
+      activeCharCount * ROW_FONT_SIZE * 1.6 +
+      lineWidth +
+      MARQUEE_RIGHT_FADE_PX +
+      200,
   );
 
   return {
@@ -958,9 +1023,12 @@ function useNativeSmoothMarquee(
     retiredCount: effectiveRetiredCount,
     retiredWidth: effectiveRetiredWidth,
     mountedChunks,
+    hasTailPad,
     trackWidth,
     clipX: interpolations.clipX,
     innerX: interpolations.innerX,
+    leftFadeOpacity: interpolations.leftFadeOpacity,
+    rightFadeOpacity: interpolations.rightFadeOpacity,
     onChunkLayout,
   };
 }
@@ -2244,6 +2312,7 @@ export function InlineThinking({
     scrollSource,
     isLiveCollapsedStream && scrollSource !== "",
     growing,
+    lineWidth,
     translateRowEpoch,
   );
   const nativeMarquee = useNativeSmoothMarquee(
@@ -2317,6 +2386,7 @@ export function InlineThinking({
         minHeight: style.toolRowMinHeight,
       },
       main: {
+        position: "relative" as const,
         flex: 1,
         minWidth: 0,
         flexDirection: "row" as const,
@@ -2485,6 +2555,13 @@ export function InlineThinking({
                 </>
               )}
             </TextShimmer>
+            {!open && nativeMarquee.active ? (
+              <NativeMarqueeEdgeVeil
+                controller={nativeMarquee}
+                surfaceColor={theme.colors.surface0}
+                offsetLeft={labelWidth + style.toolRowGap}
+              />
+            ) : null}
           </View>
           {open && (effectiveFullTranslation !== "" || translationPending) ? (
             <Pressable
@@ -2638,6 +2715,137 @@ function NativeSmoothMarqueeLine({
               </Text>
             );
           })}
+          {controller.hasTailPad ? (
+            <View
+              style={{
+                width: MARQUEE_RIGHT_FADE_PX,
+                height: 1,
+                flexShrink: 0,
+              }}
+            />
+          ) : null}
+        </Animated.View>
+      </Animated.View>
+    </View>
+  );
+}
+
+/**
+ * GPU-driven (`useNativeDriver: true`) dual-edge Hermite `surface0` curtains
+ * mounted above `TextShimmer` on iOS/Android so both base scrolling text and
+ * `SweepNative`'s shimmer slices dissolve smoothly with zero cut line.
+ */
+function NativeMarqueeEdgeVeil({
+  controller,
+  surfaceColor,
+  offsetLeft,
+}: {
+  controller: NativeMarqueeController;
+  surfaceColor: string;
+  offsetLeft: number;
+}) {
+  const leftWidth = Math.min(
+    MARQUEE_LEFT_FADE_PX,
+    Math.max(12, Math.floor(controller.lineWidth * 0.28)),
+  );
+  const rightWidth = Math.min(
+    MARQUEE_RIGHT_FADE_PX,
+    Math.max(12, Math.floor(controller.lineWidth * 0.24)),
+  );
+
+  const leftBands = useMemo(
+    () =>
+      NATIVE_LEFT_FADE_ALPHAS.map((alpha, idx) => {
+        const tinted = withAlpha(surfaceColor, alpha);
+        return (
+          <View
+            key={idx}
+            style={
+              tinted !== "transparent"
+                ? { flex: 1, backgroundColor: tinted }
+                : { flex: 1, backgroundColor: surfaceColor, opacity: alpha }
+            }
+          />
+        );
+      }),
+    [surfaceColor],
+  );
+
+  const rightBands = useMemo(
+    () =>
+      NATIVE_RIGHT_FADE_ALPHAS.map((alpha, idx) => {
+        const tinted = withAlpha(surfaceColor, alpha);
+        return (
+          <View
+            key={idx}
+            style={
+              tinted !== "transparent"
+                ? { flex: 1, backgroundColor: tinted }
+                : { flex: 1, backgroundColor: surfaceColor, opacity: alpha }
+            }
+          />
+        );
+      }),
+    [surfaceColor],
+  );
+
+  if (
+    !controller.clipX ||
+    !controller.leftFadeOpacity ||
+    !controller.rightFadeOpacity ||
+    controller.lineWidth <= 0
+  ) {
+    return null;
+  }
+
+  return (
+    <View
+      pointerEvents="none"
+      aria-hidden
+      style={{
+        position: "absolute",
+        top: 0,
+        bottom: 0,
+        left: offsetLeft,
+        width: controller.lineWidth,
+        overflow: "hidden",
+      }}
+    >
+      <Animated.View
+        style={{
+          position: "absolute",
+          top: 0,
+          bottom: 0,
+          left: 0,
+          width: leftWidth,
+          flexDirection: "row",
+          opacity: controller.leftFadeOpacity,
+        }}
+      >
+        {leftBands}
+      </Animated.View>
+      <Animated.View
+        style={{
+          position: "absolute",
+          top: 0,
+          bottom: 0,
+          left: 0,
+          width: controller.lineWidth,
+          transform: [{ translateX: controller.clipX }],
+        }}
+      >
+        <Animated.View
+          style={{
+            position: "absolute",
+            top: 0,
+            bottom: 0,
+            right: 0,
+            width: rightWidth,
+            flexDirection: "row",
+            opacity: controller.rightFadeOpacity,
+          }}
+        >
+          {rightBands}
         </Animated.View>
       </Animated.View>
     </View>

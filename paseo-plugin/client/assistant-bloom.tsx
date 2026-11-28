@@ -1,38 +1,31 @@
 /**
- * Zero-flash, native-GPU soft-mist renderer for live streaming assistant replies.
+ * Tool-call-aligned left-to-right `rgba` ink-trail bloom renderer for live
+ * streaming assistant replies (`InlineToolCall` visual signature, zero jank).
  *
  * Architecture:
- * 1. **100% real Paseo `<Markdown>`**: every block renders through Paseo's host
- *    `<Markdown>` component, automatically inheriting the user's Appearance
- *    font size, font family, `density.blockGap`, `accentBright`, workspace file
- *    links, tables, code blocks, and native text selection.
- * 2. **Stable-index block freezing + double-buffered unified merge**:
- *    - During streaming, `splitStableMarkdownBlocks` splits the stream into
- *      `settledBlocks` (frozen behind `React.memo` at stable indices so earlier
- *      blocks NEVER re-parse when new tokens arrive) plus one trailing
- *      `activeBlock` throttled to `64ms` (~15 Hz) with immediate synchronous
- *      flush on new block boundaries or `phase === "complete"`.
- *    - Once `phase === "complete"` and the 280ms mist settle window finishes on
- *      a multi-block reply, a single unified `<Markdown>{text}</Markdown>` is
- *      pre-warmed off-flow at `opacity: 0` inside the exact same plugin row.
- *      Only after its `onLayout(height > 0)` (or 120ms safety fallback) confirms
- *      iOS `EnrichedMarkdown` AST parsing has landed does it swap in at
- *      `opacity: 1` and unmount the split blocks — restoring full Markdown
- *      fidelity (reference links `[x][1]`, cross-paragraph selection, loose
- *      lists) with 0 flash and 0 LegendList ID swap.
- * 3. **120Hz native GPU mist veil (zero JS `requestAnimationFrame` loops)**:
- *    - Newly appearing blocks wait for `onLayout(height > 0)` (masking iOS
- *      `EnrichedMarkdown` async AST first-frame blank) before running a 280ms
- *      ease-out cubic `opacity: 0 -> 1` native-driver fade (with 55ms batch
- *      stagger capped at 275ms).
- *    - While streaming (and for a 280ms settle window on completion), a 5-band
- *      `theme.colors.surface0` soft mist curtain overlays the active block's
- *      bottom ~56px (`pointerEvents="none"`) and glides smoothly away via
- *      `Animated.parallel` (`useNativeDriver: true`) whenever new lines arrive,
- *      then unmounts completely when idle (0 extra GPU layers at rest).
- * 4. **Native Paseo >= 0.18.1 Turn Footer**: Paseo automatically attaches its
- *    native Copy Result / Fork / Turn Timing footer to this plugin row via
- *    `source: item`, so we draw zero duplicate footer chrome.
+ * 1. **1:1 ink-trail bloom with `InlineToolCall`**:
+ *    - Uses the exact same left-to-right character ink-fade curve (`10` code
+ *      points, Hermite smoothstep `0.04 -> 1.0` `rgba(...)` text alpha + subtle
+ *      leading edge sheen) as `renderInkTrailText` on tool rows — replacing the
+ *      old bottom-rectangle fog overlay and `64ms` chunk-throttled `<Markdown>`.
+ *    - Works identically on iOS `NSAttributedString`, Android, Desktop, and Web
+ *      using pure React Native `<Text>` / `<View>` primitives (zero DOM globals).
+ * 2. **Zero word-skipping & zero fast-output stutter (`O(1)` per frame)**:
+ *    - `advanceAssistantInkCursor` smooths velocity exponentially (`~45ms` tau)
+ *      over a `~180ms` proportional catch-up horizon so bursty/fast network
+ *      chunks (`50–600+ chars/sec`) glide continuously frame-by-frame without
+ *      skipping words or stalling between chunks.
+ *    - Zero `<Markdown>` AST / syntax-highlight parses run during active
+ *      streaming: blocks are tokenized incrementally once per block change with
+ *      pre-computed UTF-16 code-point offsets, settled blocks freeze behind
+ *      `React.memo` with `0.0px` mid-stream layout shift, and each active frame
+ *      slices at most `10` trail glyphs.
+ * 3. **Zero-flash double-buffered `<Markdown>` handoff on completion**:
+ *    - Once `phase === "complete"` and the ink-trail cursor finishes settling,
+ *      a single unified `<Markdown>{text}</Markdown>` pre-warms off-flow at
+ *      `opacity: 0` inside the same `dsh-assistant-bloom` row and swaps in only
+ *      after `onLayout(height > 0)` (or `120ms` fallback), preserving Paseo's
+ *      native Copy / Fork / Turn Timing footer with zero `LegendList` ID swap.
  *
  * @module dsh-paseo/client/assistant-bloom
  */
@@ -42,17 +35,20 @@ import {
   memo,
   useCallback,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import {
   Animated,
   Easing,
   Platform,
+  StyleSheet,
+  Text,
   View,
   type LayoutChangeEvent,
+  type TextStyle,
 } from "react-native";
 import {
   readLiveBloomState,
@@ -61,14 +57,22 @@ import {
 } from "./assistant-bloom-handoff";
 import { normalizeRowTimestamp, yieldRowPulse } from "./newest";
 import {
+  BLOOM_HANDOFF_SPEED_BOOST,
   clearActiveBloom,
   markAgentLiveActivity,
   reportActiveBloom,
 } from "./row-cascade";
+import { STREAM_FRAME_INTERVAL_MS, buildInkTrailSegments } from "./stream-reveal";
 import {
-  ACTIVE_BLOCK_THROTTLE_MS,
+  ASSISTANT_INK_TRAIL_WIDTH,
+  type AssistantBloomBlockPlan,
+  type AssistantBloomListItem,
+  type IndexedInlineRun,
+  type InlineBloomKind,
+  advanceAssistantInkCursor,
+  buildStyledInkTrailSegments,
   countCodePoints,
-  shouldFlushActiveBlockImmediately,
+  parseAssistantBloomBlock,
   shouldMergeToUnifiedMarkdown,
   shouldStartAssistantBloomFromZero,
   splitStableMarkdownBlocks,
@@ -81,28 +85,14 @@ export interface AssistantBloomData {
   bloomKey?: string;
 }
 
-const BLOCK_ENTRANCE_DURATION_MS = 280;
-const BLOCK_STAGGER_STEP_MS = 55;
-const BLOCK_STAGGER_MAX_MS = 275;
-const BLOCK_LAYOUT_FALLBACK_MS = 120;
+const ROW_ENTRANCE_DURATION_MS = 220;
 const UNIFIED_MERGE_FALLBACK_MS = 120;
-const MIST_VEIL_HEIGHT_PX = 56;
-const MIST_VEIL_DURATION_MS = 300;
-const MIST_TAIL_SETTLE_MS = 280;
-const MIST_TEXT_GROWTH_THRESHOLD = 14;
-const MIST_RETRIGGER_COOLDOWN_MS = 140;
-/** Throttle interval (ms) for publishing active-bloom handoff hints to `row-cascade`. */
-const CASCADE_REPORT_THROTTLE_MS = 120;
-const CASCADE_REPORT_REMAINING_MS = 200;
-/** Heartbeat interval (ms) to keep `row-cascade`'s 15s live-activity window fresh on long streams. */
+const CASCADE_REPORT_THROTTLE_MS = 100;
 const LIVE_ACTIVITY_HEARTBEAT_MS = 5_000;
-
-/** 5 stepped horizontal bands (top -> bottom) forming a wide ~56px mist curtain. */
-const MIST_BAND_ALPHAS = [0.08, 0.24, 0.48, 0.76, 0.96] as const;
-
-const WEB_BLOOM_STYLE_ID = "dsh-assistant-bloom-styles";
-const WEB_BLOCK_ENTER_TEST_ID = "dsh-bloom-block-enter";
-const WEB_MIST_SWEEP_TEST_ID = "dsh-bloom-mist-sweep";
+/** ~60fps VSync emit interval (14ms avoids 15.9ms<16ms 60Hz jitter skips while capping 120Hz cleanly). */
+const INK_EMIT_INTERVAL_MS = 14;
+/** Number of settled lines per frozen `<StaticCodeChunk>` inside long streaming code blocks. */
+const CODE_CHUNK_LINES = 16;
 
 const ROOT_STYLE = { position: "relative" as const, paddingTop: 4, paddingBottom: 4 };
 const UNIFIED_PREWARM_STYLE = {
@@ -113,16 +103,20 @@ const UNIFIED_PREWARM_STYLE = {
   opacity: 0,
 };
 
-interface WebStyleElement {
-  id: string;
-  textContent: string | null;
-}
+const MONO_FONT =
+  Platform?.OS === "ios" ? "Menlo" : Platform?.OS === "android" ? "monospace" : "monospace";
+const HAIRLINE_WIDTH =
+  typeof StyleSheet?.hairlineWidth === "number" && StyleSheet.hairlineWidth > 0
+    ? StyleSheet.hairlineWidth
+    : 0.5;
 
-interface WebStyleDocument {
-  getElementById?: (id: string) => unknown;
-  createElement?: (tag: string) => WebStyleElement;
-  head?: { appendChild?: (el: WebStyleElement) => void };
-  documentElement?: { appendChild?: (el: WebStyleElement) => void };
+interface BloomPalette {
+  readonly foreground: string;
+  readonly foregroundMuted: string;
+  readonly accent: string;
+  readonly surface1: string;
+  readonly surface2: string;
+  readonly border: string;
 }
 
 function isWebPlatform(): boolean {
@@ -138,400 +132,671 @@ function canUseNativeAnimated(): boolean {
   );
 }
 
-function easeOutCubic() {
-  return typeof Easing?.out === "function" && Easing?.cubic
-    ? Easing.out(Easing.cubic)
-    : undefined;
-}
-
-function ensureWebBloomStyles(): void {
-  const doc = (globalThis as { document?: WebStyleDocument }).document;
-  if (!doc || typeof doc.getElementById !== "function" || doc.getElementById(WEB_BLOOM_STYLE_ID)) {
-    return;
+function prefersReducedMotion(): boolean {
+  const win = (globalThis as Record<string, unknown>)["window"] as
+    | { matchMedia?: (query: string) => { matches?: boolean } | null }
+    | undefined;
+  try {
+    return win?.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches === true;
+  } catch {
+    return false;
   }
-  const head = doc.head ?? doc.documentElement;
-  if (!head || typeof head.appendChild !== "function" || typeof doc.createElement !== "function") {
-    return;
+}
+
+function nowMs(): number {
+  const perf = (globalThis as { performance?: { now?: () => number } }).performance;
+  return typeof perf?.now === "function" ? perf.now() : Date.now();
+}
+
+function commonUtf16PrefixLength(a: string, b: string): number {
+  const max = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < max && a.charCodeAt(i) === b.charCodeAt(i)) i += 1;
+  if (i > 0 && i < max) {
+    const prev = a.charCodeAt(i - 1);
+    if (prev >= 0xd800 && prev <= 0xdbff) i -= 1;
   }
-  const style = doc.createElement("style");
-  style.id = WEB_BLOOM_STYLE_ID;
-  style.textContent = [
-    `@keyframes dsh-bloom-fade-in{from{opacity:0}to{opacity:1}}`,
-    `@keyframes dsh-bloom-mist-sweep{0%{opacity:0.95;transform:translateY(-10px)}100%{opacity:0;transform:translateY(12px)}}`,
-    `[data-testid="${WEB_BLOCK_ENTER_TEST_ID}"]{animation:dsh-bloom-fade-in ${BLOCK_ENTRANCE_DURATION_MS}ms cubic-bezier(0.215,0.61,0.355,1) both}`,
-    `[data-testid="${WEB_MIST_SWEEP_TEST_ID}"]{animation:dsh-bloom-mist-sweep ${MIST_VEIL_DURATION_MS}ms cubic-bezier(0.215,0.61,0.355,1) forwards}`,
-  ].join("\n");
-  head.appendChild(style);
-}
-
-// Eagerly inject Web CSS keyframes at module load so the very first mounted
-// block never flashes unstyled for one frame before effects commit.
-if (
-  isWebPlatform() &&
-  typeof (globalThis as { document?: WebStyleDocument }).document !== "undefined"
-) {
-  ensureWebBloomStyles();
-}
-
-const useIsomorphicLayoutEffect =
-  typeof (globalThis as { document?: unknown }).document !== "undefined"
-    ? useLayoutEffect
-    : useEffect;
-
-/**
- * Throttles active trailing-block updates to `ACTIVE_BLOCK_THROTTLE_MS` (~15 Hz)
- * while streaming, and flushes synchronously with zero latency whenever a new
- * settled block closes or `phase` reaches `"complete"`.
- */
-function useThrottledActiveBlock(
-  activeBlock: string,
-  settledCount: number,
-  phase: "streaming" | "complete",
-  active: boolean,
-): string {
-  const [committed, setCommitted] = useState<string>(activeBlock);
-  const lastCommitAtRef = useRef<number>(Date.now());
-  const prevSettledCountRef = useRef<number>(settledCount);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const immediate =
-    !active ||
-    shouldFlushActiveBlockImmediately({
-      prevSettledCount: prevSettledCountRef.current,
-      nextSettledCount: settledCount,
-      phase,
-      hasCommittedText: committed.length > 0,
-      nextActiveText: activeBlock,
-    });
-
-  useEffect(() => {
-    prevSettledCountRef.current = settledCount;
-    if (immediate) {
-      if (timerRef.current !== null) {
-        clearTimeout(timerRef.current);
-        timerRef.current = null;
-      }
-      lastCommitAtRef.current = Date.now();
-      setCommitted(activeBlock);
-      return;
-    }
-
-    if (activeBlock === committed) return;
-
-    const now = Date.now();
-    const elapsed = now - lastCommitAtRef.current;
-    if (elapsed >= ACTIVE_BLOCK_THROTTLE_MS) {
-      if (timerRef.current !== null) {
-        clearTimeout(timerRef.current);
-        timerRef.current = null;
-      }
-      lastCommitAtRef.current = now;
-      setCommitted(activeBlock);
-      return;
-    }
-
-    if (timerRef.current !== null) {
-      clearTimeout(timerRef.current);
-    }
-    const waitMs = Math.max(1, ACTIVE_BLOCK_THROTTLE_MS - elapsed);
-    timerRef.current = setTimeout(() => {
-      timerRef.current = null;
-      lastCommitAtRef.current = Date.now();
-      setCommitted(activeBlock);
-    }, waitMs);
-  }, [activeBlock, settledCount, immediate, committed]);
-
-  useEffect(() => {
-    return () => {
-      if (timerRef.current !== null) {
-        clearTimeout(timerRef.current);
-        timerRef.current = null;
-      }
-    };
-  }, []);
-
-  return immediate ? activeBlock : committed;
-}
-
-interface MistVeilOverlayProps {
-  readonly surfaceColor: string;
-  readonly pulseId: number;
-  readonly intensity: number;
+  return i;
 }
 
 /**
- * Wide (~56px) 5-band stepped soft-mist frontier built strictly from host
- * `theme.colors.surface0` `View` bands (no SVG/MaskedView required).
- * Animated purely on the native GPU driver (or Web CSS keyframes) and unmounted
- * completely once streaming settles.
+ * Apply true `rgba(...)` alpha multiplication so nested `<Text>` spans dissolve
+ * natively on iOS `NSAttributedString` (where `style.opacity` is ignored),
+ * Android, and Web — matching `renderInkTrailText` in `row-entrance.tsx`.
  */
-const MistVeilOverlay = memo(function MistVeilOverlay({
-  surfaceColor,
-  pulseId,
-  intensity,
-}: MistVeilOverlayProps) {
-  const web = isWebPlatform();
-  const nativeAnim = canUseNativeAnimated();
-  const opacityRef = useRef<InstanceType<typeof Animated.Value> | null>(null);
-  const translateYRef = useRef<InstanceType<typeof Animated.Value> | null>(null);
-  const runningRef = useRef<Animated.CompositeAnimation | null>(null);
-
-  if (nativeAnim) {
-    if (opacityRef.current === null) opacityRef.current = new Animated.Value(0);
-    if (translateYRef.current === null) translateYRef.current = new Animated.Value(0);
+function tintInkColor(color: string, alpha: number): string {
+  const clamped = Math.max(0, Math.min(1, alpha));
+  const rgbaMatch =
+    /^rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9.]+)\s*\)$/i.exec(color.trim());
+  if (rgbaMatch !== null) {
+    const baseA = Number.parseFloat(rgbaMatch[4]!);
+    const nextA = Number.isFinite(baseA) ? Math.max(0, Math.min(1, baseA * clamped)) : clamped;
+    return `rgba(${rgbaMatch[1]}, ${rgbaMatch[2]}, ${rgbaMatch[3]}, ${Number(nextA.toFixed(3))})`;
   }
+  return withAlpha(color, Number(clamped.toFixed(3)));
+}
 
-  useIsomorphicLayoutEffect(() => {
-    if (web) ensureWebBloomStyles();
-  }, [web]);
+function inlineKindStyle(kind: InlineBloomKind, baseFontSize: number): TextStyle | undefined {
+  switch (kind) {
+    case "bold":
+      return { fontWeight: "600" };
+    case "italic":
+      return { fontStyle: "italic" };
+    case "boldItalic":
+      return { fontWeight: "600", fontStyle: "italic" };
+    case "code":
+      return {
+        fontFamily: MONO_FONT,
+        fontSize: Math.max(12, baseFontSize - 1.5),
+      };
+    case "strike":
+      return { textDecorationLine: "line-through" };
+    case "link":
+    case "plain":
+    default:
+      return undefined;
+  }
+}
 
-  useEffect(() => {
-    if (!nativeAnim || pulseId <= 0 || !opacityRef.current || !translateYRef.current) return;
-    runningRef.current?.stop();
-    const startOpacity = Math.max(0.45, Math.min(0.95, intensity));
-    opacityRef.current.setValue(startOpacity);
-    translateYRef.current.setValue(-10);
-    const easing = easeOutCubic();
-    const anim = Animated.parallel([
-      Animated.timing(opacityRef.current, {
-        toValue: 0,
-        duration: MIST_VEIL_DURATION_MS,
-        useNativeDriver: true,
-        ...(easing !== undefined ? { easing } : {}),
-      }),
-      Animated.timing(translateYRef.current, {
-        toValue: 12,
-        duration: MIST_VEIL_DURATION_MS,
-        useNativeDriver: true,
-        ...(easing !== undefined ? { easing } : {}),
-      }),
-    ]);
-    runningRef.current = anim;
-    anim.start(({ finished }) => {
-      if (finished && runningRef.current === anim) {
-        runningRef.current = null;
-      }
-    });
-    return () => {
-      anim.stop();
-    };
-  }, [nativeAnim, pulseId, intensity]);
+function headingMetrics(
+  level: 1 | 2 | 3 | 4 | 5 | 6,
+  baseFontSize: number,
+): { fontSize: number; lineHeight: number } {
+  const scale =
+    level === 1 ? 1.32 : level === 2 ? 1.2 : level === 3 ? 1.1 : level === 4 ? 1.04 : 1.0;
+  const fontSize = Math.round(baseFontSize * scale);
+  const lineHeight = Math.round(fontSize * 1.38);
+  return { fontSize, lineHeight };
+}
 
-  const bands = useMemo(
-    () =>
-      MIST_BAND_ALPHAS.map((alpha, idx) => {
-        const tinted = withAlpha(surfaceColor, alpha);
-        const style =
-          tinted !== "transparent"
-            ? { flex: 1 as const, backgroundColor: tinted }
-            : { flex: 1 as const, backgroundColor: surfaceColor, opacity: alpha };
-        return <View key={idx} style={style} />;
-      }),
-    [surfaceColor],
+function renderInlineRuns(
+  runs: readonly IndexedInlineRun[],
+  progressChars: number,
+  settledFloor: number,
+  palette: BloomPalette,
+  baseFontSize: number,
+  defaultColor: string,
+  highlightColor: string,
+): ReactNode {
+  if (runs.length === 0) return null;
+  const segments = buildStyledInkTrailSegments(
+    runs,
+    progressChars,
+    ASSISTANT_INK_TRAIL_WIDTH,
+    settledFloor,
   );
+  if (segments.length === 0) return null;
+  if (
+    segments.length === 1 &&
+    segments[0]!.alpha >= 1 &&
+    segments[0]!.kind === "plain"
+  ) {
+    return segments[0]!.text;
+  }
 
-  if (pulseId <= 0) return null;
+  return segments.map((seg, idx) => {
+    const extra = inlineKindStyle(seg.kind, baseFontSize);
+    const targetColor = seg.kind === "link" ? palette.accent : defaultColor;
 
-  if (web) {
+    if (seg.alpha >= 1) {
+      if (seg.kind === "plain" && targetColor === defaultColor) {
+        return seg.text;
+      }
+      return (
+        <Text
+          key={idx}
+          style={[
+            extra,
+            seg.kind === "link" ? { color: palette.accent } : undefined,
+            seg.kind === "code" ? { backgroundColor: palette.surface2 } : undefined,
+          ]}
+        >
+          {seg.text}
+        </Text>
+      );
+    }
+
+    if (seg.alpha <= 0.005) {
+      return (
+        <Text key={idx} style={[extra, { color: "transparent" }]}>
+          {seg.text}
+        </Text>
+      );
+    }
+
+    const rawColor =
+      seg.kind === "link"
+        ? palette.accent
+        : seg.highlight > 0
+          ? highlightColor
+          : targetColor;
+    const segAlpha =
+      seg.highlight === 1 && highlightColor !== targetColor
+        ? Number((seg.alpha * 0.92).toFixed(3))
+        : seg.alpha;
+    const tinted = tintInkColor(rawColor, segAlpha);
+    const codeBg =
+      seg.kind === "code" ? tintInkColor(palette.surface2, segAlpha) : undefined;
+
+    return (
+      <Text
+        key={idx}
+        style={[
+          extra,
+          tinted !== "transparent" ? { color: tinted } : { opacity: segAlpha, color: rawColor },
+          codeBg && codeBg !== "transparent" ? { backgroundColor: codeBg } : undefined,
+        ]}
+      >
+        {seg.text}
+      </Text>
+    );
+  });
+}
+
+function renderListMarkerTrail(
+  marker: string,
+  progressChars: number,
+  settledFloor: number,
+  palette: BloomPalette,
+): ReactNode {
+  if (!Number.isFinite(progressChars) || progressChars >= marker.length + ASSISTANT_INK_TRAIL_WIDTH) {
+    return marker;
+  }
+  const segs = buildInkTrailSegments(
+    marker,
+    progressChars,
+    ASSISTANT_INK_TRAIL_WIDTH,
+    settledFloor,
+  );
+  if (segs.length === 0) return "";
+  if (segs.length === 1 && segs[0]!.opacity >= 1 && segs[0]!.highlight === 0) {
+    return segs[0]!.text;
+  }
+  return segs.map((seg, idx) => {
+    if (seg.opacity >= 1 && seg.highlight === 0) return seg.text;
+    const visualAlpha = Math.max(0.04, Math.min(1, (seg.opacity - 0.14) / 0.86));
+    const rawColor = seg.highlight > 0 ? palette.foreground : palette.foregroundMuted;
+    const tinted = tintInkColor(rawColor, visualAlpha);
+    return (
+      <Text
+        key={idx}
+        style={tinted !== "transparent" ? { color: tinted } : { opacity: visualAlpha }}
+      >
+        {seg.text}
+      </Text>
+    );
+  });
+}
+
+interface StaticListItemProps {
+  readonly item: AssistantBloomListItem;
+  readonly palette: BloomPalette;
+  readonly baseFontSize: number;
+  readonly baseLineHeight: number;
+}
+
+const StaticListItem = memo(
+  function StaticListItem({
+    item,
+    palette,
+    baseFontSize,
+    baseLineHeight,
+  }: StaticListItemProps) {
+    const bodyNode = renderInlineRuns(
+      item.runs,
+      Number.POSITIVE_INFINITY,
+      item.bodyCpCount,
+      palette,
+      baseFontSize,
+      palette.foreground,
+      palette.foreground,
+    );
     return (
       <View
-        key={pulseId}
-        testID={WEB_MIST_SWEEP_TEST_ID}
-        pointerEvents="none"
         style={{
-          position: "absolute",
-          left: 0,
-          right: 0,
-          bottom: 0,
-          height: MIST_VEIL_HEIGHT_PX,
+          flexDirection: "row",
+          alignItems: "flex-start",
+          paddingLeft: item.indent * 14,
         }}
       >
-        {bands}
+        <Text
+          style={{
+            color: palette.foregroundMuted,
+            fontSize: baseFontSize,
+            lineHeight: baseLineHeight,
+            marginRight: 8,
+            minWidth: item.marker === "•" ? 10 : 18,
+          }}
+        >
+          {item.marker}
+        </Text>
+        <Text
+          selectable
+          style={{
+            color: palette.foreground,
+            fontSize: baseFontSize,
+            lineHeight: baseLineHeight,
+            flex: 1,
+          }}
+        >
+          {bodyNode}
+        </Text>
       </View>
     );
-  }
+  },
+  (prev, next) => {
+    if (
+      prev.palette !== next.palette ||
+      prev.baseFontSize !== next.baseFontSize ||
+      prev.baseLineHeight !== next.baseLineHeight ||
+      prev.item.indent !== next.item.indent ||
+      prev.item.marker !== next.item.marker ||
+      prev.item.bodyCpCount !== next.item.bodyCpCount ||
+      prev.item.runs.length !== next.item.runs.length
+    ) {
+      return false;
+    }
+    const len = prev.item.runs.length;
+    if (len === 0) return true;
+    return prev.item.runs[len - 1]!.text === next.item.runs[len - 1]!.text;
+  },
+);
 
-  if (nativeAnim && opacityRef.current && translateYRef.current) {
-    const AnimatedView = Animated.View;
-    return (
-      <AnimatedView
-        pointerEvents="none"
-        style={{
-          position: "absolute",
-          left: 0,
-          right: 0,
-          bottom: 0,
-          height: MIST_VEIL_HEIGHT_PX,
-          opacity: opacityRef.current,
-          transform: [{ translateY: translateYRef.current }],
-        }}
-      >
-        {bands}
-      </AnimatedView>
-    );
-  }
+interface StaticCodeChunkProps {
+  readonly text: string;
+  readonly color: string;
+  readonly fontSize: number;
+  readonly lineHeight: number;
+}
 
-  return null;
+const StaticCodeChunk = memo(function StaticCodeChunk({
+  text,
+  color,
+  fontSize,
+  lineHeight,
+}: StaticCodeChunkProps) {
+  return (
+    <Text
+      selectable
+      style={{
+        color,
+        fontFamily: MONO_FONT,
+        fontSize,
+        lineHeight,
+      }}
+    >
+      {text}
+    </Text>
+  );
 });
 
-interface MarkdownBlockItemProps {
-  readonly content: string;
-  readonly animateEntrance: boolean;
-  readonly staggerDelayMs: number;
-  readonly mistActive: boolean;
-  readonly streaming: boolean;
-  readonly surfaceColor: string;
+function findExactCpIndex(cpOffsets: readonly number[], utf16Pos: number): number {
+  let lo = 0;
+  let hi = cpOffsets.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const val = cpOffsets[mid]!;
+    if (val === utf16Pos) return mid;
+    if (val < utf16Pos) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return lo;
+}
+
+interface BlockRenderProps {
+  readonly plan: AssistantBloomBlockPlan;
+  readonly localProgress: number;
+  readonly localSettledFloor: number;
+  readonly palette: BloomPalette;
+  readonly baseFontSize: number;
+  readonly baseLineHeight: number;
+}
+
+function renderBloomBlockContent({
+  plan,
+  localProgress,
+  localSettledFloor,
+  palette,
+  baseFontSize,
+  baseLineHeight,
+}: BlockRenderProps): ReactNode {
+  const proseBase: TextStyle = {
+    color: palette.foreground,
+    fontSize: baseFontSize,
+    lineHeight: baseLineHeight,
+  };
+
+  switch (plan.kind) {
+    case "hr": {
+      const hrAlpha = Number.isFinite(localProgress)
+        ? Math.max(0.08, Math.min(1, localProgress / Math.max(1, ASSISTANT_INK_TRAIL_WIDTH * 0.5)))
+        : 1;
+      const borderTint = tintInkColor(palette.border, hrAlpha);
+      return (
+        <View
+          style={{
+            height: HAIRLINE_WIDTH,
+            backgroundColor: borderTint !== "transparent" ? borderTint : palette.border,
+            opacity: borderTint !== "transparent" ? 1 : hrAlpha,
+            marginVertical: 4,
+          }}
+        />
+      );
+    }
+
+    case "heading": {
+      if (plan.cpCount === 0) return null;
+      const { fontSize, lineHeight } = headingMetrics(plan.level, baseFontSize);
+      const content = renderInlineRuns(
+        plan.runs,
+        localProgress,
+        localSettledFloor,
+        palette,
+        fontSize,
+        palette.foreground,
+        palette.foreground,
+      );
+      if (content === null) return null;
+      return (
+        <Text
+          selectable
+          style={{
+            color: palette.foreground,
+            fontSize,
+            lineHeight,
+            fontWeight: "700",
+          }}
+        >
+          {content}
+        </Text>
+      );
+    }
+
+    case "blockquote": {
+      if (plan.cpCount === 0) return null;
+      const content = renderInlineRuns(
+        plan.runs,
+        localProgress,
+        localSettledFloor,
+        palette,
+        baseFontSize,
+        palette.foregroundMuted,
+        palette.foreground,
+      );
+      if (content === null) return null;
+      return (
+        <View
+          style={{
+            borderLeftWidth: 2.5,
+            borderLeftColor: palette.border,
+            paddingLeft: 10,
+          }}
+        >
+          <Text
+            selectable
+            style={{
+              color: palette.foregroundMuted,
+              fontSize: baseFontSize,
+              lineHeight: baseLineHeight,
+            }}
+          >
+            {content}
+          </Text>
+        </View>
+      );
+    }
+
+    case "list": {
+      const rows: ReactNode[] = [];
+      for (let idx = 0; idx < plan.items.length; idx += 1) {
+        const item = plan.items[idx]!;
+        if (Number.isFinite(localProgress) && localProgress <= item.markerStartCp && idx > 0) {
+          break;
+        }
+        const itemEndCp = item.bodyStartCp + item.bodyCpCount;
+        const itemSettled =
+          !Number.isFinite(localProgress) ||
+          localProgress >= itemEndCp + ASSISTANT_INK_TRAIL_WIDTH ||
+          localSettledFloor >= itemEndCp;
+        if (itemSettled) {
+          rows.push(
+            <StaticListItem
+              key={idx}
+              item={item}
+              palette={palette}
+              baseFontSize={baseFontSize}
+              baseLineHeight={baseLineHeight}
+            />,
+          );
+          continue;
+        }
+        const markerProg = localProgress - item.markerStartCp;
+        if (markerProg <= 0) continue;
+        const markerFloor = Math.max(0, localSettledFloor - item.markerStartCp);
+        const bodyProg = localProgress - item.bodyStartCp;
+        const bodyFloor = Math.max(0, localSettledFloor - item.bodyStartCp);
+
+        const bodyNode =
+          bodyProg > 0
+            ? renderInlineRuns(
+                item.runs,
+                bodyProg,
+                bodyFloor,
+                palette,
+                baseFontSize,
+                palette.foreground,
+                palette.foreground,
+              )
+            : null;
+
+        rows.push(
+          <View
+            key={idx}
+            style={{
+              flexDirection: "row",
+              alignItems: "flex-start",
+              paddingLeft: item.indent * 14,
+            }}
+          >
+            <Text
+              style={{
+                color: palette.foregroundMuted,
+                fontSize: baseFontSize,
+                lineHeight: baseLineHeight,
+                marginRight: 8,
+                minWidth: item.marker === "•" ? 10 : 18,
+              }}
+            >
+              {renderListMarkerTrail(item.marker, markerProg, markerFloor, palette)}
+            </Text>
+            <Text selectable style={[proseBase, { flex: 1 }]}>
+              {bodyNode}
+            </Text>
+          </View>,
+        );
+      }
+      if (rows.length === 0) return null;
+      return <View style={{ gap: 4 }}>{rows}</View>;
+    }
+
+    case "code":
+    case "table": {
+      const codeFontSize = Math.max(12, baseFontSize - 2);
+      const codeLineHeight = Math.round(codeFontSize * 1.5);
+      const singleRun = plan.runs.length === 1 ? plan.runs[0]! : undefined;
+      const frozenChunks: string[] = [];
+      let tailRuns: readonly IndexedInlineRun[] = plan.runs;
+      let tailProgress = localProgress;
+      let tailFloor = localSettledFloor;
+
+      if (
+        singleRun !== undefined &&
+        Number.isFinite(localProgress) &&
+        singleRun.cpCount > 240
+      ) {
+        const settledCp = Math.min(
+          singleRun.cpCount,
+          Math.max(localSettledFloor, Math.floor(localProgress - ASSISTANT_INK_TRAIL_WIDTH)),
+        );
+        if (settledCp > 160) {
+          const settledUtf16 = singleRun.cpOffsets[settledCp]!;
+          let lineCount = 0;
+          let chunkStart = 0;
+          let nl = singleRun.text.indexOf("\n", 0);
+          while (nl !== -1 && nl < settledUtf16) {
+            lineCount += 1;
+            if (lineCount === CODE_CHUNK_LINES) {
+              frozenChunks.push(singleRun.text.slice(chunkStart, nl));
+              chunkStart = nl + 1;
+              lineCount = 0;
+            }
+            nl = singleRun.text.indexOf("\n", nl + 1);
+          }
+          if (frozenChunks.length > 0) {
+            const cutCp = findExactCpIndex(singleRun.cpOffsets, chunkStart);
+            const remText = singleRun.text.slice(chunkStart);
+            const remOffsets = singleRun.cpOffsets.slice(cutCp).map((v) => v - chunkStart);
+            tailRuns =
+              remOffsets.length > 1
+                ? [
+                    {
+                      text: remText,
+                      kind: singleRun.kind,
+                      startCp: 0,
+                      cpCount: remOffsets.length - 1,
+                      cpOffsets: remOffsets,
+                    },
+                  ]
+                : [];
+            tailProgress = Math.max(0, localProgress - cutCp);
+            tailFloor = Math.max(0, localSettledFloor - cutCp);
+          }
+        }
+      }
+
+      const content =
+        tailRuns.length > 0
+          ? renderInlineRuns(
+              tailRuns,
+              tailProgress,
+              tailFloor,
+              palette,
+              codeFontSize,
+              palette.foreground,
+              palette.foreground,
+            )
+          : null;
+      if (frozenChunks.length === 0 && content === null && plan.lang === "") return null;
+      return (
+        <View
+          style={{
+            backgroundColor: palette.surface1,
+            borderColor: palette.border,
+            borderWidth: HAIRLINE_WIDTH,
+            borderRadius: 8,
+            paddingHorizontal: 12,
+            paddingVertical: 10,
+          }}
+        >
+          {plan.kind === "code" && plan.lang !== "" ? (
+            <Text
+              style={{
+                color: palette.foregroundMuted,
+                fontFamily: MONO_FONT,
+                fontSize: 11,
+                lineHeight: 15,
+                marginBottom: frozenChunks.length > 0 || content !== null ? 6 : 0,
+              }}
+            >
+              {plan.lang}
+            </Text>
+          ) : null}
+          {frozenChunks.map((chunk, cIdx) => (
+            <StaticCodeChunk
+              key={cIdx}
+              text={chunk}
+              color={palette.foreground}
+              fontSize={codeFontSize}
+              lineHeight={codeLineHeight}
+            />
+          ))}
+          {content !== null ? (
+            <Text
+              selectable
+              style={{
+                color: palette.foreground,
+                fontFamily: MONO_FONT,
+                fontSize: codeFontSize,
+                lineHeight: codeLineHeight,
+              }}
+            >
+              {content}
+            </Text>
+          ) : null}
+        </View>
+      );
+    }
+
+    case "paragraph":
+    default: {
+      if (plan.cpCount === 0) return null;
+      const content = renderInlineRuns(
+        plan.runs,
+        localProgress,
+        localSettledFloor,
+        palette,
+        baseFontSize,
+        palette.foreground,
+        palette.foreground,
+      );
+      if (content === null) return null;
+      return (
+        <Text selectable style={proseBase}>
+          {content}
+        </Text>
+      );
+    }
+  }
+}
+
+interface StaticAssistantBlockProps {
+  readonly plan: AssistantBloomBlockPlan;
+  readonly palette: BloomPalette;
+  readonly baseFontSize: number;
+  readonly baseLineHeight: number;
 }
 
 /**
- * Stable-key Markdown block wrapper.
- *
- * - Settled blocks keep identical props and stay frozen behind `React.memo`
- *   (zero re-renders and zero Markdown re-parsing as later tokens stream in).
- * - Newly mounted live blocks stay at `opacity: 0` until `onLayout` reports
- *   `height > 0` (covering iOS `EnrichedMarkdown` async first-frame blank),
- *   then glide in on the native GPU driver in 280ms.
- * - The trailing active block stays mounted on the exact same component type
- *   and key when it transitions from active -> settled or streaming -> complete,
- *   guaranteeing zero unmount/remount flicker.
+ * Memoized settled block during streaming: shares the exact layout & typography
+ * of `renderBloomBlockContent` (`0.0px` mid-stream shift) and never re-renders
+ * on 60fps cursor frames as subsequent blocks stream below it.
  */
-const MarkdownBlockItem = memo(function MarkdownBlockItem({
-  content,
-  animateEntrance,
-  staggerDelayMs,
-  mistActive,
-  streaming,
-  surfaceColor,
-}: MarkdownBlockItemProps) {
-  const web = isWebPlatform();
-  const nativeAnim = canUseNativeAnimated();
-  const initialAnimateRef = useRef<boolean>(animateEntrance);
-  const initialDelayRef = useRef<number>(staggerDelayMs);
-  const entranceStartedRef = useRef<boolean>(!initialAnimateRef.current);
-  const entranceAnimRef = useRef<Animated.CompositeAnimation | null>(null);
-  const opacityRef = useRef<InstanceType<typeof Animated.Value> | null>(null);
-
-  if (nativeAnim && initialAnimateRef.current && opacityRef.current === null) {
-    opacityRef.current = new Animated.Value(0);
-  }
-
-  const prevHeightRef = useRef<number>(0);
-  const prevLenRef = useRef<number>(content.length);
-  const lastPulseAtRef = useRef<number>(0);
-  const [mistPulse, setMistPulse] = useState<{ id: number; intensity: number }>({
-    id: 0,
-    intensity: 0.95,
-  });
-
-  const triggerEntrance = useCallback(() => {
-    if (entranceStartedRef.current) return;
-    entranceStartedRef.current = true;
-    if (!nativeAnim || !opacityRef.current) return;
-    const easing = easeOutCubic();
-    const anim = Animated.timing(opacityRef.current, {
-      toValue: 1,
-      duration: BLOCK_ENTRANCE_DURATION_MS,
-      delay: initialDelayRef.current,
-      useNativeDriver: true,
-      ...(easing !== undefined ? { easing } : {}),
-    });
-    entranceAnimRef.current = anim;
-    anim.start();
-  }, [nativeAnim]);
-
-  useIsomorphicLayoutEffect(() => {
-    if (web && initialAnimateRef.current) {
-      ensureWebBloomStyles();
-    }
-  }, [web]);
-
-  // Unconditional unmount cleanup so an entrance animation started directly from
-  // `onLayout` (before the fallback effect ran) is always stopped on unmount.
-  useEffect(() => {
-    return () => {
-      entranceAnimRef.current?.stop();
-    };
-  }, []);
-
-  // Safety net: ensure a newly mounted block can never stay invisible if a host
-  // or zero-height divider omits `onLayout`.
-  useEffect(() => {
-    if (!nativeAnim || !initialAnimateRef.current || entranceStartedRef.current) return;
-    const fallback = setTimeout(
-      triggerEntrance,
-      BLOCK_LAYOUT_FALLBACK_MS + initialDelayRef.current,
-    );
-    return () => {
-      clearTimeout(fallback);
-    };
-  }, [nativeAnim, triggerEntrance]);
-
-  const fireMistPulse = useCallback((intensity: number, force: boolean) => {
-    const now = Date.now();
-    if (!force && now - lastPulseAtRef.current < MIST_RETRIGGER_COOLDOWN_MS) return;
-    lastPulseAtRef.current = now;
-    setMistPulse((prev) => ({ id: prev.id + 1, intensity }));
-  }, []);
-
-  // Trigger a gentle mist pulse when active text grows meaningfully within a line.
-  useEffect(() => {
-    const delta = content.length - prevLenRef.current;
-    prevLenRef.current = content.length;
-    if (!mistActive || !streaming || delta < MIST_TEXT_GROWTH_THRESHOLD) return;
-    fireMistPulse(0.68, false);
-  }, [content.length, mistActive, streaming, fireMistPulse]);
-
-  const handleLayout = useCallback(
-    (event: LayoutChangeEvent) => {
-      const nextHeight = event?.nativeEvent?.layout?.height ?? 0;
-      if (nextHeight > 0 && !entranceStartedRef.current) {
-        triggerEntrance();
-      }
-      const prevHeight = prevHeightRef.current;
-      prevHeightRef.current = nextHeight;
-      if (mistActive && streaming && prevHeight > 0 && nextHeight > prevHeight + 2) {
-        fireMistPulse(0.95, true);
-      }
-    },
-    [triggerEntrance, mistActive, streaming, fireMistPulse],
-  );
-
-  const inner = (
-    <View style={mistActive ? { position: "relative", overflow: "hidden" } : undefined}>
-      <Markdown>{content}</Markdown>
-      {mistActive ? (
-        <MistVeilOverlay
-          surfaceColor={surfaceColor}
-          pulseId={mistPulse.id}
-          intensity={mistPulse.intensity}
-        />
-      ) : null}
+const StaticAssistantBlock = memo(function StaticAssistantBlock({
+  plan,
+  palette,
+  baseFontSize,
+  baseLineHeight,
+}: StaticAssistantBlockProps) {
+  return (
+    <View>
+      {renderBloomBlockContent({
+        plan,
+        localProgress: Number.POSITIVE_INFINITY,
+        localSettledFloor: plan.cpCount,
+        palette,
+        baseFontSize,
+        baseLineHeight,
+      })}
     </View>
   );
-
-  if (nativeAnim && initialAnimateRef.current && opacityRef.current) {
-    const AnimatedView = Animated.View;
-    return (
-      <AnimatedView onLayout={handleLayout} style={{ opacity: opacityRef.current }}>
-        {inner}
-      </AnimatedView>
-    );
-  }
-
-  if (web && initialAnimateRef.current) {
-    const webDelayStyle =
-      initialDelayRef.current > 0
-        ? ({ animationDelay: `${initialDelayRef.current}ms` } as unknown as Record<string, string>)
-        : undefined;
-    return (
-      <View onLayout={handleLayout} testID={WEB_BLOCK_ENTER_TEST_ID} style={webDelayStyle}>
-        {inner}
-      </View>
-    );
-  }
-
-  return <View onLayout={mistActive ? handleLayout : undefined}>{inner}</View>;
 });
+
+interface IndexedBlockPlan {
+  readonly raw: string;
+  readonly plan: AssistantBloomBlockPlan;
+  readonly startCp: number;
+  readonly cpCount: number;
+}
 
 export function AssistantMessageBloom({
   theme,
@@ -543,37 +808,135 @@ export function AssistantMessageBloom({
   const { text, phase, bloomKey } = item.data;
   // Match Paseo `density.blockGap = { xs: 12, md: 16 }` (`styles/density.ts:33`).
   const blockGap = layout.compact ? 12 : 16;
+  const baseFontSize = isWebPlatform() ? 14 : 15;
+  const baseLineHeight = 22;
+
   const agentStatus = useAgent(agentId ?? "", (snapshot) => snapshot.status);
+  const hasRaf =
+    typeof globalThis.requestAnimationFrame === "function" &&
+    typeof globalThis.cancelAnimationFrame === "function";
+  const reducedMotion = prefersReducedMotion();
+
   const rowAt = normalizeRowTimestamp(timestamp);
   const rowIdentity = bloomKey ? `${agentId ?? ""}\0${bloomKey}` : `${agentId ?? ""}\0${rowAt}`;
 
-  const totalCp = useMemo(() => countCodePoints(text), [text]);
+  // Incremental per-index block plan cache so already-closed leading blocks
+  // are never re-tokenized when new tokens append at the tail.
+  const blockCacheRef = useRef<Map<number, { raw: string; plan: AssistantBloomBlockPlan }>>(
+    new Map(),
+  );
+
+  const rawSplit = useMemo(() => splitStableMarkdownBlocks(text), [text]);
+  const { indexedPlans, totalCp } = useMemo(() => {
+    const cache = blockCacheRef.current;
+    const allRaws =
+      rawSplit.activeBlock !== ""
+        ? [...rawSplit.settledBlocks, rawSplit.activeBlock]
+        : [...rawSplit.settledBlocks];
+    const out: IndexedBlockPlan[] = [];
+    let cpOffset = 0;
+    for (let i = 0; i < allRaws.length; i += 1) {
+      const raw = allRaws[i]!;
+      const hit = cache.get(i);
+      let plan: AssistantBloomBlockPlan;
+      if (hit !== undefined && hit.raw === raw) {
+        plan = hit.plan;
+      } else {
+        plan = parseAssistantBloomBlock(raw);
+        cache.set(i, { raw, plan });
+      }
+      out.push({ raw, plan, startCp: cpOffset, cpCount: plan.cpCount });
+      cpOffset += plan.cpCount;
+    }
+    if (cache.size > allRaws.length + 4) {
+      for (const k of cache.keys()) {
+        if (k >= allRaws.length) cache.delete(k);
+      }
+    }
+    return { indexedPlans: out, totalCp: cpOffset };
+  }, [rawSplit]);
+
   const persisted = readLiveBloomState(bloomKey);
-  const initialEverStreamed =
-    persisted !== undefined
+  const initialCanBloom =
+    hasRaf &&
+    !reducedMotion &&
+    (persisted !== undefined
       ? persisted.everStreamed
       : shouldStartAssistantBloomFromZero({
           phase,
-          totalCp,
+          totalCp: totalCp > 0 ? totalCp : countCodePoints(text),
           agentStatus,
-        });
+        }));
 
   const prevIdentityRef = useRef<string>(rowIdentity);
   const instanceEpochRef = useRef<number>(0);
   const prevTextRef = useRef<string>(text);
-  const everStreamedRef = useRef<boolean>(initialEverStreamed);
+  const everStreamedRef = useRef<boolean>(initialCanBloom);
+  const totalCpRef = useRef<number>(totalCp);
+  const cursorRef = useRef<number>(
+    persisted !== undefined
+      ? persisted.cursor
+      : initialCanBloom
+        ? 0
+        : totalCp + ASSISTANT_INK_TRAIL_WIDTH,
+  );
+  const settledFloorRef = useRef<number>(
+    persisted !== undefined ? persisted.settledFloor : initialCanBloom ? 0 : totalCp,
+  );
+  const velocityRef = useRef<number>(persisted !== undefined ? persisted.velocity : 0);
   const revealedBlocksRef = useRef<Set<number>>(
     persisted !== undefined ? persisted.revealedBlocks : new Set<number>(),
   );
-  // Stable per-block entrance config so `React.memo` never invalidates settled blocks.
-  const blockEntranceMapRef = useRef<Map<number, { animate: boolean; delayMs: number }>>(
-    new Map(),
+  const unifiedSettledRef = useRef<boolean>(
+    persisted !== undefined ? persisted.unifiedSettled : false,
   );
+  const [unifiedReady, setUnifiedReady] = useState<boolean>(unifiedSettledRef.current);
+
+  const rafRef = useRef<number | null>(null);
+  const lastFrameRef = useRef<number>(0);
+  const handoffBoostRef = useRef<boolean>(false);
   const lastCascadeReportAtRef = useRef<number>(0);
   const lastLiveActivityAtRef = useRef<number>(0);
+  const [, setTick] = useState<number>(0);
 
-  const [tailSettling, setTailSettling] = useState<boolean>(false);
-  const [unifiedReady, setUnifiedReady] = useState<boolean>(false);
+  // Gentle native-driver container fade-in on fresh live mount (matching `RowEntrance`).
+  const nativeAnim = canUseNativeAnimated();
+  const mountFadeRef = useRef<InstanceType<typeof Animated.Value> | null>(null);
+  const shouldFadeContainerRef = useRef<boolean>(
+    initialCanBloom && persisted === undefined && cursorRef.current === 0,
+  );
+  if (nativeAnim && shouldFadeContainerRef.current && mountFadeRef.current === null) {
+    mountFadeRef.current = new Animated.Value(0);
+  }
+
+  useEffect(() => {
+    if (!nativeAnim || !shouldFadeContainerRef.current || !mountFadeRef.current) return;
+    const easing =
+      typeof Easing?.out === "function" && Easing?.cubic ? Easing.out(Easing.cubic) : undefined;
+    const anim = Animated.timing(mountFadeRef.current, {
+      toValue: 1,
+      duration: ROW_ENTRANCE_DURATION_MS,
+      useNativeDriver: true,
+      ...(easing !== undefined ? { easing } : {}),
+    });
+    anim.start();
+    return () => {
+      anim.stop();
+    };
+  }, [nativeAnim]);
+
+  const syncState = useCallback(() => {
+    if (!bloomKey) return;
+    const state: LiveBloomState = {
+      everStreamed: everStreamedRef.current,
+      cursor: cursorRef.current,
+      settledFloor: settledFloorRef.current,
+      velocity: velocityRef.current,
+      unifiedSettled: unifiedSettledRef.current,
+      revealedBlocks: revealedBlocksRef.current,
+    };
+    writeLiveBloomState(bloomKey, state);
+  }, [bloomKey]);
 
   if (prevIdentityRef.current !== rowIdentity) {
     const isContinuation =
@@ -583,40 +946,85 @@ export function AssistantMessageBloom({
     prevIdentityRef.current = rowIdentity;
     if (!isContinuation) {
       instanceEpochRef.current += 1;
+      blockCacheRef.current.clear();
+      handoffBoostRef.current = false;
       const nextPersisted = readLiveBloomState(bloomKey);
-      blockEntranceMapRef.current.clear();
       if (nextPersisted !== undefined) {
-        everStreamedRef.current = nextPersisted.everStreamed;
+        everStreamedRef.current = nextPersisted.everStreamed && hasRaf && !reducedMotion;
+        cursorRef.current = nextPersisted.cursor;
+        settledFloorRef.current = nextPersisted.settledFloor;
+        velocityRef.current = nextPersisted.velocity;
         revealedBlocksRef.current = nextPersisted.revealedBlocks;
+        unifiedSettledRef.current = nextPersisted.unifiedSettled;
       } else {
-        const fresh = shouldStartAssistantBloomFromZero({
-          phase,
-          totalCp,
-          agentStatus,
-        });
+        const fresh =
+          hasRaf &&
+          !reducedMotion &&
+          shouldStartAssistantBloomFromZero({
+            phase,
+            totalCp: totalCp > 0 ? totalCp : countCodePoints(text),
+            agentStatus,
+          });
         everStreamedRef.current = fresh;
+        cursorRef.current = fresh ? 0 : totalCp + ASSISTANT_INK_TRAIL_WIDTH;
+        settledFloorRef.current = fresh ? 0 : totalCp;
+        velocityRef.current = 0;
         revealedBlocksRef.current = new Set<number>();
+        unifiedSettledRef.current = false;
       }
     }
-  } else if (
-    text !== prevTextRef.current &&
-    (phase === "streaming" || text.length > prevTextRef.current.length)
-  ) {
-    if (!everStreamedRef.current) {
-      everStreamedRef.current = true;
+  } else if (text !== prevTextRef.current) {
+    const prevText = prevTextRef.current;
+    const prevTotal = totalCpRef.current;
+    if (hasRaf && !reducedMotion && (phase === "streaming" || text.length > prevText.length)) {
+      if (!everStreamedRef.current) {
+        everStreamedRef.current = true;
+        settledFloorRef.current = prevTotal;
+        cursorRef.current = prevTotal;
+        velocityRef.current = 0;
+      } else if (text.startsWith(prevText)) {
+        // Pull cursor back to `prevTotal` if it had glided into the settle tail
+        // during a network pause so newly arrived characters always bloom from
+        // alpha 0.04 without skipping, while locking already-visible chars at 1.
+        if (cursorRef.current > prevTotal) {
+          settledFloorRef.current = Math.max(settledFloorRef.current, prevTotal);
+          cursorRef.current = prevTotal;
+        }
+      } else {
+        const commonUtf16 = commonUtf16PrefixLength(prevText, text);
+        const commonCp = countCodePoints(text.slice(0, commonUtf16));
+        settledFloorRef.current = Math.min(settledFloorRef.current, commonCp);
+        if (cursorRef.current > commonCp) {
+          settledFloorRef.current = Math.max(settledFloorRef.current, commonCp);
+          cursorRef.current = commonCp;
+        }
+      }
+      if (unifiedSettledRef.current) {
+        unifiedSettledRef.current = false;
+      }
+    } else if (!everStreamedRef.current) {
+      cursorRef.current = totalCp + ASSISTANT_INK_TRAIL_WIDTH;
+      settledFloorRef.current = totalCp;
     }
   }
   prevTextRef.current = text;
-  const everStreamed = everStreamedRef.current;
+  totalCpRef.current = totalCp;
 
-  const syncState = useCallback(() => {
-    if (!bloomKey) return;
-    const state: LiveBloomState = {
-      everStreamed: everStreamedRef.current,
-      revealedBlocks: revealedBlocksRef.current,
-    };
-    writeLiveBloomState(bloomKey, state);
-  }, [bloomKey]);
+  const everStreamed = everStreamedRef.current;
+  const settledTarget = totalCp + ASSISTANT_INK_TRAIL_WIDTH;
+  const needsAnim =
+    hasRaf &&
+    !reducedMotion &&
+    everStreamed &&
+    totalCp > 0 &&
+    cursorRef.current < settledTarget - 0.02;
+
+  const needsAnimRef = useRef<boolean>(needsAnim);
+  needsAnimRef.current = needsAnim;
+  const phaseRef = useRef<"streaming" | "complete">(phase);
+  phaseRef.current = phase;
+  const agentIdRef = useRef<string | undefined>(agentId);
+  agentIdRef.current = agentId;
 
   const yieldedPulseRowRef = useRef<string | null>(null);
 
@@ -629,20 +1037,107 @@ export function AssistantMessageBloom({
         yieldedPulseRowRef.current = rowIdentity;
         yieldRowPulse(agentId);
       }
-      setTailSettling(true);
-      setUnifiedReady(false);
+      if (unifiedReady) {
+        unifiedSettledRef.current = false;
+        setUnifiedReady(false);
+      }
       return;
     }
-    clearActiveBloom(agentId);
-    if (!everStreamed) {
-      setTailSettling(false);
+    if (!needsAnim) {
+      clearActiveBloom(agentId);
+    }
+  }, [agentId, phase, rowIdentity, everStreamed, needsAnim, unifiedReady]);
+
+  // Continuous 60/120Hz `requestAnimationFrame` ink-trail loop.
+  useEffect(() => {
+    if (!needsAnim) {
+      if (rafRef.current !== null && typeof globalThis.cancelAnimationFrame === "function") {
+        globalThis.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      lastFrameRef.current = 0;
+      handoffBoostRef.current = false;
+      if (phaseRef.current !== "streaming") {
+        clearActiveBloom(agentIdRef.current);
+      }
+      syncState();
       return;
     }
-    const timer = setTimeout(() => {
-      setTailSettling(false);
-    }, MIST_TAIL_SETTLE_MS);
-    return () => clearTimeout(timer);
-  }, [agentId, phase, rowIdentity, everStreamed]);
+
+    const onSuccessorWaiting = () => {
+      handoffBoostRef.current = true;
+    };
+
+    const publishCascade = (wallNow: number) => {
+      if (wallNow - lastCascadeReportAtRef.current >= CASCADE_REPORT_THROTTLE_MS) {
+        lastCascadeReportAtRef.current = wallNow;
+        const remCp = Math.max(
+          0,
+          totalCpRef.current + ASSISTANT_INK_TRAIL_WIDTH - cursorRef.current,
+        );
+        const speed = Math.max(55, velocityRef.current);
+        const estMs = Math.min(400, Math.max(80, (remCp / speed) * 1000));
+        reportActiveBloom(agentIdRef.current, estMs, onSuccessorWaiting, wallNow);
+      }
+      if (wallNow - lastLiveActivityAtRef.current >= LIVE_ACTIVITY_HEARTBEAT_MS) {
+        lastLiveActivityAtRef.current = wallNow;
+        markAgentLiveActivity(agentIdRef.current, wallNow);
+      }
+    };
+
+    publishCascade(Date.now());
+    if (rafRef.current !== null) return;
+
+    let lastEmitAt = 0;
+    const tick = (frameNow: number) => {
+      rafRef.current = null;
+      if (!needsAnimRef.current) {
+        lastFrameRef.current = 0;
+        return;
+      }
+      const now = frameNow > 0 ? frameNow : nowMs();
+      const rawDt =
+        lastFrameRef.current === 0
+          ? STREAM_FRAME_INTERVAL_MS
+          : Math.max(1, now - lastFrameRef.current);
+      lastFrameRef.current = now;
+
+      const step = advanceAssistantInkCursor({
+        current: cursorRef.current,
+        target: totalCpRef.current,
+        velocity: velocityRef.current,
+        dtMs: rawDt,
+        phase: phaseRef.current,
+        speedBoost: handoffBoostRef.current ? BLOOM_HANDOFF_SPEED_BOOST : 1,
+        trailWidth: ASSISTANT_INK_TRAIL_WIDTH,
+      });
+      cursorRef.current = step.cursor;
+      velocityRef.current = step.velocity;
+
+      if (step.settled) {
+        settledFloorRef.current = totalCpRef.current;
+        lastFrameRef.current = 0;
+        handoffBoostRef.current = false;
+        if (phaseRef.current !== "streaming") {
+          clearActiveBloom(agentIdRef.current);
+        }
+        syncState();
+        setTick((v) => (v + 1) & 0x7fffffff);
+        return;
+      }
+
+      publishCascade(Date.now());
+      syncState();
+      if (lastEmitAt === 0 || now - lastEmitAt >= INK_EMIT_INTERVAL_MS) {
+        lastEmitAt = now;
+        setTick((v) => (v + 1) & 0x7fffffff);
+      }
+      rafRef.current = globalThis.requestAnimationFrame(tick);
+    };
+
+    lastFrameRef.current = 0;
+    rafRef.current = globalThis.requestAnimationFrame(tick);
+  }, [needsAnim, syncState, rowIdentity]);
 
   useEffect(() => {
     syncState();
@@ -650,71 +1145,79 @@ export function AssistantMessageBloom({
 
   useEffect(() => {
     return () => {
-      clearActiveBloom(agentId);
+      if (rafRef.current !== null && typeof globalThis.cancelAnimationFrame === "function") {
+        globalThis.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      clearActiveBloom(agentIdRef.current);
       syncState();
     };
-  }, [agentId, syncState]);
+  }, [syncState]);
 
-  const rawSplit = useMemo(() => splitStableMarkdownBlocks(text), [text]);
-  const committedActiveBlock = useThrottledActiveBlock(
-    rawSplit.activeBlock,
-    rawSplit.settledBlocks.length,
-    phase,
-    everStreamed,
-  );
-
-  // Throttled cascade handoff hint (A-3) + 5s live-activity heartbeat (A-4)
-  // while streaming so downstream tool rows cascade smoothly even on >15s replies.
-  useEffect(() => {
-    if (phase !== "streaming" || !everStreamed) return;
-    const now = Date.now();
-    if (now - lastCascadeReportAtRef.current >= CASCADE_REPORT_THROTTLE_MS) {
-      lastCascadeReportAtRef.current = now;
-      reportActiveBloom(agentId, CASCADE_REPORT_REMAINING_MS, undefined, now);
-    }
-    if (now - lastLiveActivityAtRef.current >= LIVE_ACTIVITY_HEARTBEAT_MS) {
-      lastLiveActivityAtRef.current = now;
-      markAgentLiveActivity(agentId, now);
-    }
-  }, [agentId, phase, everStreamed, rawSplit.settledBlocks.length, committedActiveBlock]);
-
-  const totalBlocks = rawSplit.settledBlocks.length + (committedActiveBlock !== "" ? 1 : 0);
+  const tailSettling = phase === "streaming" || needsAnim;
   const needsUnifiedMerge =
     everStreamed &&
     shouldMergeToUnifiedMarkdown({
       phase,
       tailSettling,
-      blockCount: totalBlocks,
+      blockCount: indexedPlans.length,
     });
 
   useEffect(() => {
-    setUnifiedReady(false);
+    setUnifiedReady(unifiedSettledRef.current);
   }, [rowIdentity]);
 
-  // Reset double-buffer readiness whenever merge preconditions change (e.g. row
-  // identity changes, text updates, or streaming resumes).
   useEffect(() => {
     if (!needsUnifiedMerge) {
-      setUnifiedReady(false);
+      if (unifiedReady && phase === "streaming") {
+        unifiedSettledRef.current = false;
+        setUnifiedReady(false);
+      }
       return;
     }
     if (unifiedReady) return;
     const fallback = setTimeout(() => {
+      unifiedSettledRef.current = true;
+      syncState();
       setUnifiedReady(true);
     }, UNIFIED_MERGE_FALLBACK_MS);
     return () => clearTimeout(fallback);
-  }, [needsUnifiedMerge, unifiedReady, rowIdentity, text]);
+  }, [needsUnifiedMerge, unifiedReady, phase, rowIdentity, text, syncState]);
 
-  const handleUnifiedLayout = useCallback((event: LayoutChangeEvent) => {
-    const height = event?.nativeEvent?.layout?.height ?? 0;
-    if (height > 0) {
-      setUnifiedReady(true);
-    }
-  }, []);
+  const handleUnifiedLayout = useCallback(
+    (event: LayoutChangeEvent) => {
+      const height = event?.nativeEvent?.layout?.height ?? 0;
+      if (height > 0) {
+        unifiedSettledRef.current = true;
+        syncState();
+        setUnifiedReady(true);
+      }
+    },
+    [syncState],
+  );
 
-  // Idle / reopened / non-live row: render a single native `<Markdown>` on frame 0
-  // with zero animation wrappers and zero timers.
-  if (!everStreamed) {
+  const palette = useMemo<BloomPalette>(
+    () => ({
+      foreground: theme.colors.foreground,
+      foregroundMuted: theme.colors.foregroundMuted,
+      accent: theme.colors.accent,
+      surface1: theme.colors.surface1,
+      surface2: theme.colors.surface2,
+      border: theme.colors.border,
+    }),
+    [
+      theme.colors.foreground,
+      theme.colors.foregroundMuted,
+      theme.colors.accent,
+      theme.colors.surface1,
+      theme.colors.surface2,
+      theme.colors.border,
+    ],
+  );
+
+  // Idle / reopened / reduced-motion / already-unified row: render a single
+  // native `<Markdown>` on frame 0 with zero animation wrappers or timers.
+  if (!everStreamed || (unifiedReady && phase === "complete" && !needsAnim)) {
     return (
       <View style={ROOT_STYLE}>
         <Markdown>{text}</Markdown>
@@ -722,85 +1225,76 @@ export function AssistantMessageBloom({
     );
   }
 
-  if (totalBlocks === 0) {
+  if (indexedPlans.length === 0) {
     return <View style={ROOT_STYLE} />;
   }
 
-  const showMist = phase === "streaming" || tailSettling;
+  const cursor = cursorRef.current;
+  const settledFloor = settledFloorRef.current;
   const epoch = instanceEpochRef.current;
+  const closedCount = rawSplit.settledBlocks.length;
 
-  let batchNewIdx = 0;
-  const entranceConfigFor = (index: number): { animate: boolean; delayMs: number } => {
-    const existing = blockEntranceMapRef.current.get(index);
-    if (existing !== undefined) return existing;
-    const alreadyRevealed = revealedBlocksRef.current.has(index);
-    const config = alreadyRevealed
-      ? { animate: false, delayMs: 0 }
-      : {
-          animate: true,
-          delayMs: Math.min(BLOCK_STAGGER_MAX_MS, batchNewIdx * BLOCK_STAGGER_STEP_MS),
-        };
-    if (!alreadyRevealed) {
-      batchNewIdx += 1;
-      revealedBlocksRef.current.add(index);
+  const renderedBlocks: ReactNode[] = [];
+  for (let i = 0; i < indexedPlans.length; i += 1) {
+    const entry = indexedPlans[i]!;
+    if (entry.startCp > cursor && i > 0) break;
+
+    const blockEnd = entry.startCp + entry.cpCount;
+    const blockFullySettled =
+      i < closedCount &&
+      (cursor >= blockEnd + ASSISTANT_INK_TRAIL_WIDTH || settledFloor >= blockEnd);
+
+    if (blockFullySettled) {
+      revealedBlocksRef.current.add(i);
+      renderedBlocks.push(
+        <StaticAssistantBlock
+          key={`${epoch}:${i}`}
+          plan={entry.plan}
+          palette={palette}
+          baseFontSize={baseFontSize}
+          baseLineHeight={baseLineHeight}
+        />,
+      );
+      continue;
     }
-    blockEntranceMapRef.current.set(index, config);
-    return config;
-  };
 
-  const renderedBlocks = !unifiedReady
-    ? (() => {
-        const list = [];
-        for (let i = 0; i < rawSplit.settledBlocks.length; i += 1) {
-          const cfg = entranceConfigFor(i);
-          list.push(
-            <MarkdownBlockItem
-              key={`${epoch}:${i}`}
-              content={rawSplit.settledBlocks[i]!}
-              animateEntrance={cfg.animate}
-              staggerDelayMs={cfg.delayMs}
-              mistActive={false}
-              streaming={false}
-              surfaceColor={theme.colors.surface0}
-            />,
-          );
-        }
-        if (committedActiveBlock !== "") {
-          const activeIndex = rawSplit.settledBlocks.length;
-          const cfg = entranceConfigFor(activeIndex);
-          list.push(
-            <MarkdownBlockItem
-              key={`${epoch}:${activeIndex}`}
-              content={committedActiveBlock}
-              animateEntrance={cfg.animate}
-              staggerDelayMs={cfg.delayMs}
-              mistActive={showMist}
-              streaming={phase === "streaming"}
-              surfaceColor={theme.colors.surface0}
-            />,
-          );
-        }
-        return list;
-      })()
-    : null;
+    const localProgress = Math.max(0, cursor - entry.startCp);
+    const localSettledFloor = Math.max(0, settledFloor - entry.startCp);
+    const content = renderBloomBlockContent({
+      plan: entry.plan,
+      localProgress,
+      localSettledFloor,
+      palette,
+      baseFontSize,
+      baseLineHeight,
+    });
+    if (content !== null) {
+      renderedBlocks.push(<View key={`${epoch}:${i}`}>{content}</View>);
+    }
+  }
 
-  return (
+  const body = (
     <View style={ROOT_STYLE}>
-      {renderedBlocks !== null ? (
-        <View key={`${epoch}:blocks`} style={{ gap: blockGap }}>
-          {renderedBlocks}
-        </View>
-      ) : null}
+      <View key={`${epoch}:blocks`} style={{ gap: blockGap }}>
+        {renderedBlocks}
+      </View>
       {needsUnifiedMerge ? (
         <View
           key={`${epoch}:unified`}
-          onLayout={unifiedReady ? undefined : handleUnifiedLayout}
-          pointerEvents={unifiedReady ? "auto" : "none"}
-          style={unifiedReady ? undefined : UNIFIED_PREWARM_STYLE}
+          onLayout={handleUnifiedLayout}
+          pointerEvents="none"
+          style={UNIFIED_PREWARM_STYLE}
         >
           <Markdown>{text}</Markdown>
         </View>
       ) : null}
     </View>
   );
+
+  if (nativeAnim && shouldFadeContainerRef.current && mountFadeRef.current) {
+    const AnimatedView = Animated.View;
+    return <AnimatedView style={{ opacity: mountFadeRef.current }}>{body}</AnimatedView>;
+  }
+
+  return body;
 }
